@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+
+# Extracted App Files & Binaries
+*.apk
+*.so
+*.dex
+*.zip
+
+# Third-Party Tools
+*.jar
+uber-apk-signer*.jar
+
+# Workspaces (Defined in AutoPatcher.py)
+source/
+destination/
+archives/
+
+# Device Logs
+trace.txt
+*.log
+
+# Keystores (Falls lokal vorhanden)
+*.jks
+*.keystore
+
+# Ghidra Project Files
+*.gpr
+*.rep/
+*.lock

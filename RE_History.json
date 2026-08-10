@@ -1,0 +1,98 @@
+[
+    {
+        "id": "PID-20260807-210617",
+        "name": "Ebene 3 - Null-Patch (Mutex intakt)",
+        "timestamp": "2026-08-07 21:12:06",
+        "result": "Crash",
+        "observation": "Kippy App startet kurz und wird dann direkt wieder beendet. Man sieht das Kippy Logo f\u00fcr den Bruchteil einer Sekunde",
+        "patches": [
+            {
+                "ram": "00830b08",
+                "base": "00100000",
+                "orig": "02 00 40 f9 6d ff ff 17",
+                "patch": "00 00 80 52 c0 03 5f d6"
+            }
+        ]
+    },
+    {
+        "id": "PID-20260807-214535",
+        "name": "Ebene 1 - SSL Verify True Patch",
+        "timestamp": "2026-08-07 21:50:30",
+        "result": "No Internet",
+        "observation": "Die App startet sauber auf. Wenn ich in das Feld f\u00fcr den Nutzernamen klicke und ihn eingebe wird sogar \u00fcber google mein Passwort automatisch eingetragen. Das hatte ich bisher nur bei der original app. Dann allerdings wenn ich auf \"anmelden\" klicke erhalte ich die Meldung \"Keine Internetverbindung\". Im Unterschied zu bisherigen Versuchen kommt diese Meldung auch wirklich nur, wenn ich auf den \"Anmelden\" Button klicke. Bisher war es sonst so, dass diese Meldung in zyklischen Abst\u00e4nden alle 2-3 Sekunden angezeigt wurde.",
+        "patches": [
+            {
+                "ram": "00853d28",
+                "base": "00100000",
+                "orig": "ff 43 02 d1",
+                "patch": "20 00 80 52 c0 03 5f d6"
+            }
+        ]
+    },
+    {
+        "id": "PID-20260807-220428",
+        "name": "Ebene 1 - Epilog True Patch (Final)",
+        "timestamp": "2026-08-07 22:21:39",
+        "result": "No Internet",
+        "observation": "Wenn http Toolkit nicht aktiv ist:\nApp funktioniert einwandfrei\nWenn http Toolkit aktiv ist:\nStartscreen ok\nAnmeldeseite erscheint\nGoogle Passwort Autofill OK\nKlick auf Button \"Anmelden\" NICHT OK - Es erscheint einmalig die Meldung \"Keine Internetverbindung\"\n---\nWenn ich ich http toolkit nicht aktiv habe, mich anmelde, dann http toolkit aktiviere, dann bin ich eingeloggt, aber es erscheint zyklisch die Meldung \"kein Internet\"\nWenn ich dann die App schlie\u00dfe und wieder \u00f6ffne erhalte ich einen \"Add new pet\" Screen (Scheinbar bin ich angemeldet) sprich kein LoginFenster. Es ploppt auch mehrmals die Info \"Network Error\" auf. Interessant dass sie dieses mal auf englisch und nicht auf deutsch ist.",
+        "patches": [
+            {
+                "ram": "00853eac",
+                "base": "00100000",
+                "orig": "e0 03 16 2a",
+                "patch": "20 00 80 52"
+            }
+        ]
+    },
+    {
+        "id": "PID-20260807-224030",
+        "name": "Ebene 1 - Epilog X509_V_OK (0)",
+        "timestamp": "2026-08-07 22:49:17",
+        "result": "Success",
+        "observation": "toolkit aktiv:\nApp startet, Anmeldung google autofill wird durchgef\u00fchrt\nBei klick auf Anmelden erscheint der Fehler \"Keine Internetverbindung\"\n\nHttp toolkit deaktivert (APP noch offen) Weiterhin keine INternetverbindung\n\nNeustart Kippy: Gleiches Verhalten wie zuvor (Autofill ok aber Anmeldung nicht m\u00f6glich->Meldung \"Keine Internetverbindung\")",
+        "patches": [
+            {
+                "ram": "00853eac",
+                "base": "00100000",
+                "orig": "e0 03 16 2a",
+                "patch": "00 00 80 52"
+            }
+        ]
+    },
+    {
+        "id": "PID-20260807-224917",
+        "name": "",
+        "timestamp": "2026-08-07 22:49:56",
+        "result": "Success",
+        "observation": "toolkit aktiv:\nApp startet, Anmeldung google autofill wird durchgef\u00fchrt\nBei klick auf Anmelden erscheint der Fehler \"Keine Internetverbindung\"\n\nHttp toolkit deaktivert (APP noch offen) Weiterhin keine INternetverbindung\n\nNeustart Kippy: Gleiches Verhalten wie zuvor (Autofill ok aber Anmeldung nicht m\u00f6glich->Meldung \"Keine Internetverbindung\")",
+        "patches": [
+            {
+                "ram": "00853eac",
+                "base": "00100000",
+                "orig": "e0 03 16 2a",
+                "patch": "00 00 80 52"
+            }
+        ]
+    },
+    {
+        "id": "PID-20260807-230257",
+        "name": "Die Flutter-Callbacks (Double-Patch)",
+        "timestamp": "2026-08-07 23:12:16",
+        "result": "Success",
+        "observation": "Anmeldung i.O. mit http tool aktiv\nTracking scheint zu funktionieren.\nRestliche Funktionen lassen sich aufrufen",
+        "patches": [
+            {
+                "ram": "0099b738",
+                "base": "00100000",
+                "orig": "",
+                "patch": "20 00 80 52 c0 03 5f d6"
+            },
+            {
+                "ram": "0099ba40",
+                "base": "00100000",
+                "orig": "",
+                "patch": "00 00 80 52 c0 03 5f d6"
+            }
+        ]
+    }
+]
