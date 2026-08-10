@@ -1,4 +1,3 @@
-```markdown
 # Android RE Patching Framework (Case Study) 🔧
 
 A Python-based automation framework designed to massively accelerate the iterative reverse engineering workflow on Android.
@@ -58,7 +57,3 @@ When reverse engineering Dart/Flutter applications, traditional Man-in-the-Middl
 3. **Control Flow Identification:** Systematic analysis of various ARM64 routines – from memory management (mutex/stack) to iterative X509 certificate parsing loops, down to the final custom verification callbacks registered by Flutter.
 4. **Injection & Automation:** The identified RAM offsets and corresponding modified ARM64 hex instructions (e.g., a manipulated return value or premature return) are entered into this tool's GUI and automatically patched into the `.so` files.
 5. **Deployment & Verification:** The tool handles repackaging, signing, and flashing to the smartphone. The integrated Logcat trace immediately reveals whether the patch resulted in a SIGSEGV crash, a logic error (e.g., "No internet connection"), or a successful TLS handshake.
-
-```
-
-```
