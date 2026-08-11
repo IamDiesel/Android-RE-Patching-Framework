@@ -15,6 +15,12 @@ This tool automates the tedious cycle of unpacking, binary hex patching, signing
 * **Integrated Tracing:** Start and stop targeted `logcat` traces based on the process ID (PID) of the target app directly from the GUI.
 * **Systematic Test Documentation:** All test runs, patches, and observations are versioned and stored in both machine-readable (`RE_History.json`) and structured Markdown reports (`Kippy_RE_Log.md`) for later analysis.
 
+<img width="1174" height="964" alt="image" src="https://github.com/user-attachments/assets/e4a01e5a-77cc-408e-86bb-74ccba64ca9b" />
+<img width="1193" height="978" alt="image" src="https://github.com/user-attachments/assets/3af764b9-6ac4-49ae-b9ac-44ef852cd2a7" />
+<img width="1188" height="970" alt="image" src="https://github.com/user-attachments/assets/aaa1f447-b6e3-42a7-82ac-e95863b06303" />
+
+
+
 ## 🛠️ System Requirements & Setup
 
 1. **Python 3.x** (with `tkinter` support).
