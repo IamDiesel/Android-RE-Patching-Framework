@@ -29,3 +29,5 @@ trace.txt
 *.gpr
 *.rep/
 *.lock
+
+.idea
