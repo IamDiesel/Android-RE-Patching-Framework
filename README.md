@@ -21,6 +21,7 @@ This tool automates the tedious cycle of unpacking, binary hex patching, signing
 2. **Android SDK Platform-Tools:** `adb` must be available in the system PATH.
 3. **Java Development Kit (JDK):** Required for repackaging (`jar`) and signing.
 4. **Uber-APK-Signer:** Download the latest version of [patrickfav/uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) and place it in the root directory.
+5. **mitmproxy:** Required for the API Inspector (`pip install mitmproxy`).
 
 ### Directory Structure
 
@@ -34,6 +35,7 @@ The framework automatically creates the required workspace upon the first launch
 ├── archives/               # Version archive of all builds & traces
 ├── RE_History.json         # Machine-readable patch history
 └── Kippy_RE_Log.md         # Human-readable reverse engineering logbook
+
 
 ```
 
@@ -57,3 +59,42 @@ When reverse engineering Dart/Flutter applications, traditional Man-in-the-Middl
 3. **Control Flow Identification:** Systematic analysis of various ARM64 routines – from memory management (mutex/stack) to iterative X509 certificate parsing loops, down to the final custom verification callbacks registered by Flutter.
 4. **Injection & Automation:** The identified RAM offsets and corresponding modified ARM64 hex instructions (e.g., a manipulated return value or premature return) are entered into this tool's GUI and automatically patched into the `.so` files.
 5. **Deployment & Verification:** The tool handles repackaging, signing, and flashing to the smartphone. The integrated Logcat trace immediately reveals whether the patch resulted in a SIGSEGV crash, a logic error (e.g., "No internet connection"), or a successful TLS handshake.
+
+---
+
+## 🌐 API Inspector (DAST & MITM Proxy)
+
+The framework includes a fully integrated Dynamic Application Security Testing (DAST) suite powered by `mitmproxy`. This allows you to intercept, analyze, and manipulate API traffic on the fly. Since Flutter/Dart applications typically ignore global HTTP proxy settings, this tool utilizes a local VPN routing trick to capture the traffic.
+
+### 1️⃣ Setup & Commissioning (The VPN Trick)
+
+To successfully capture traffic from a Flutter application, follow these exact steps:
+
+1. **Start the Proxy:** In the framework GUI, navigate to the "API Inspector" tab and click **▶ Start Proxy**.
+2. **Push the Certificate:** Click **📱 Push Cert**. This copies the `mitmproxy-ca-cert.cer` file to your device's `/Download/` folder.
+3. **Install the Certificate:** On your Android device, go to *Settings -> Security -> Encryption & Credentials -> Install a certificate*. Choose **CA Certificate**, navigate to your Downloads folder, and install the pushed certificate.
+4. **Establish USB Tunnel:** Connect your phone via USB and click **🔌 Route USB** in the GUI. This executes `adb reverse tcp:8080 tcp:8080`, linking your phone's local port 8080 directly to your PC's proxy.
+5. **Configure SuperProxy (The Flutter Bypass):**
+* Download and install a proxy-forwarding app like **SuperProxy** on your Android device.
+* Add a new profile: Protocol `HTTP`, Server `127.0.0.1`, Port `8080`.
+* Start the profile. Android will prompt you to allow a VPN connection.
+* *Crucial Step:* Once connected to the proxy via the VPN, open SuperProxy again. You will be prompted to accept/trust the proxy's certificate for the VPN session. Accept it.
+
+
+
+### 2️⃣ Usage & Traffic Manipulation
+
+Once the setup is complete, all intercepted traffic from the target app will automatically populate the SQLite database and appear in the GUI in real-time.
+
+* **Live Monitoring & Details:** Click on any request in the Treeview (top left). The bottom pane will instantly display the raw Request Headers/Body and Response Headers/Body.
+* **Filtering:** Use the search bar to filter incoming traffic in real-time by HTTP Method (e.g., `POST`) or URL paths (e.g., `/api/login`).
+* **Commenting:** Add custom observations or notes to specific requests via the "Request Details" tab. These are permanently saved in the local `api_traffic.db`.
+* **Intercept Rules (On-the-fly Manipulation):**
+Navigate to the "Intercept Regeln" tab to define dynamic manipulation rules.
+* Enter a **URL Match** (e.g., `/user/status`).
+* Select an **Action** (e.g., `replace_res_body`).
+* Provide the new JSON **Payload** (e.g., `{"status": "premium"}`).
+* Click **Regel Hinzufügen**. The proxy will immediately intercept any matching future request and swap the payload before it reaches the app or the server.
+
+
+
