@@ -9,33 +9,45 @@ from config import ConfigManager
 from pipeline_engine import PipelineEngine
 from history import HistoryManager
 from api_inspector import APIInspectorTab
+from app_manager import AppManagerTab  # <-- NEU: Import des App Managers
+
 
 class KippyReFrameworkApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Kippy RE-Framework V8 - DAST & Proxy Suite")
         self.geometry("1200x950")
-        
+
         self.cfg = ConfigManager()
         self.history = HistoryManager(self.cfg)
         self.engine = PipelineEngine(self.cfg, self.log, self.get_patch_data, self.get_current_archive_path)
-        
+
         self.patch_rows = []
         self.current_id = ""
         self.current_archive_path = ""
-        
+
         self.create_widgets()
         self.generate_new_id()
-        
+
     def create_widgets(self):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # --- NEU: App Manager Tab als ersten Reiter initialisieren ---
+        self.tab_app_manager = AppManagerTab(
+            self.notebook,
+            self.cfg.paths.get("SOURCE_DIR", "source"),
+            self.log,
+            self.handle_app_imported
+        )
 
         self.tab_workspace = ttk.Frame(self.notebook)
         self.tab_management = ttk.Frame(self.notebook)
         self.tab_api = APIInspectorTab(self.notebook, self.cfg, self.log)
         self.tab_settings = ttk.Frame(self.notebook)
 
+        # Tabs in der richtigen Reihenfolge hinzufügen
+        self.notebook.add(self.tab_app_manager, text="📱 App Manager")
         self.notebook.add(self.tab_workspace, text="🔧 Workspace")
         self.notebook.add(self.tab_api, text="🌐 API Inspector")
         self.notebook.add(self.tab_management, text="📊 Test Management")
@@ -44,6 +56,30 @@ class KippyReFrameworkApp(tk.Tk):
         self._setup_workspace()
         self._setup_management()
         self._setup_settings()
+
+    # --- NEU: Auto-Config Callback ---
+    def handle_app_imported(self, session_data):
+        pkg = session_data["package_name"]
+        arch = session_data["architecture"]
+
+        self.log(f"[*] Wende Auto-Config für {pkg} ({arch}) an...")
+
+        # Settings-Felder (aus dem Reiter 'Einstellungen') updaten
+        self.entries["APP_PACKAGE"].delete(0, tk.END)
+        self.entries["APP_PACKAGE"].insert(0, pkg)
+
+        if arch == "ARM64":
+            self.entries["SPLIT_NAME"].delete(0, tk.END)
+            self.entries["SPLIT_NAME"].insert(0, "split_config.arm64_v8a")
+        elif arch == "x86_64":
+            self.entries["SPLIT_NAME"].delete(0, tk.END)
+            self.entries["SPLIT_NAME"].insert(0, "split_config.x86_64")
+
+        # Config aktualisieren, damit die Pfade im ConfigManager sofort neu berechnet werden
+        if self._sync_config_from_ui():
+            self.cfg.save()
+
+        self.log(f"[+] Workspace für {pkg} konfiguriert. Du kannst nun loslegen.")
 
     def _setup_workspace(self):
         m_frame = ttk.LabelFrame(self.tab_workspace, text="1. Patch Meta-Daten")
@@ -64,8 +100,10 @@ class KippyReFrameworkApp(tk.Tk):
 
         a_frame = ttk.LabelFrame(self.tab_workspace, text="3. Pipelines Ausführen")
         a_frame.pack(fill="x", padx=10, pady=5)
-        ttk.Button(a_frame, text="1. Build Pipeline", command=lambda: self.run_pipeline("BUILD")).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Button(a_frame, text="2. Flash Pipeline", command=lambda: self.run_pipeline("FLASH")).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Button(a_frame, text="1. Build Pipeline", command=lambda: self.run_pipeline("BUILD")).grid(row=0, column=0,
+                                                                                                       padx=5, pady=5)
+        ttk.Button(a_frame, text="2. Flash Pipeline", command=lambda: self.run_pipeline("FLASH")).grid(row=0, column=1,
+                                                                                                       padx=5, pady=5)
         self.btn_trace_start = ttk.Button(a_frame, text="Start Trace", command=self.start_trace)
         self.btn_trace_start.grid(row=0, column=2, padx=5, pady=5)
         self.btn_trace_stop = ttk.Button(a_frame, text="Stop Trace", command=self.stop_trace, state="disabled")
@@ -73,12 +111,14 @@ class KippyReFrameworkApp(tk.Tk):
 
         r_frame = ttk.LabelFrame(self.tab_workspace, text="4. Resultat")
         r_frame.pack(fill="x", padx=10, pady=5)
-        self.combo_res = ttk.Combobox(r_frame, values=["Success", "Crash", "No Internet", "Logic Error"], state="readonly")
+        self.combo_res = ttk.Combobox(r_frame, values=["Success", "Crash", "No Internet", "Logic Error"],
+                                      state="readonly")
         self.combo_res.current(0)
         self.combo_res.grid(row=0, column=1, padx=5, pady=2)
         self.txt_obs = tk.Text(r_frame, height=3, width=60)
         self.txt_obs.grid(row=1, column=1, padx=5, pady=2)
-        ttk.Button(r_frame, text="Save Result", command=self.save_result).grid(row=2, column=1, sticky="e", padx=5, pady=5)
+        ttk.Button(r_frame, text="Save Result", command=self.save_result).grid(row=2, column=1, sticky="e", padx=5,
+                                                                               pady=5)
 
         self.console = tk.Text(self.tab_workspace, height=10, bg="black", fg="lightgreen")
         self.console.pack(fill="both", expand=True, padx=10, pady=5)
@@ -86,9 +126,9 @@ class KippyReFrameworkApp(tk.Tk):
     def _setup_management(self):
         cols = ("ID", "Name", "Date", "Result", "Kommentar")
         self.tree = ttk.Treeview(self.tab_management, columns=cols, show="headings", height=15)
-        for c in cols: 
+        for c in cols:
             self.tree.heading(c, text=c)
-        
+
         self.tree.column("ID", width=140)
         self.tree.column("Name", width=180)
         self.tree.column("Date", width=140)
@@ -104,10 +144,12 @@ class KippyReFrameworkApp(tk.Tk):
     def _setup_settings(self):
         p_frame = ttk.LabelFrame(self.tab_settings, text="Pfade & App")
         p_frame.pack(fill="x", padx=10, pady=5)
-        
+
         self.entries = {}
-        for i, (lbl, key) in enumerate([("Base Dir", "BASE_DIR"), ("Split APK", "SPLIT_NAME"), ("Package", "APP_PACKAGE"), ("Signer", "SIGNER_JAR")]):
-            ttk.Label(p_frame, text=lbl+":").grid(row=i, column=0, sticky="w", padx=5, pady=2)
+        for i, (lbl, key) in enumerate(
+                [("Base Dir", "BASE_DIR"), ("Split APK", "SPLIT_NAME"), ("Package", "APP_PACKAGE"),
+                 ("Signer", "SIGNER_JAR")]):
+            ttk.Label(p_frame, text=lbl + ":").grid(row=i, column=0, sticky="w", padx=5, pady=2)
             ent = ttk.Entry(p_frame, width=60)
             ent.grid(row=i, column=1, padx=5, pady=2)
             self.entries[key] = ent
@@ -119,12 +161,12 @@ class KippyReFrameworkApp(tk.Tk):
 
         b_frame = ttk.Frame(self.tab_settings)
         b_frame.pack(fill="x", padx=10, pady=10)
-        
+
         ttk.Button(b_frame, text="Laden...", command=self.load_settings_file).pack(side="left", padx=5)
         ttk.Button(b_frame, text="Speichern unter...", command=self.save_settings_as).pack(side="left", padx=5)
         ttk.Button(b_frame, text="Defaults", command=self.restore_defaults).pack(side="left", padx=5)
         ttk.Button(b_frame, text="Save (Aktuell)", command=self.save_settings).pack(side="right", padx=5)
-        
+
         self.populate_settings()
 
     def on_tree_double_click(self, event):
@@ -133,25 +175,25 @@ class KippyReFrameworkApp(tk.Tk):
         item_id = selection[0]
         record_values = self.tree.item(item_id, "values")
         if not record_values: return
-        
+
         rec_id = record_values[0]
         record = next((r for r in self.history.data if r["id"] == rec_id), None)
         if not record: return
-        
+
         top = tk.Toplevel(self)
         top.title(f"Eintrag bearbeiten: {rec_id}")
         top.geometry("450x300")
-        
+
         ttk.Label(top, text="Ergebnis:").pack(pady=5)
         combo = ttk.Combobox(top, values=["Success", "Crash", "No Internet", "Logic Error"], state="readonly")
         combo.set(record.get("result", "Success"))
         combo.pack(pady=5)
-        
+
         ttk.Label(top, text="Notizen/Beobachtung:").pack(pady=5)
         txt = tk.Text(top, height=5, width=40)
         txt.insert("1.0", record.get("observation", ""))
         txt.pack(pady=5, fill="both", expand=True)
-        
+
         def save_edit():
             new_res = combo.get()
             new_obs = txt.get("1.0", tk.END).strip()
@@ -159,7 +201,7 @@ class KippyReFrameworkApp(tk.Tk):
             self.refresh_tree()
             top.destroy()
             self.log(f"[*] Datensatz {rec_id} aktualisiert.")
-            
+
         ttk.Button(top, text="Änderungen Speichern", command=save_edit).pack(pady=10, side="bottom")
 
     def generate_new_id(self):
@@ -167,9 +209,14 @@ class KippyReFrameworkApp(tk.Tk):
         self.lbl_id.config(text=self.current_id)
 
     def log(self, msg):
-        self.console.insert("end", msg + "\n")
-        self.console.see("end")
-        self.update()
+        # Prüfen, ob das Konsolen-Textfeld bereits existiert
+        if hasattr(self, 'console') and self.console:
+            self.console.insert("end", msg + "\n")
+            self.console.see("end")
+            self.update()
+        else:
+            # Fallback für Meldungen während der Startphase der App
+            print(msg)
 
     def add_patch_row(self):
         f = ttk.Frame(self.p_container)
@@ -189,20 +236,22 @@ class KippyReFrameworkApp(tk.Tk):
         self.patch_rows = [p for p in self.patch_rows if p["frame"] != f]
 
     def get_patch_data(self):
-        return [{"ram": p["ram"].get(), "base": p["base"].get(), "orig": p["orig"].get(), "patch": p["patch"].get()} for p in self.patch_rows]
+        return [{"ram": p["ram"].get(), "base": p["base"].get(), "orig": p["orig"].get(), "patch": p["patch"].get()} for
+                p in self.patch_rows]
 
     def get_current_archive_path(self):
         return self.current_archive_path
 
     def run_pipeline(self, name):
         if name == "BUILD":
-            self.current_archive_path = os.path.join(self.cfg.paths["ARCHIVE_DIR"], f"{self.current_id}_{self.ent_name.get().replace(' ', '_')}")
+            self.current_archive_path = os.path.join(self.cfg.paths["ARCHIVE_DIR"],
+                                                     f"{self.current_id}_{self.ent_name.get().replace(' ', '_')}")
             os.makedirs(self.current_archive_path, exist_ok=True)
-            for f in os.listdir(self.cfg.paths["DEST_DIR"]): 
+            for f in os.listdir(self.cfg.paths["DEST_DIR"]):
                 os.remove(os.path.join(self.cfg.paths["DEST_DIR"], f))
-            
+
         success = self.engine.run_pipeline(name)
-        
+
         if name == "BUILD" and success:
             for f in os.listdir(self.cfg.paths["DEST_DIR"]):
                 if f.endswith("-aligned-debugSigned.apk"):
@@ -264,13 +313,15 @@ class KippyReFrameworkApp(tk.Tk):
 
     def save_settings_as(self):
         if self._sync_config_from_ui():
-            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")], title="Einstellungen speichern unter")
+            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")],
+                                                title="Einstellungen speichern unter")
             if path:
                 self.cfg.save(path)
                 messagebox.showinfo("Gespeichert", f"Konfiguration gespeichert unter:\n{path}")
 
     def load_settings_file(self):
-        path = filedialog.askopenfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")], title="Einstellungen laden")
+        path = filedialog.askopenfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")],
+                                          title="Einstellungen laden")
         if path:
             self.cfg.load(path)
             self.populate_settings()
