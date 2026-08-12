@@ -5,6 +5,7 @@ import os
 
 
 class AppManagerTab(ttk.Frame):
+    def __init__(self, parent, source_dir, log_callback, on_app_imported_callback):
         super().__init__(parent)
         self.source_dir = source_dir
         self.log = log_callback
