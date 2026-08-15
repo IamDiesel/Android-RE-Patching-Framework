@@ -32,6 +32,8 @@ class PipelineEngine:
                 success = self._run_cmd_step(step)
             elif step_type == "mirror_workspace":
                 success = self._mirror_workspace()
+            elif step_type == "inject_nsc":  # <--- NEU HINZUFÜGEN
+                success = self._inject_nsc()  # <--- NEU HINZUFÜGEN
             elif step_type == "anchor_patch":
                 success = self._apply_hex_patches()
             elif step_type == "smart_patch":
@@ -70,6 +72,57 @@ class PipelineEngine:
                 return False
         else:
             self.log("[*] Arbeitskopie existiert bereits. Nutze Destination-Workspace.")
+        return True
+
+    def _inject_nsc(self):
+        """Injiziert automatisch eine Network Security Config, um User-Zertifikate (Mitmproxy) zu erlauben."""
+        dest_dir = os.path.join(self.cfg.paths["DEST_DIR"], "base_unpacked")
+        manifest_path = os.path.join(dest_dir, "AndroidManifest.xml")
+        xml_dir = os.path.join(dest_dir, "res", "xml")
+        nsc_path = os.path.join(xml_dir, "kippy_nsc.xml")
+
+        if not os.path.exists(manifest_path):
+            self.log("[!] AndroidManifest.xml nicht gefunden. Überspringe NSC-Injection.")
+            return False
+
+        self.log("[*] Injiziere Network Security Config für Mitmproxy (User-Certs)...")
+
+        # 1. Freizügige XML-Datei anlegen
+        os.makedirs(xml_dir, exist_ok=True)
+        nsc_content = '''<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>'''
+
+        # 2. Manifest parsen und anpassen
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = f.read()
+
+        import re
+        match = re.search(r'android:networkSecurityConfig="@xml/([^"]+)"', manifest_data)
+
+        if match:
+            # Wenn die App schon eine config hat, überschreiben wir sie einfach heimlich
+            existing_nsc_name = match.group(1)
+            existing_nsc_path = os.path.join(xml_dir, f"{existing_nsc_name}.xml")
+            with open(existing_nsc_path, "w", encoding="utf-8") as f:
+                f.write(nsc_content)
+            self.log(f"[+] Existierende NSC '{existing_nsc_name}.xml' mit User-Cert-Trust überschrieben!")
+        else:
+            # Wenn keine existiert, legen wir unsere eigene an und verlinken sie im Manifest
+            with open(nsc_path, "w", encoding="utf-8") as f:
+                f.write(nsc_content)
+            manifest_data = manifest_data.replace("<application ",
+                                                  '<application android:networkSecurityConfig="@xml/kippy_nsc" ')
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write(manifest_data)
+            self.log("[+] Manifest erfolgreich gepatcht (kippy_nsc hinzugefügt)!")
+
         return True
 
     def _apply_smart_patches(self):

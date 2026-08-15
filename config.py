@@ -19,9 +19,11 @@ DEFAULT_CONFIG = {
             {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "BUILD_NATIVE": [
+            {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
+            {"name": "Inject Network Security Config", "type": "inject_nsc"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
             {"name": "Copy original splits to dest", "type": "cmd", "cmd": "copy *.apk \"{DEST_DIR}\\\"", "cwd": "{APP_SOURCE_DIR}"},
-            {"name": "Build patched base", "type": "cmd", "cmd": "apktool b base_unpacked -o \"{DEST_DIR}\\base.apk\"", "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Build patched base", "type": "cmd", "cmd": "apktool b base_unpacked -o base.apk", "cwd": "{DEST_DIR}"},
             {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
@@ -80,7 +82,6 @@ class ConfigManager:
         self.paths = {
             "SOURCE_DIR": os.path.join(b_dir, "source"),
             "APP_SOURCE_DIR": os.path.join(b_dir, "source", app_pkg),
-            # NEU: Das Zielverzeichnis erbt nun dynamisch den App-Package Namen
             "DEST_DIR": os.path.join(b_dir, "destination", app_pkg),
             "ARCHIVE_DIR": os.path.join(b_dir, "archives"),
             "LOG_FILE": os.path.join(b_dir, "Kippy_RE_Log.md"),
