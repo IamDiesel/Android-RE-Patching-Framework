@@ -9,7 +9,9 @@ from history import HistoryManager
 from cg_manager import CallGraphManager
 from api_inspector import APIInspectorTab
 from app_manager import AppManagerTab
-from ui_tabs import WorkspaceTab, HistoryTab, SettingsTab
+from ui_workspace_tab import WorkspaceTab
+from ui_history_tab import HistoryTab
+from ui_settings_tab import SettingsTab
 
 class KippyReFrameworkApp(tk.Tk):
     def __init__(self):

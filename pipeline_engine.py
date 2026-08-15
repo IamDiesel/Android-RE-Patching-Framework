@@ -1,7 +1,9 @@
 import os
 import subprocess
-from tkinter import messagebox
 import time
+import shutil
+from tkinter import messagebox
+
 
 class PipelineEngine:
     def __init__(self, config_mgr, logger_func, get_patches_func, get_archive_path_func):
@@ -28,6 +30,8 @@ class PipelineEngine:
             success = False
             if step_type == "cmd":
                 success = self._run_cmd_step(step)
+            elif step_type == "mirror_workspace":
+                success = self._mirror_workspace()
             elif step_type == "anchor_patch":
                 success = self._apply_hex_patches()
             elif step_type == "smart_patch":
@@ -45,6 +49,74 @@ class PipelineEngine:
                 return False
 
         self.log(f"\n=== PIPELINE {pipeline_name} ERFOLGREICH ===")
+        return True
+
+    def _mirror_workspace(self):
+        """Kopiert den entpackten Ordner einmalig in die Destination."""
+        src = os.path.join(self.cfg.paths["APP_SOURCE_DIR"], "base_unpacked")
+        dst = os.path.join(self.cfg.paths["DEST_DIR"], "base_unpacked")
+
+        if not os.path.exists(src):
+            self.log("[!] Original-Ordner fehlt in Source. Hast du die APK entpackt?")
+            return False
+
+        if not os.path.exists(dst):
+            self.log("[*] Erstelle Arbeitskopie im Destination-Ordner (One-Time-Mirror)...")
+            try:
+                shutil.copytree(src, dst)
+                self.log("[+] Arbeitskopie erfolgreich erstellt.")
+            except Exception as e:
+                self.log(f"[!] Fehler beim Spiegeln: {e}")
+                return False
+        else:
+            self.log("[*] Arbeitskopie existiert bereits. Nutze Destination-Workspace.")
+        return True
+
+    def _apply_smart_patches(self):
+        """Wendet Patches sicher in der Destination an (inklusive Undo-Funktion)."""
+        patches = [p for p in self.get_patches() if p.get("type") == "smali"]
+        if not patches:
+            self.log("[*] Keine Smali-Patches definiert, überspringe.")
+            return True
+
+        src_dir = os.path.join(self.cfg.paths.get("APP_SOURCE_DIR", ""), "base_unpacked")
+        dst_dir = os.path.join(self.cfg.paths.get("DEST_DIR", ""), "base_unpacked")
+
+        for idx, p in enumerate(patches):
+            rel_file = p.get("file", "")
+            src_file = os.path.join(src_dir, rel_file)
+            dst_file = os.path.join(dst_dir, rel_file)
+
+            # 1. Single-File Reset: Garantiert sauberen Status für entfernte/bearbeitete Patches
+            if os.path.exists(src_file):
+                os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+            else:
+                self.log(f"[!] Originaldatei nicht in Source gefunden: {src_file}")
+                return False
+
+            # 2. Patchvorgang auf der Destination-Datei
+            try:
+                with open(dst_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                orig_block = p.get("orig", "").replace("\r\n", "\n")
+                edit_block = p.get("edit", "").replace("\r\n", "\n")
+                content = content.replace("\r\n", "\n")
+
+                if orig_block not in content:
+                    self.log(f"[!] Original-Block in '{rel_file}' nicht gefunden! (Hat sich der Code geändert?)")
+                    return False
+
+                content = content.replace(orig_block, edit_block)
+
+                with open(dst_file, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{rel_file}' angewendet.")
+            except Exception as e:
+                self.log(f"[!] Fehler beim Anwenden von Smali-Patch: {e}")
+                return False
+
         return True
 
     def _run_cmd_step(self, step):
@@ -76,7 +148,6 @@ class PipelineEngine:
             log_file = os.path.join(self.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
 
             with open(log_file, "w", encoding="utf-8") as out_f:
-                # NEU: stdin=subprocess.DEVNULL würgt den "Drücken Sie eine beliebige Taste"-Dialog sofort ab!
                 process = subprocess.Popen(cmd, shell=True, cwd=cwd,
                                            stdout=out_f, stderr=subprocess.STDOUT,
                                            stdin=subprocess.DEVNULL,
@@ -91,8 +162,7 @@ class PipelineEngine:
                             time.sleep(0.05)
 
                     for line in in_f.readlines():
-                        if line.strip():
-                            self.log(line.strip())
+                        if line.strip(): self.log(line.strip())
 
             return process.returncode == 0
         except Exception as e:
@@ -128,44 +198,6 @@ class PipelineEngine:
             self.log(f"[!] Patch-Fehler: {e}")
             return False
 
-    def _apply_smart_patches(self):
-        patches = [p for p in self.get_patches() if p.get("type") == "smali"]
-        if not patches:
-            self.log("[*] Keine Smali-Patches definiert, überspringe.")
-            return True
-
-        # NEU: Der Patcher greift jetzt auf das base_unpacked Verzeichnis zu!
-        smali_dir = os.path.join(self.cfg.paths.get("APP_SOURCE_DIR", ""), "base_unpacked")
-
-        for idx, p in enumerate(patches):
-            filepath = os.path.join(smali_dir, p.get("file", ""))
-            if not os.path.exists(filepath):
-                self.log(f"[!] Datei nicht gefunden: {filepath}")
-                return False
-
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-
-                # Windows Line-Endings normalisieren
-                orig_block = p.get("orig", "").replace("\r\n", "\n")
-                edit_block = p.get("edit", "").replace("\r\n", "\n")
-                content = content.replace("\r\n", "\n")
-
-                if orig_block not in content:
-                    self.log(
-                        f"[!] Original-Block in '{p.get('file')}' nicht gefunden! (Hat sich der Code durch ein Update geändert?)")
-                    return False
-
-                content = content.replace(orig_block, edit_block)
-
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(content)
-                self.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{p.get('file')}' angewendet.")
-            except Exception as e:
-                self.log(f"[!] Fehler beim Anwenden von Smali-Patch: {e}")
-                return False
-        return True
     def _start_trace_step(self, step):
         app_pkg = self.cfg.config.get("APP_PACKAGE", "")
         pid_res = subprocess.run(f"adb shell pidof {app_pkg}", shell=True, capture_output=True, text=True)
