@@ -54,7 +54,7 @@ class PipelineEngine:
         return True
 
     def _mirror_workspace(self):
-        """Kopiert den entpackten Ordner einmalig in die Destination."""
+        """Kopiert den entpackten Ordner in die Destination (überschreibt bestehende Dateien für einen sauberen Build)."""
         src = os.path.join(self.cfg.paths["APP_SOURCE_DIR"], "base_unpacked")
         dst = os.path.join(self.cfg.paths["DEST_DIR"], "base_unpacked")
 
@@ -62,17 +62,15 @@ class PipelineEngine:
             self.log("[!] Original-Ordner fehlt in Source. Hast du die APK entpackt?")
             return False
 
-        if not os.path.exists(dst):
-            self.log("[*] Erstelle Arbeitskopie im Destination-Ordner (One-Time-Mirror)...")
-            try:
-                shutil.copytree(src, dst)
-                self.log("[+] Arbeitskopie erfolgreich erstellt.")
-            except Exception as e:
-                self.log(f"[!] Fehler beim Spiegeln: {e}")
-                return False
-        else:
-            self.log("[*] Arbeitskopie existiert bereits. Nutze Destination-Workspace.")
-        return True
+        self.log("[*] Synchronisiere Original-Dateien in den Destination-Workspace...")
+        try:
+            # FIX: dirs_exist_ok=True erzwingt das Kopieren/Überschreiben, auch wenn der Ordner (durch die .pkl) schon existiert!
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            self.log("[+] Arbeitskopie erfolgreich synchronisiert.")
+            return True
+        except Exception as e:
+            self.log(f"[!] Fehler beim Spiegeln: {e}")
+            return False
 
     def _inject_nsc(self):
         """Injiziert automatisch eine Network Security Config, um User-Zertifikate (Mitmproxy) zu erlauben."""
@@ -100,21 +98,25 @@ class PipelineEngine:
 </network-security-config>'''
 
         # 2. Manifest parsen und anpassen
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest_data = f.read()
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest_data = f.read()
+        except UnicodeDecodeError:
+            self.log("[!] FEHLER: AndroidManifest.xml ist binär kompiliert (AXML)!")
+            self.log("[!] NSC-Injection übersprungen. Bitte entpacke die App neu (ohne '-r' Flag).")
+            # Wir brechen den Build nicht ab, überspringen aber das Injizieren
+            return True
 
         import re
         match = re.search(r'android:networkSecurityConfig="@xml/([^"]+)"', manifest_data)
 
         if match:
-            # Wenn die App schon eine config hat, überschreiben wir sie einfach heimlich
             existing_nsc_name = match.group(1)
             existing_nsc_path = os.path.join(xml_dir, f"{existing_nsc_name}.xml")
             with open(existing_nsc_path, "w", encoding="utf-8") as f:
                 f.write(nsc_content)
             self.log(f"[+] Existierende NSC '{existing_nsc_name}.xml' mit User-Cert-Trust überschrieben!")
         else:
-            # Wenn keine existiert, legen wir unsere eigene an und verlinken sie im Manifest
             with open(nsc_path, "w", encoding="utf-8") as f:
                 f.write(nsc_content)
             manifest_data = manifest_data.replace("<application ",

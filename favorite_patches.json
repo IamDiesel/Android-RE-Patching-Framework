@@ -1,0 +1,45 @@
+[
+    {
+        "name": "ExtendedTrustManagerX509 TrustManagerWrapper",
+        "comment": "Patch f\u00fcr Virtua - Restfunktionalit\u00e4t komplett entfernt, nur return-void",
+        "date": "2026-08-15 23:29:36",
+        "patches": [
+            {
+                "type": "smali",
+                "file": "smali_classes7/io/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager.smali",
+                "orig": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n    .locals 1\n\n    .line 1\n    iget-object v0, p0, Lio/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager;->a:Ljavax/net/ssl/X509ExtendedTrustManager;\n\n    invoke-interface {v0, p1, p2}, Ljavax/net/ssl/X509TrustManager;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n\n    return-void\n.end method",
+                "edit": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n    .locals 0\n    return-void\n.end method"
+            },
+            {
+                "type": "smali",
+                "file": "smali_classes7/io/netty/handler/ssl/util/X509TrustManagerWrapper.smali",
+                "orig": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n    .locals 1\n\n    .line 1\n    iget-object v0, p0, Lio/netty/handler/ssl/util/X509TrustManagerWrapper;->a:Ljavax/net/ssl/X509TrustManager;\n\n    invoke-interface {v0, p1, p2}, Ljavax/net/ssl/X509TrustManager;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n\n    return-void\n.end method",
+                "edit": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n    .locals 0\n    return-void\n.end method"
+            },
+            {
+                "type": "smali",
+                "file": "smali_classes7/io/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager.smali",
+                "orig": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V\n    .locals 1\n\n    .line 2\n    iget-object v0, p0, Lio/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager;->a:Ljavax/net/ssl/X509ExtendedTrustManager;\n\n    invoke-virtual {v0, p1, p2, p3}, Ljavax/net/ssl/X509ExtendedTrustManager;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V\n\n    return-void\n.end method",
+                "edit": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V\n    .locals 0\n    return-void\n.end method"
+            },
+            {
+                "type": "smali",
+                "file": "smali_classes7/io/netty/handler/ssl/util/X509TrustManagerWrapper.smali",
+                "orig": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V\n    .locals 0\n\n    .line 2\n    iget-object p3, p0, Lio/netty/handler/ssl/util/X509TrustManagerWrapper;->a:Ljavax/net/ssl/X509TrustManager;\n\n    invoke-interface {p3, p1, p2}, Ljavax/net/ssl/X509TrustManager;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n\n    return-void\n.end method",
+                "edit": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/net/Socket;)V\n    .locals 0\n    return-void\n.end method"
+            },
+            {
+                "type": "smali",
+                "file": "smali_classes7/io/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager.smali",
+                "orig": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V\n    .locals 3\n\n    .line 3\n    invoke-virtual {p3}, Ljavax/net/ssl/SSLEngine;->getHandshakeSession()Ljavax/net/ssl/SSLSession;\n\n    move-result-object v0\n\n    if-eqz v0, :cond_0\n\n    const-string v1, \"TLSv1.3\"\n\n    invoke-interface {v0}, Ljavax/net/ssl/SSLSession;->getProtocol()Ljava/lang/String;\n\n    move-result-object v2\n\n    invoke-virtual {v1, v2}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z\n\n    move-result v1\n\n    if-eqz v1, :cond_0\n\n    new-instance v1, Lio/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager$1;\n\n    invoke-direct {v1, p3, p3, v0}, Lio/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager$1;-><init>(Ljavax/net/ssl/SSLEngine;Ljavax/net/ssl/SSLEngine;Ljavax/net/ssl/SSLSession;)V\n\n    move-object p3, v1\n\n    .line 4\n    :cond_0\n    iget-object v0, p0, Lio/netty/handler/ssl/OpenSslTlsv13X509ExtendedTrustManager;->a:Ljavax/net/ssl/X509ExtendedTrustManager;\n\n    invoke-virtual {v0, p1, p2, p3}, Ljavax/net/ssl/X509ExtendedTrustManager;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V\n\n    return-void\n.end method",
+                "edit": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V\n    .locals 0\n    return-void\n.end method"
+            },
+            {
+                "type": "smali",
+                "file": "smali_classes7/io/netty/handler/ssl/util/X509TrustManagerWrapper.smali",
+                "orig": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V\n    .locals 0\n\n    .line 3\n    iget-object p3, p0, Lio/netty/handler/ssl/util/X509TrustManagerWrapper;->a:Ljavax/net/ssl/X509TrustManager;\n\n    invoke-interface {p3, p1, p2}, Ljavax/net/ssl/X509TrustManager;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;)V\n\n    return-void\n.end method",
+                "edit": ".method public final checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljavax/net/ssl/SSLEngine;)V\n    .locals 0\n    return-void\n.end method"
+            }
+        ]
+    }
+]

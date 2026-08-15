@@ -3,7 +3,7 @@ from tkinter import ttk, messagebox, filedialog
 import subprocess
 import os
 import shutil
-
+import threading
 
 class AppManagerTab(ttk.Frame):
     def __init__(self, parent, source_dir, log_callback, on_app_imported_callback):
@@ -55,15 +55,33 @@ class AppManagerTab(ttk.Frame):
     def load_packages(self):
         self.listbox.delete(0, tk.END)
         self.packages = []
-        try:
-            result = subprocess.check_output("adb shell pm list packages -3", shell=True, text=True)
-            for line in result.strip().split('\n'):
-                if line.startswith("package:"):
-                    pkg = line.replace("package:", "").strip()
-                    self.packages.append(pkg)
-                    self.listbox.insert(tk.END, pkg)
-        except subprocess.CalledProcessError:
-            self.log("[!] ADB Fehler: Konnte Paketliste nicht laden.")
+        self.listbox.insert(tk.END, "Lade Apps... (Warte auf ADB)")
+        self.update_idletasks()
+
+        def task():
+            try:
+                # FIX: 5 Sekunden Timeout! Wenn ADB hängt, crasht/friert die App nicht mehr ein.
+                result = subprocess.check_output("adb shell pm list packages -3", shell=True, text=True, timeout=5)
+                pkgs = [line.replace("package:", "").strip() for line in result.strip().split('\n') if line.startswith("package:")]
+                self.after(0, lambda: self._update_list(pkgs))
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: self._handle_adb_error("ADB reagiert nicht (Timeout)."))
+            except Exception as e:
+                self.after(0, lambda: self._handle_adb_error(e))
+
+        # FIX: Abfrage in den Hintergrund verlagert
+        threading.Thread(target=task, daemon=True).start()
+
+    def _update_list(self, pkgs):
+        self.listbox.delete(0, tk.END)
+        self.packages = pkgs
+        for pkg in self.packages:
+            self.listbox.insert(tk.END, pkg)
+
+    def _handle_adb_error(self, e):
+        self.listbox.delete(0, tk.END)
+        self.listbox.insert(tk.END, "⚠️ ADB Fehler / Gerät offline")
+        self.log(f"[!] ADB Fehler beim App-Laden: {e}")
 
     def filter_list(self, event):
         search = self.ent_search.get().lower()
@@ -93,7 +111,6 @@ class AppManagerTab(ttk.Frame):
                 if f.endswith(".apk"):
                     src_file = os.path.join(folderpath, f)
                     dst_file = os.path.join(target_folder, f)
-                    # FIX: Verhindert Absturz, wenn Quell- und Zielordner identisch sind
                     if os.path.abspath(src_file) != os.path.abspath(dst_file):
                         shutil.copy(src_file, dst_file)
 
@@ -149,7 +166,6 @@ class AppManagerTab(ttk.Frame):
                 elif "x86_64" in path:
                     detected_arch = "x86_64"; break
 
-            # FIX: Variablenname 'pkg' statt 'pkg_name' verwenden
             self.stat_workspace.config(text=f"🟢 Verzeichnis: source/{pkg}/")
             self.stat_arch.config(text=f"🟢 Architektur erkannt: {detected_arch}")
             self.stat_logcat.config(text=f"🟢 Logcat Filter gesetzt auf: {pkg}")

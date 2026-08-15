@@ -185,7 +185,7 @@ class SmaliStudioTab(ttk.Frame):
 
         def task():
             self.app.is_unpacking = True
-            cmd = 'apktool d "base.apk" -o "base_unpacked" -f -r'
+            cmd = 'apktool d "base.apk" -o "base_unpacked" -f'
             self.app.log(f"[*] Starte Entpacken für Smali: {cmd}")
 
             self.app.after(0, lambda: self.progress_bar.pack(side="left", padx=5))
@@ -574,10 +574,16 @@ class SmaliStudioTab(ttk.Frame):
         if not self._ensure_index_loaded():
             return
 
+        # NEU: Singleton-Check verhindert mehrfaches Öffnen und Crashes!
+        if hasattr(self, "search_window") and self.search_window.winfo_exists():
+            self.search_window.lift()  # Holt das Fenster nach vorne
+            self.search_window.focus_force()  # Gibt ihm den Fokus
+            return
+
         top = tk.Toplevel(self)
         top.title("🔍 Globale RAM-Suche (Echtzeit)")
         top.geometry("900x550")
-        top.attributes("-topmost", True)
+        top.attributes("-top", True)
 
         f_top = ttk.Frame(top)
         f_top.pack(fill="x", padx=10, pady=10)

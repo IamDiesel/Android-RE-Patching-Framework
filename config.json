@@ -48,6 +48,14 @@
         ],
         "BUILD_NATIVE": [
             {
+                "name": "Mirror Original Workspace",
+                "type": "mirror_workspace"
+            },
+            {
+                "name": "Inject Network Security Config",
+                "type": "inject_nsc"
+            },
+            {
                 "name": "Apply Smali Patches",
                 "type": "smart_patch"
             },
@@ -60,8 +68,8 @@
             {
                 "name": "Build patched base",
                 "type": "cmd",
-                "cmd": "apktool b base_unpacked -o \"{DEST_DIR}\\base.apk\"",
-                "cwd": "{APP_SOURCE_DIR}"
+                "cmd": "apktool b base_unpacked -o base.apk",
+                "cwd": "{DEST_DIR}"
             },
             {
                 "name": "Sign all APKs",

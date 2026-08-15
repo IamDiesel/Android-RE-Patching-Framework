@@ -829,3 +829,17 @@ Mit Tunnel: Teilweise kein Internet - über Ich->Boxring Stuttgart > Mein Club K
 App Crasht (Kein UNterschied ob prxy aktiv oder nicht)
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260816-002911)
+* **App:** digifit.virtuagym.client.android (v)
+* **Name:** EXT TRUST MANIFEST
+* **Testergebnis:** No Internet
+
+**Beobachtung:**
+Anmeldung erfolgreich
+Laden des App Dashboards erfolgreich
+Laden des Kalenders erfolgreich
+Laden einzelner Termie war nicht erfolgreich, die App wurde resettet
+Netzwerktraffic konnte aber aufgezeichnet werden
+
+---
