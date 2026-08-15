@@ -1,19 +1,28 @@
 import os
 import json
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 DEFAULT_CONFIG = {
-    "BASE_DIR": r"C:\Users\Lenovo\Downloads\APK-Tools\Script",
+    "BASE_DIR": CURRENT_DIR,
     "SPLIT_NAME": "split_config.arm64_v8a",
     "APP_PACKAGE": "com.datamars.kippynew",
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "PIPELINES": {
-        "BUILD": [
-            {"name": "Backup original APK", "type": "cmd", "cmd": "copy {SPLIT_NAME}.apk {SPLIT_NAME}.zip", "cwd": "{SOURCE_DIR}"},
-            {"name": "Extract APK", "type": "cmd", "cmd": "tar -xf {SPLIT_NAME}.zip -C {SPLIT_NAME}", "cwd": "{SOURCE_DIR}"},
+        "BUILD_FLUTTER": [
+            {"name": "Backup original APK", "type": "cmd", "cmd": "copy \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}.zip\"", "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Extract APK (tar)", "type": "cmd", "cmd": "tar -xf \"..\\{SPLIT_NAME}.zip\" -C .", "cwd": "{EXTRACT_DIR}"},
             {"name": "Apply Hex Patches", "type": "anchor_patch"},
-            {"name": "Repack APK", "type": "cmd", "cmd": "jar c0f {SPLIT_NAME}.apk AndroidManifest.xml lib stamp-cert-sha256 META-INF", "cwd": "{EXTRACT_DIR}"},
-            {"name": "Move repacked APK", "type": "cmd", "cmd": "move {SPLIT_NAME}.apk {DEST_DIR}\\{SPLIT_NAME}.apk", "cwd": "{EXTRACT_DIR}"},
-            {"name": "Sign APKs", "type": "cmd", "cmd": "java -jar {SIGNER_JAR} -a . --allowResign", "cwd": "{DEST_DIR}"}
+            {"name": "Repack APK (jar)", "type": "cmd", "cmd": "jar c0f \"{SPLIT_NAME}.apk\" AndroidManifest.xml lib stamp-cert-sha256 META-INF", "cwd": "{EXTRACT_DIR}"},
+            {"name": "Copy original splits to dest", "type": "cmd", "cmd": "copy *.apk \"{DEST_DIR}\\\"", "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Move repacked APK", "type": "cmd", "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"", "cwd": "{BASE_DIR}"},
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
+        ],
+        "BUILD_NATIVE": [
+            {"name": "Apply Smali Patches", "type": "smart_patch"},
+            {"name": "Copy original splits to dest", "type": "cmd", "cmd": "copy *.apk \"{DEST_DIR}\\\"", "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Build patched base", "type": "cmd", "cmd": "apktool b base_unpacked -o \"{DEST_DIR}\\base.apk\"", "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
             {"name": "Install to Device", "type": "cmd", "cmd": "adb install-multiple -i com.android.vending {SIGNED_APKS}", "cwd": "{DEST_DIR}"}
@@ -38,7 +47,7 @@ class ConfigManager:
     def load(self, file_path=None):
         if file_path:
             self.config_file = file_path
-            
+
         if os.path.exists(self.config_file):
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
@@ -53,10 +62,10 @@ class ConfigManager:
         target = file_path if file_path else self.config_file
         with open(target, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=4)
-        
+
         if file_path:
             self.config_file = target
-            
+
         self._update_paths()
 
     def restore_defaults(self):
@@ -65,17 +74,23 @@ class ConfigManager:
 
     def _update_paths(self):
         b_dir = self.config.get("BASE_DIR", "")
+        app_pkg = self.config.get("APP_PACKAGE", "")
+        split = self.config.get("SPLIT_NAME", "")
+
         self.paths = {
             "SOURCE_DIR": os.path.join(b_dir, "source"),
-            "DEST_DIR": os.path.join(b_dir, "destination"),
+            "APP_SOURCE_DIR": os.path.join(b_dir, "source", app_pkg),
+            # NEU: Das Zielverzeichnis erbt nun dynamisch den App-Package Namen
+            "DEST_DIR": os.path.join(b_dir, "destination", app_pkg),
             "ARCHIVE_DIR": os.path.join(b_dir, "archives"),
             "LOG_FILE": os.path.join(b_dir, "Kippy_RE_Log.md"),
             "JSON_HISTORY": os.path.join(b_dir, "RE_History.json"),
-            "EXTRACT_DIR": os.path.join(b_dir, "source", self.config.get("SPLIT_NAME", "")),
+            "EXTRACT_DIR": os.path.join(b_dir, "source", app_pkg, split),
             "API_DB": os.path.join(b_dir, "api_traffic.db"),
             "API_RULES": os.path.join(b_dir, "intercept_rules.json")
         }
-        for d in ["SOURCE_DIR", "DEST_DIR", "ARCHIVE_DIR"]:
+
+        for d in ["SOURCE_DIR", "DEST_DIR", "ARCHIVE_DIR", "APP_SOURCE_DIR"]:
             os.makedirs(self.paths[d], exist_ok=True)
 
     def get_format_vars(self):

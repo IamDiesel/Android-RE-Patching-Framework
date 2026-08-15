@@ -31,3 +31,7 @@ trace.txt
 *.lock
 
 .idea
+doc/virtuagymTrace.txt
+RE_History.json
+tstconfig.json
+RE_History.json

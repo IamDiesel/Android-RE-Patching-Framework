@@ -23,7 +23,7 @@ class HistoryManager:
         self.data.append(record)
         self.save()
         self._append_markdown(record)
-        
+
     def update_record(self, record_id, new_result, new_observation):
         for record in self.data:
             if record["id"] == record_id:
@@ -35,13 +35,24 @@ class HistoryManager:
     def _append_markdown(self, record):
         path = self.cfg.paths.get("LOG_FILE")
         if not path: return
-        
+
+        app_pkg = record.get('app_package', 'Unbekannt')
+        app_ver = record.get('app_version', 'N/A')
+
         md = f"### 🔧 RE-Patch-Report ({record['id']})\n"
-        md += f"* **Name:** {record['name']}\n"
+        md += f"* **App:** {app_pkg} (v{app_ver})\n"
+        md += f"* **Name:** {record.get('name', 'N/A')}\n"
         md += f"* **Testergebnis:** {record['result']}\n"
+
         for i, pt in enumerate(record.get('patches', [])):
-            md += f"  * **Patch {i + 1}:** RAM: `0x{pt['ram']}` | Hex: `{pt['patch']}`\n"
-        md += f"\n**Beobachtung:**\n{record['observation']}\n"
-        
+            if pt.get("type") == "smali":
+                md += f"\n  * **Smali Patch {i + 1}** in Datei: `{pt.get('file')}`\n"
+                md += f"  ```smali\n{pt.get('edit', '')}\n  ```\n"
+            else:
+                file_name = pt.get("file", "libflutter.so")
+                md += f"  * **Hex Patch {i + 1}:** Datei: `{file_name}` | RAM: `0x{pt.get('ram', '?')}` | Hex: `{pt.get('patch', '?')}`\n"
+
+        md += f"\n**Beobachtung:**\n{record.get('observation', '')}\n"
+
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"\n{md}\n---\n")

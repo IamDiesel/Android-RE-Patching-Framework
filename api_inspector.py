@@ -7,6 +7,7 @@ import time
 import sys
 import threading
 import re
+import subprocess
 
 
 # ==========================================
@@ -609,11 +610,18 @@ class APIInspectorTab(ttk.Frame):
         if self.proxy_process and self.proxy_process.poll() is None: return
         addon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mitm_addon.py")
         if not os.path.exists(addon_path): return messagebox.showerror("Fehler", f"Addon fehlt:\n{addon_path}")
-        cmd = f"\"{sys.executable}\" -m mitmproxy.tools.mitmdump --listen-host 0.0.0.0 -s \"{addon_path}\" --set api_db=\"{self.cfg.paths['API_DB']}\" --set rules_file=\"{self.cfg.paths['API_RULES']}\""
-        self.proxy_process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                              text=True, bufsize=1)
-        self.lbl_proxy_status.config(text="Proxy: 🟢 Läuft", foreground="green")
-        threading.Thread(target=self._read_proxy_output, daemon=True).start()
+
+        # FIX: Nutze direkt den Befehl "mitmdump" (da der Scripts-Pfad im PATH liegt)
+        cmd = f"mitmdump --listen-host 0.0.0.0 -s \"{addon_path}\" --set api_db=\"{self.cfg.paths['API_DB']}\" --set rules_file=\"{self.cfg.paths['API_RULES']}\""
+
+        try:
+            self.proxy_process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                  text=True, bufsize=1)
+            self.lbl_proxy_status.config(text="Proxy: 🟢 Läuft", foreground="green")
+            threading.Thread(target=self._read_proxy_output, daemon=True).start()
+        except Exception as e:
+            messagebox.showerror("Proxy Fehler", f"Konnte Proxy nicht starten:\n{e}")
+            self.log(f"[!] Proxy Start Error: {e}")
 
     def _read_proxy_output(self):
         try:

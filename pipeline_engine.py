@@ -1,6 +1,7 @@
 import os
 import subprocess
 from tkinter import messagebox
+import time
 
 class PipelineEngine:
     def __init__(self, config_mgr, logger_func, get_patches_func, get_archive_path_func):
@@ -16,9 +17,9 @@ class PipelineEngine:
         if not pipeline:
             self.log(f"[!] Pipeline '{pipeline_name}' ist leer oder nicht definiert.")
             return False
-        
+
         self.log(f"=== STARTE PIPELINE: {pipeline_name} ===")
-        
+
         for step in pipeline:
             step_name = step.get("name", "Unnamed Step")
             step_type = step.get("type", "cmd")
@@ -29,6 +30,8 @@ class PipelineEngine:
                 success = self._run_cmd_step(step)
             elif step_type == "anchor_patch":
                 success = self._apply_hex_patches()
+            elif step_type == "smart_patch":
+                success = self._apply_smart_patches()
             elif step_type == "trace_start":
                 success = self._start_trace_step(step)
             elif step_type == "trace_stop":
@@ -40,20 +43,20 @@ class PipelineEngine:
                 self.log(f"\n[!] FEHLER: Pipeline bei Schritt '{step_name}' abgebrochen.")
                 messagebox.showerror("Pipeline Fehler", f"Der Schritt '{step_name}' ist fehlgeschlagen.")
                 return False
-        
+
         self.log(f"\n=== PIPELINE {pipeline_name} ERFOLGREICH ===")
         return True
 
     def _run_cmd_step(self, step):
         cmd_template = step.get("cmd", "")
         cwd_template = step.get("cwd", "{BASE_DIR}")
-        
+
         extra_vars = {}
         if "{SIGNED_APKS}" in cmd_template:
             dest = self.cfg.paths["DEST_DIR"]
             apks = [f for f in os.listdir(dest) if f.endswith("-aligned-debugSigned.apk")]
             if not apks:
-                self.log("[!] Keine signierten APKs für {SIGNED_APKS} gefunden.")
+                self.log("[!] Keine signierten APKs gefunden.")
                 return False
             extra_vars["SIGNED_APKS"] = " ".join(apks)
 
@@ -65,33 +68,59 @@ class PipelineEngine:
 
         self.log(f"> [{cwd}]\n> {cmd}")
         try:
-            result = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
-            if result.stdout: self.log(result.stdout)
-            if result.stderr: self.log(f"WARN/ERR: {result.stderr}")
-            return result.returncode == 0
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            log_file = os.path.join(self.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
+
+            with open(log_file, "w", encoding="utf-8") as out_f:
+                # NEU: stdin=subprocess.DEVNULL würgt den "Drücken Sie eine beliebige Taste"-Dialog sofort ab!
+                process = subprocess.Popen(cmd, shell=True, cwd=cwd,
+                                           stdout=out_f, stderr=subprocess.STDOUT,
+                                           stdin=subprocess.DEVNULL,
+                                           startupinfo=startupinfo)
+
+                with open(log_file, "r", encoding="utf-8") as in_f:
+                    while process.poll() is None:
+                        line = in_f.readline()
+                        if line:
+                            self.log(line.strip())
+                        else:
+                            time.sleep(0.05)
+
+                    for line in in_f.readlines():
+                        if line.strip():
+                            self.log(line.strip())
+
+            return process.returncode == 0
         except Exception as e:
             self.log(f"[!] Systemfehler: {e}")
             return False
 
     def _apply_hex_patches(self):
         lib_path = os.path.join(self.cfg.paths["EXTRACT_DIR"], "lib", "arm64-v8a", "libflutter.so")
+        patches = [p for p in self.get_patches() if p.get("type") == "hex"]
+
+        if not patches:
+            self.log("[*] Keine Hex-Patches definiert, überspringe.")
+            return True
+
         if not os.path.exists(lib_path):
             self.log(f"[!] Bibliothek nicht gefunden: {lib_path}")
             return False
-        patches = self.get_patches()
-        if not patches:
-            self.log("[*] Keine Patches definiert, überspringe.")
-            return True
+
         try:
             with open(lib_path, "r+b") as f:
                 for idx, p in enumerate(patches):
-                    ram_val = p["ram"].strip()
+                    ram_val = p.get("ram", "").strip()
                     if not ram_val: continue
                     ram_val = int(ram_val, 16)
-                    base_val = int(p["base"].strip(), 16)
+                    base_val = int(p.get("base", "0").strip(), 16)
                     offset = ram_val - base_val
-                    patch_hex = p["patch"].replace(" ", "")
-                    self.log(f"[*] Patch {idx + 1}: Offset 0x{offset:X}")
+                    patch_hex = p.get("patch", "").replace(" ", "")
+                    self.log(f"[*] Hex-Patch {idx + 1}: Offset 0x{offset:X}")
                     f.seek(offset)
                     f.write(bytes.fromhex(patch_hex))
             return True
@@ -99,11 +128,49 @@ class PipelineEngine:
             self.log(f"[!] Patch-Fehler: {e}")
             return False
 
+    def _apply_smart_patches(self):
+        patches = [p for p in self.get_patches() if p.get("type") == "smali"]
+        if not patches:
+            self.log("[*] Keine Smali-Patches definiert, überspringe.")
+            return True
+
+        # NEU: Der Patcher greift jetzt auf das base_unpacked Verzeichnis zu!
+        smali_dir = os.path.join(self.cfg.paths.get("APP_SOURCE_DIR", ""), "base_unpacked")
+
+        for idx, p in enumerate(patches):
+            filepath = os.path.join(smali_dir, p.get("file", ""))
+            if not os.path.exists(filepath):
+                self.log(f"[!] Datei nicht gefunden: {filepath}")
+                return False
+
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                # Windows Line-Endings normalisieren
+                orig_block = p.get("orig", "").replace("\r\n", "\n")
+                edit_block = p.get("edit", "").replace("\r\n", "\n")
+                content = content.replace("\r\n", "\n")
+
+                if orig_block not in content:
+                    self.log(
+                        f"[!] Original-Block in '{p.get('file')}' nicht gefunden! (Hat sich der Code durch ein Update geändert?)")
+                    return False
+
+                content = content.replace(orig_block, edit_block)
+
+                with open(filepath, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{p.get('file')}' angewendet.")
+            except Exception as e:
+                self.log(f"[!] Fehler beim Anwenden von Smali-Patch: {e}")
+                return False
+        return True
     def _start_trace_step(self, step):
         app_pkg = self.cfg.config.get("APP_PACKAGE", "")
         pid_res = subprocess.run(f"adb shell pidof {app_pkg}", shell=True, capture_output=True, text=True)
         pid = pid_res.stdout.strip()
-        
+
         if not pid:
             self.log("[!] PID nicht gefunden. Läuft die App?")
             return False
@@ -111,13 +178,14 @@ class PipelineEngine:
         archive_path = self.get_archive_path()
         if not archive_path: archive_path = self.cfg.paths["ARCHIVE_DIR"]
         trace_file = os.path.join(archive_path, "trace.txt")
-        
+
         self.logcat_out = open(trace_file, "w")
         cmd = self._format(step.get("cmd", ""), {"PID": pid})
         cwd = self._format(step.get("cwd", "{BASE_DIR}"))
-        
+
         self.log(f"> [{cwd}]\n> {cmd}")
-        self.logcat_process = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=self.logcat_out, stderr=subprocess.STDOUT)
+        self.logcat_process = subprocess.Popen(cmd, shell=True, cwd=cwd, stdout=self.logcat_out,
+                                               stderr=subprocess.STDOUT)
         self.log(f"[*] Trace gestartet (PID: {pid}). Output in {trace_file}")
         return True
 
