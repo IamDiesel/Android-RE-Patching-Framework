@@ -3,6 +3,8 @@
     "SPLIT_NAME": "digifit.virtuagym.client.android",
     "APP_PACKAGE": "digifit.virtuagym.client.android",
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
+    "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
+    "MANIFEST_STRATEGY": "apkeditor",
     "PIPELINES": {
         "BUILD_FLUTTER": [
             {
@@ -52,10 +54,6 @@
                 "type": "mirror_workspace"
             },
             {
-                "name": "Inject Network Security Config",
-                "type": "inject_nsc"
-            },
-            {
                 "name": "Apply Smali Patches",
                 "type": "smart_patch"
             },
@@ -66,10 +64,8 @@
                 "cwd": "{APP_SOURCE_DIR}"
             },
             {
-                "name": "Build patched base",
-                "type": "cmd",
-                "cmd": "apktool b base_unpacked -o base.apk",
-                "cwd": "{DEST_DIR}"
+                "name": "Manifest & Build (Dynamic Strategy)",
+                "type": "manifest_and_build"
             },
             {
                 "name": "Sign all APKs",

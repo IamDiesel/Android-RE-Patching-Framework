@@ -632,7 +632,14 @@ class APIInspectorTab(ttk.Frame):
 
     def stop_proxy(self):
         if self.proxy_process:
-            self.proxy_process.terminate()
+            # FIX: Unter Windows müssen wir den gesamten Prozessbaum töten,
+            # da shell=True sonst nur die CMD killt und mitmdump den Port 8080 blockiert.
+            if os.name == 'nt':
+                subprocess.run(f"taskkill /F /T /PID {self.proxy_process.pid}", shell=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                self.proxy_process.terminate()
+
             self.proxy_process = None
             self.lbl_proxy_status.config(text="Proxy: 🔴 Offline", foreground="black")
 

@@ -3,6 +3,64 @@ import subprocess
 import time
 import shutil
 from tkinter import messagebox
+from abc import ABC, abstractmethod
+
+
+# --- STRATEGY PATTERN FÜR MANIFEST & BUILD ---
+class ManifestBuildStrategy(ABC):
+    @abstractmethod
+    def pre_process(self, engine): pass
+
+    @abstractmethod
+    def patch_manifest(self, engine): pass
+
+    @abstractmethod
+    def build(self, engine): pass
+
+
+class SmaliOnlyStrategy(ManifestBuildStrategy):
+    def pre_process(self, engine):
+        engine.log("[*] SmaliOnly-Strategie: Kein Pre-Processing nötig.")
+        return True
+
+    def patch_manifest(self, engine):
+        engine.log("[*] SmaliOnly-Strategie: Manifest bleibt unangetastet (-r).")
+        return True
+
+    def build(self, engine):
+        engine.log("[*] Baue App mit Standard Apktool (Ohne Ressourcen-Check)...")
+        cmd = "apktool b base_unpacked -o base.apk"
+        return engine._run_cmd_step({"cmd": cmd, "cwd": "{DEST_DIR}"})
+
+
+class Aapt2Strategy(ManifestBuildStrategy):
+    def pre_process(self, engine):
+        engine.log("[*] AAPT2-Strategie: Achtung! Setzt Universal-APK oder fehlerfreie Ressourcen voraus.")
+        return True
+
+    def patch_manifest(self, engine):
+        return engine._inject_nsc()
+
+    def build(self, engine):
+        engine.log("[*] Baue App streng mit AAPT2...")
+        # FIX: --use-aapt2 entfernt, da es in v3 Standard ist
+        cmd = "apktool b base_unpacked -o base.apk"
+        return engine._run_cmd_step({"cmd": cmd, "cwd": "{DEST_DIR}"})
+
+
+class ApkEditorStrategy(ManifestBuildStrategy):
+    def pre_process(self, engine):
+        engine.log("[*] APKEditor-Strategie: Native AXML/ARSC Kompilierung.")
+        return True
+
+    def patch_manifest(self, engine):
+        return engine._inject_nsc()
+
+    def build(self, engine):
+        engine.log("[*] Baue App mit APKEditor (ohne AAPT2)...")
+        # FIX: Das '-f' Flag hinzugefügt, damit die alte base.apk gnadenlos überschrieben wird!
+        cmd = "java -jar \"{APKEDITOR_JAR}\" b -f -i base_unpacked -o base.apk"
+        return engine._run_cmd_step({"cmd": cmd, "cwd": "{DEST_DIR}"})
 
 
 class PipelineEngine:
@@ -32,8 +90,8 @@ class PipelineEngine:
                 success = self._run_cmd_step(step)
             elif step_type == "mirror_workspace":
                 success = self._mirror_workspace()
-            elif step_type == "inject_nsc":  # <--- NEU HINZUFÜGEN
-                success = self._inject_nsc()  # <--- NEU HINZUFÜGEN
+            elif step_type == "manifest_and_build":  # <--- Dynamischer Strategie-Aufruf
+                success = self._run_manifest_and_build_strategy()
             elif step_type == "anchor_patch":
                 success = self._apply_hex_patches()
             elif step_type == "smart_patch":
@@ -292,3 +350,21 @@ class PipelineEngine:
         for k, v in vars_dict.items():
             text = text.replace(f"{{{k}}}", str(v))
         return text
+
+    def _run_manifest_and_build_strategy(self):
+        strategy_name = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+
+        if strategy_name == "aapt2":
+            strategy = Aapt2Strategy()
+        elif strategy_name == "apkeditor":
+            strategy = ApkEditorStrategy()
+        else:
+            strategy = SmaliOnlyStrategy()
+
+        self.log(f"\n[*] Lade Manifest-Strategie: {strategy.__class__.__name__}")
+
+        if not strategy.pre_process(self): return False
+        if not strategy.patch_manifest(self): return False
+        if not strategy.build(self): return False
+
+        return True

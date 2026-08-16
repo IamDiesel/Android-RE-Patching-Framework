@@ -62,12 +62,14 @@ class AppManagerTab(ttk.Frame):
             try:
                 # FIX: 5 Sekunden Timeout! Wenn ADB hängt, crasht/friert die App nicht mehr ein.
                 result = subprocess.check_output("adb shell pm list packages -3", shell=True, text=True, timeout=5)
-                pkgs = [line.replace("package:", "").strip() for line in result.strip().split('\n') if line.startswith("package:")]
-                self.after(0, lambda: self._update_list(pkgs))
+                pkgs = [line.replace("package:", "").strip() for line in result.strip().split('\n') if
+                        line.startswith("package:")]
+                self.after(0, lambda p=pkgs: self._update_list(p))
             except subprocess.TimeoutExpired:
                 self.after(0, lambda: self._handle_adb_error("ADB reagiert nicht (Timeout)."))
             except Exception as e:
-                self.after(0, lambda: self._handle_adb_error(e))
+                err_msg = str(e)  # <--- FIX: Den Fehler als String zwischenspeichern
+                self.after(0, lambda m=err_msg: self._handle_adb_error(m))  # <--- FIX: String übergeben
 
         # FIX: Abfrage in den Hintergrund verlagert
         threading.Thread(target=task, daemon=True).start()

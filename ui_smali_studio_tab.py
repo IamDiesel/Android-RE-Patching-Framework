@@ -580,10 +580,15 @@ class SmaliStudioTab(ttk.Frame):
             self.search_window.focus_force()  # Gibt ihm den Fokus
             return
 
-        top = tk.Toplevel(self)
-        top.title("🔍 Globale RAM-Suche (Echtzeit)")
+        # --- FIX: Fenster an die Haupt-App binden (self.app) statt an den Frame (self)! ---
+        # Das verhindert, dass die Suche beim Abdocken zerschossen wird.
+        top = tk.Toplevel(self.app)
+        self.search_window = top  # FIX: Referenz für den Singleton-Check speichern
+
+        top.title("  Globale RAM-Suche (Echtzeit)")
         top.geometry("900x550")
-        top.attributes("-top", True)
+        top.attributes("-topmost", True)  # FIX: Korrektes Windows-Attribut
+        # ---------------------------------------------------------------------------------
 
         f_top = ttk.Frame(top)
         f_top.pack(fill="x", padx=10, pady=10)

@@ -15,7 +15,7 @@ class SettingsTab(ttk.Frame):
 
         for i, (lbl, key) in enumerate(
                 [("Base Dir", "BASE_DIR"), ("Split APK", "SPLIT_NAME"), ("Package", "APP_PACKAGE"),
-                 ("Signer", "SIGNER_JAR")]):
+                 ("Signer", "SIGNER_JAR"), ("APKEditor", "APKEDITOR_JAR")]):
             ttk.Label(p_frame, text=lbl + ":").grid(row=i, column=0, sticky="w", padx=5, pady=2)
             ent = ttk.Entry(p_frame, width=60)
             ent.grid(row=i, column=1, padx=5, pady=2)
@@ -23,6 +23,7 @@ class SettingsTab(ttk.Frame):
 
         pipe_frame = ttk.LabelFrame(self, text="Pipelines (JSON)")
         pipe_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
         self.txt_pipes = tk.Text(pipe_frame, height=15, font=("Courier", 9))
         self.txt_pipes.pack(fill="both", expand=True, padx=5, pady=5)
 
@@ -40,12 +41,14 @@ class SettingsTab(ttk.Frame):
         for k, ent in self.entries.items():
             ent.delete(0, tk.END)
             ent.insert(0, self.app.cfg.config.get(k, ""))
+
         self.txt_pipes.delete("1.0", tk.END)
         self.txt_pipes.insert("1.0", json.dumps(self.app.cfg.config.get("PIPELINES", {}), indent=4))
 
     def _sync_config_from_ui(self):
         for k, ent in self.entries.items():
             self.app.cfg.config[k] = ent.get()
+
         try:
             self.app.cfg.config["PIPELINES"] = json.loads(self.txt_pipes.get("1.0", tk.END))
             return True

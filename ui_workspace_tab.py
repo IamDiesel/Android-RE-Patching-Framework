@@ -233,6 +233,8 @@ class WorkspaceTab(ttk.Frame):
         ttk.Label(m_frame, text="Patch-ID:").grid(row=0, column=0, sticky="w", padx=5, pady=2)
         self.lbl_id = ttk.Label(m_frame, text="", font=("Courier", 10, "bold"))
         self.lbl_id.grid(row=0, column=1, sticky="w", padx=5, pady=2)
+        ttk.Button(m_frame, text="↻ Neu", width=6, command=self.app.generate_new_id).grid(row=0, column=2, padx=5,
+                                                                                          pady=2)
         ttk.Label(m_frame, text="Manueller Name:").grid(row=1, column=0, sticky="w", padx=5, pady=2)
         self.ent_name = ttk.Entry(m_frame, width=25)
         self.ent_name.grid(row=1, column=1, sticky="w", padx=5, pady=2)
@@ -254,10 +256,26 @@ class WorkspaceTab(ttk.Frame):
         # 3. Pipelines Ausführen
         a_frame = ttk.LabelFrame(scroll_frame, text="3. Pipelines Ausführen")
         a_frame.pack(side="bottom", fill="x", padx=5, pady=5)
+
         ttk.Label(a_frame, text="Pipeline:").pack(anchor="w", padx=5, pady=2)
         self.combo_pipe = ttk.Combobox(a_frame, values=["BUILD_FLUTTER", "BUILD_NATIVE"], state="readonly")
         self.combo_pipe.current(0)
         self.combo_pipe.pack(fill="x", padx=5, pady=2)
+
+        # --- NEU: Manifest Strategie direkt im Workspace wählbar machen ---
+        ttk.Label(a_frame, text="Manifest Strategie:").pack(anchor="w", padx=5, pady=2)
+        self.combo_strat = ttk.Combobox(a_frame, values=["smali_only", "aapt2", "apkeditor"], state="readonly")
+        self.combo_strat.set(self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only"))
+        self.combo_strat.pack(fill="x", padx=5, pady=2)
+
+        # Speichert die Strategie bei jeder Änderung SOFORT in die Config
+        def on_strat_change(e):
+            self.app.cfg.config["MANIFEST_STRATEGY"] = self.combo_strat.get()
+            self.app.cfg.save()
+            self.app.log(f"[*] Manifest-Strategie auf '{self.combo_strat.get()}' gesetzt.")
+
+        self.combo_strat.bind("<<ComboboxSelected>>", on_strat_change)
+        # ------------------------------------------------------------------
 
         btn_f = ttk.Frame(a_frame)
         btn_f.pack(fill="x", padx=5, pady=5)
@@ -292,9 +310,18 @@ class WorkspaceTab(ttk.Frame):
         self.add_patch_row()
 
     def build_console(self, parent):
-        self.build_dock_header(parent, "🖥️ Konsole", parent, self.main_paned, 1)
+        self.build_dock_header(parent, "  Konsole", parent, self.main_paned, 1)
         self.console = tk.Text(parent, height=12, bg="black", fg="lightgreen")
         self.console.pack(side="bottom", fill="both", expand=True, padx=5, pady=5)
+
+        # --- NEU: Rechtsklick-Menü zum Leeren der Konsole ---
+        self.console_menu = tk.Menu(parent, tearoff=0)
+        self.console_menu.add_command(label="Konsole leeren", command=lambda: self.console.delete("1.0", tk.END))
+
+        def show_menu(e):
+            self.console_menu.post(e.x_root, e.y_root)
+
+        self.console.bind("<Button-3>", show_menu)  # Button-3 ist Rechtsklick
 
     def open_favorites(self):
         FavoritePatchesDialog(self, self)
