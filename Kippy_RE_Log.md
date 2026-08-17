@@ -843,3 +843,127 @@ Laden einzelner Termie war nicht erfolgreich, die App wurde resettet
 Netzwerktraffic konnte aber aufgezeichnet werden
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260817-030833)
+* **App:** digifit.virtuagym.client.android (v12.4.2)
+* **Name:** Success VIrtuagym
+* **Testergebnis:** Success
+
+**Beobachtung:**
+Smali Patch mit APKEditor Native.
+Patches:
+{
+        "name": "OKHostnameVerifier + CertificateChainCleaner VS",
+        "comment": "Patch mit apkeditor erstellt",
+        "date": "2026-08-17 02:57:01",
+        "patches": [
+            {
+                "type": "smali",
+                "file": "smali/classes7/okhttp3/internal/tls/OkHostnameVerifier.smali",
+                "orig": ".method public final verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z\n    .locals 2\n    .param p1    # Ljava/lang/String;\n        .annotation build Lorg/jetbrains/annotations/NotNull;\n        .end annotation\n    .end param\n    .param p2    # Ljavax/net/ssl/SSLSession;\n        .annotation build Lorg/jetbrains/annotations/NotNull;\n        .end annotation\n    .end param\n\n    const-string v0, \"host\"\n\n    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V\n\n    const-string v0, \"session\"\n\n    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V\n\n    invoke-static {p1}, Lokhttp3/internal/tls/OkHostnameVerifier;->b(Ljava/lang/String;)Z\n\n    move-result v0\n\n    const/4 v1, 0x0\n\n    if-nez v0, :cond_0\n\n    goto :goto_0\n\n    :cond_0\n    :try_start_0\n    invoke-interface {p2}, Ljavax/net/ssl/SSLSession;->getPeerCertificates()[Ljava/security/cert/Certificate;\n\n    move-result-object p2\n\n    aget-object p2, p2, v1\n\n    const-string v0, \"null cannot be cast to non-null type java.security.cert.X509Certificate\"\n\n    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->e(Ljava/lang/Object;Ljava/lang/String;)V\n\n    check-cast p2, Ljava/security/cert/X509Certificate;\n\n    invoke-static {p1, p2}, Lokhttp3/internal/tls/OkHostnameVerifier;->c(Ljava/lang/String;Ljava/security/cert/X509Certificate;)Z\n\n    move-result p1\n\n    :try_end_0\n    .catch Ljavax/net/ssl/SSLException; {:try_start_0 .. :try_end_0} :catch_0\n\n    return p1\n\n    :catch_0\n    :goto_0\n    return v1\n.end method",
+                "edit": ".method public final verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z\n    .locals 2\n\n    const/4 v0, 0x1\n    return v0\n.end method"
+            },
+            {
+                "type": "smali",
+                "file": "smali/classes7/okhttp3/internal/platform/android/AndroidCertificateChainCleaner.smali",
+                "orig": ".method public final a(Ljava/lang/String;Ljava/util/List;)Ljava/util/List;\n    .locals 2\n    .param p1    # Ljava/lang/String;\n        .annotation build Lorg/jetbrains/annotations/NotNull;\n        .end annotation\n    .end param\n    .param p2    # Ljava/util/List;\n        .annotation build Lorg/jetbrains/annotations/NotNull;\n        .end annotation\n    .end param\n    .annotation build Lokhttp3/internal/SuppressSignatureCheck;\n    .end annotation\n    .annotation build Lorg/jetbrains/annotations/NotNull;\n    .end annotation\n\n    const-string v0, \"chain\"\n\n    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V\n\n    const-string v0, \"hostname\"\n\n    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V\n\n    const/4 v0, 0x0\n\n    new-array v0, v0, [Ljava/security/cert/X509Certificate;\n\n    invoke-interface {p2, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;\n\n    move-result-object p2\n\n    check-cast p2, [Ljava/security/cert/X509Certificate;\n\n    :try_start_0\n    iget-object v0, p0, Lokhttp3/internal/platform/android/AndroidCertificateChainCleaner;->c:Landroid/net/http/X509TrustManagerExtensions;\n\n    const-string v1, \"RSA\"\n\n    invoke-virtual {v0, p2, v1, p1}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;\n\n    move-result-object p1\n\n    const-string p2, \"checkServerTrusted(...)\"\n\n    invoke-static {p1, p2}, Lkotlin/jvm/internal/Intrinsics;->f(Ljava/lang/Object;Ljava/lang/String;)V\n\n    :try_end_0\n    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0\n\n    return-object p1\n\n    :catch_0\n    move-exception p1\n\n    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;\n\n    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;\n\n    move-result-object v0\n\n    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V\n\n    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;\n\n    throw p2\n.end method",
+                "edit": ".method public final a(Ljava/lang/String;Ljava/util/List;)Ljava/util/List;\n    .locals 2\n    .param p1    # Ljava/lang/String;\n        .annotation build Lorg/jetbrains/annotations/NotNull;\n        .end annotation\n    .end param\n    .param p2    # Ljava/util/List;\n        .annotation build Lorg/jetbrains/annotations/NotNull;\n        .end annotation\n    .end param\n    .annotation build Lokhttp3/internal/SuppressSignatureCheck;\n    .end annotation\n    .annotation build Lorg/jetbrains/annotations/NotNull;\n    .end annotation\n\n    return-object p2\n\n    const-string v0, \"chain\"\n\n    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V\n\n    const-string v0, \"hostname\"\n\n    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V\n\n    const/4 v0, 0x0\n\n    new-array v0, v0, [Ljava/security/cert/X509Certificate;\n\n    invoke-interface {p2, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;\n\n    move-result-object p2\n\n    check-cast p2, [Ljava/security/cert/X509Certificate;\n\n    :try_start_0\n    iget-object v0, p0, Lokhttp3/internal/platform/android/AndroidCertificateChainCleaner;->c:Landroid/net/http/X509TrustManagerExtensions;\n\n    const-string v1, \"RSA\"\n\n    invoke-virtual {v0, p2, v1, p1}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;\n\n    move-result-object p1\n\n    const-string p2, \"checkServerTrusted(...)\"\n\n    invoke-static {p1, p2}, Lkotlin/jvm/internal/Intrinsics;->f(Ljava/lang/Object;Ljava/lang/String;)V\n\n    :try_end_0\n    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0\n\n    return-object p1\n\n    :catch_0\n    move-exception p1\n\n    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;\n\n    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;\n\n    move-result-object v0\n\n    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V\n\n    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;\n\n    throw p2\n.end method"
+            }
+        ]
+    }
+
+---
+
+### 🔧 RE-Patch-Report (PID-20260817-033224)
+* **App:** digifit.virtuagym.client.android (v12.4.2)
+* **Name:** Success Documentation_VirtuaGym_Success
+* **Testergebnis:** Success
+
+  * **Smali Patch 1** in Datei: `smali/classes7/okhttp3/internal/tls/OkHostnameVerifier.smali`
+  ```smali
+.method public final verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z
+    .locals 2
+
+    const/4 v0, 0x1
+    return v0
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali/classes7/okhttp3/internal/platform/android/AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public final a(Ljava/lang/String;Ljava/util/List;)Ljava/util/List;
+    .locals 2
+    .param p1    # Ljava/lang/String;
+        .annotation build Lorg/jetbrains/annotations/NotNull;
+        .end annotation
+    .end param
+    .param p2    # Ljava/util/List;
+        .annotation build Lorg/jetbrains/annotations/NotNull;
+        .end annotation
+    .end param
+    .annotation build Lokhttp3/internal/SuppressSignatureCheck;
+    .end annotation
+    .annotation build Lorg/jetbrains/annotations/NotNull;
+    .end annotation
+
+    return-object p2
+
+    const-string v0, "chain"
+
+    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V
+
+    const-string v0, "hostname"
+
+    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->g(Ljava/lang/Object;Ljava/lang/String;)V
+
+    const/4 v0, 0x0
+
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    invoke-interface {p2, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    move-result-object p2
+
+    check-cast p2, [Ljava/security/cert/X509Certificate;
+
+    :try_start_0
+    iget-object v0, p0, Lokhttp3/internal/platform/android/AndroidCertificateChainCleaner;->c:Landroid/net/http/X509TrustManagerExtensions;
+
+    const-string v1, "RSA"
+
+    invoke-virtual {v0, p2, v1, p1}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;
+
+    move-result-object p1
+
+    const-string p2, "checkServerTrusted(...)"
+
+    invoke-static {p1, p2}, Lkotlin/jvm/internal/Intrinsics;->f(Ljava/lang/Object;Ljava/lang/String;)V
+
+    :try_end_0
+    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p1
+
+    :catch_0
+    move-exception p1
+
+    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;
+
+    move-result-object v0
+
+    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    throw p2
+.end method
+  ```
+
+**Beobachtung:**
+Erfolgreich angemeldet
+Termine angezeigt
+Termin gebucht & Storniert
+
+---
