@@ -4,8 +4,18 @@
     "APP_PACKAGE": "digifit.virtuagym.client.android",
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
-    "MANIFEST_STRATEGY": "apkeditor",
+    "MANIFEST_STRATEGY": "aapt2",
     "PIPELINES": {
+        "PREPARE_WORKSPACE": [
+            {
+                "name": "Merge Split APKs",
+                "type": "merge_splits"
+            },
+            {
+                "name": "Decompile APK",
+                "type": "decompile"
+            }
+        ],
         "BUILD_FLUTTER": [
             {
                 "name": "Backup original APK",
@@ -66,7 +76,7 @@
             {
                 "name": "Install to Device",
                 "type": "cmd",
-                "cmd": "adb install-multiple -i com.android.vending {SIGNED_APKS}",
+                "cmd": "adb install -r -t -d -i com.android.vending {SIGNED_APKS}",
                 "cwd": "{DEST_DIR}"
             }
         ],

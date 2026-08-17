@@ -2,6 +2,7 @@ import os
 import subprocess
 import time
 import shutil
+import threading
 from tkinter import messagebox
 from abc import ABC, abstractmethod
 
@@ -102,6 +103,10 @@ class PipelineEngine:
                 success = self._apply_hex_patches()
             elif step_type == "smart_patch":
                 success = self._apply_smart_patches()
+            elif step_type == "merge_splits":
+                success = self._merge_splits()
+            elif step_type == "decompile":
+                success = self._decompile()
             elif step_type == "trace_start":
                 success = self._start_trace_step(step)
             elif step_type == "trace_stop":
@@ -117,6 +122,140 @@ class PipelineEngine:
         self.log(f"\n=== PIPELINE {pipeline_name} ERFOLGREICH ===")
         return True
 
+    def _get_dir_size_mb(self, path):
+        total = 0
+        try:
+            for dirpath, _, filenames in os.walk(path):
+                for f in filenames:
+                    fp = os.path.join(dirpath, f)
+                    if not os.path.islink(fp):
+                        total += os.path.getsize(fp)
+        except:
+            pass
+        return total / (1024 * 1024)
+
+    def _merge_splits(self):
+        app_source_dir = self.cfg.paths.get("APP_SOURCE_DIR", "")
+        apks = [f for f in os.listdir(app_source_dir) if f.endswith(".apk") and f != "merged_base.apk"]
+
+        if not apks:
+            self.log("[!] Keine APKs im Source-Ordner gefunden!")
+            return False
+
+        if len(apks) == 1:
+            self.log("[*] Nur eine APK gefunden. Kein Merge notwendig.")
+            return True
+
+        self.log(f"[*] {len(apks)} APKs erkannt. Verschmelze Split-APKs zu Universal-APK...")
+        apkeditor_jar = os.path.join(self.cfg.config.get("BASE_DIR", ""),
+                                     self.cfg.config.get("APKEDITOR_JAR", "APKEditor.jar"))
+
+        merged_path = os.path.join(app_source_dir, "merged_base.apk")
+        if os.path.exists(merged_path):
+            try:
+                os.remove(merged_path)
+            except Exception as e:
+                self.log(f"[!] Konnte alte merged_base.apk nicht löschen: {e}")
+
+        merge_cmd = f'java -jar "{apkeditor_jar}" m -i . -o merged_base.apk'
+
+        try:
+            result = subprocess.run(merge_cmd, shell=True, cwd=app_source_dir,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode == 0:
+                self.log("[+] Split-APKs erfolgreich zu 'merged_base.apk' verschmolzen!")
+                return True
+            else:
+                self.log(f"[!] Fehler beim Verschmelzen (Exit {result.returncode}). Output: {result.stderr}")
+                strategy = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+                if strategy == "aapt2":
+                    self.log("[!] WARNUNG: AAPT2-Strategie wird vermutlich fehlschlagen, da Ressourcen fehlen!")
+                return True  # Erlaubt Fallback auf base.apk
+        except Exception as e:
+            self.log(f"[!] Ausnahme beim Verschmelzen: {e}")
+            return True
+
+    def _decompile(self):
+        app_source_dir = self.cfg.paths.get("APP_SOURCE_DIR", "")
+
+        target_apk = "base.apk"
+        if os.path.exists(os.path.join(app_source_dir, "merged_base.apk")):
+            target_apk = "merged_base.apk"
+        elif not os.path.exists(os.path.join(app_source_dir, "base.apk")):
+            self.log("[!] Weder merged_base.apk noch base.apk gefunden!")
+            return False
+
+        strategy = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+        unpacked_name = self.get_unpacked_dir_name()
+        smali_dir = os.path.join(app_source_dir, unpacked_name)
+        apkeditor_jar = os.path.join(self.cfg.config.get("BASE_DIR", ""),
+                                     self.cfg.config.get("APKEDITOR_JAR", "APKEditor.jar"))
+
+        if strategy == "apkeditor":
+            cmd = f'java -jar "{apkeditor_jar}" d -f -i "{target_apk}" -o "{unpacked_name}"'
+            tool_prefix = "[APKEditor]"
+        else:
+            cmd = f'apktool d "{target_apk}" -o "{unpacked_name}" -f'
+            tool_prefix = "[Apktool]"
+
+        self.log(f"[*] Starte Entpacken für Smali: {cmd}")
+
+        try:
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            process = subprocess.Popen(cmd, shell=True, cwd=app_source_dir,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, bufsize=1, startupinfo=startupinfo,
+                                       errors="replace")
+
+            self.last_log_line = "Starte..."
+
+            def log_reader():
+                for line in process.stdout:
+                    clean_line = line.strip()
+                    if clean_line:
+                        self.log(f"{tool_prefix} {clean_line}")
+                        self.last_log_line = clean_line
+
+            reader_thread = threading.Thread(target=log_reader, daemon=True)
+            reader_thread.start()
+
+            last_size = -1
+            stuck_counter = 0
+
+            while process.poll() is None:
+                time.sleep(1)
+                current_size = self._get_dir_size_mb(smali_dir)
+
+                # Check for frozen compilation (like "Copying original..." hang)
+                if current_size == last_size and current_size > 5:
+                    stuck_counter += 1
+                    if stuck_counter >= 5 and "Copying" in self.last_log_line:
+                        self.log("[*] Ordner wächst nicht mehr. Beende blockierenden Prozess...")
+                        process.terminate()
+                        break
+                else:
+                    stuck_counter = 0
+                    last_size = current_size
+
+            reader_thread.join(timeout=1.0)
+
+            if process.returncode in [0, 1, None]:
+                self.log(f"[+] '{target_apk}' erfolgreich entpackt nach: {smali_dir}")
+                return True
+            else:
+                self.log(f"[!] Fehler beim Entpacken (Exit {process.returncode}).")
+                return False
+
+        except Exception as e:
+            self.log(f"[!] Ausnahme beim Entpacken: {e}")
+            return False
+
+    # -------------------------------------------------------------
+
     def _mirror_workspace(self):
         """Kopiert den entpackten Ordner in die Destination."""
         folder_name = self.get_unpacked_dir_name()
@@ -126,6 +265,8 @@ class PipelineEngine:
         if not os.path.exists(src):
             self.log(
                 f"[!] Original-Ordner '{folder_name}' fehlt in Source. Hast du die APK mit dieser Strategie entpackt?")
+            self.log(
+                "[!] Klicke oben links auf 'APK Entpacken & Indexieren', um den Ordner für diese Strategie zu erstellen.")
             return False
 
         self.log(f"[*] Synchronisiere '{folder_name}' in den Destination-Workspace...")
@@ -138,7 +279,7 @@ class PipelineEngine:
             return False
 
     def _inject_nsc(self):
-        """Injiziert automatisch eine Network Security Config, um User-Zertifikate (Mitmproxy) zu erlauben."""
+        """Injiziert automatisch eine Network Security Config und entfernt Split-Zwänge für AAPT2."""
         folder_name = self.get_unpacked_dir_name()
         dest_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name)
         manifest_path = os.path.join(dest_dir, "AndroidManifest.xml")
@@ -170,10 +311,9 @@ class PipelineEngine:
         import re
         match = re.search(r'android:networkSecurityConfig="@xml/([^"]+)"', manifest_data)
 
-        # Finde das richtige res/xml Verzeichnis
         strategy_name = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
         xml_dir = None
-        
+
         if strategy_name == "apkeditor":
             res_root = os.path.join(dest_dir, "resources")
             for root, dirs, files in os.walk(res_root):
@@ -187,6 +327,9 @@ class PipelineEngine:
 
         os.makedirs(xml_dir, exist_ok=True)
 
+        manifest_changed = False
+
+        # --- 1. Zertifikats-Injection ---
         if match:
             existing_nsc_name = match.group(1)
             existing_nsc_path = os.path.join(xml_dir, f"{existing_nsc_name}.xml")
@@ -199,9 +342,50 @@ class PipelineEngine:
                 f.write(nsc_content)
             manifest_data = manifest_data.replace("<application ",
                                                   '<application android:networkSecurityConfig="@xml/kippy_nsc" ')
+            self.log("[+] Manifest erfolgreich gepatcht (kippy_nsc hinzugefügt)!")
+            manifest_changed = True
+
+        # --- 2. Split-Zwang (NUR für AAPT2) ---
+        if strategy_name == "aapt2":
+            app_source_dir = self.cfg.paths.get("APP_SOURCE_DIR", "")
+            has_merged_base = os.path.exists(os.path.join(app_source_dir, "merged_base.apk"))
+            apks = [f for f in os.listdir(app_source_dir) if f.endswith(".apk") and f != "merged_base.apk"]
+
+            if has_merged_base or len(apks) > 1:
+                original_len = len(manifest_data)
+
+                # a) Entfernt <meta-data android:name="com.android.vending.splits.required" ... />
+                #    Nutze re.DOTALL und re.IGNORECASE, um Zeilenumbrüche etc. abzufangen.
+                manifest_data = re.sub(
+                    r'<meta-data[^>]*?android:name="com\.android\.vending\.splits\.required"[^>]*?>\s*</meta-data>|<meta-data[^>]*?android:name="com\.android\.vending\.splits\.required"[^>]*?/>',
+                    '', manifest_data, flags=re.IGNORECASE | re.DOTALL)
+
+                # b) Entfernt android:requiredSplitTypes="..." aus dem <manifest>-Tag
+                manifest_data = re.sub(r'\s*android:requiredSplitTypes="[^"]*"', '', manifest_data)
+
+                # c) Entfernt android:splitTypes="..." aus dem <manifest>-Tag
+                manifest_data = re.sub(r'\s*android:splitTypes="[^"]*"', '', manifest_data)
+
+                # d) Entfernt android:isSplitRequired="true" (Sicherheitshalber)
+                manifest_data = re.sub(r'\s*android:isSplitRequired="[^"]*"', '', manifest_data)
+
+                # e) Native Libs Fix
+                if 'android:extractNativeLibs="false"' in manifest_data:
+                    manifest_data = manifest_data.replace('android:extractNativeLibs="false"',
+                                                          'android:extractNativeLibs="true"')
+                elif 'android:extractNativeLibs="true"' not in manifest_data:
+                    manifest_data = manifest_data.replace("<application ",
+                                                          '<application android:extractNativeLibs="true" ')
+
+                if len(manifest_data) != original_len:
+                    self.log(
+                        "[+] Split-Zwang (isSplitRequired/splitTypes/meta-data) für AAPT2-Universal-Build aus Manifest entfernt!")
+                    manifest_changed = True
+
+        # --- 3. Manifest speichern ---
+        if manifest_changed:
             with open(manifest_path, "w", encoding="utf-8") as f:
                 f.write(manifest_data)
-            self.log("[+] Manifest erfolgreich gepatcht (kippy_nsc hinzugefügt)!")
 
         return True
 
@@ -268,16 +452,13 @@ class PipelineEngine:
                 edit_block = p.get("edit", "").replace("\r\n", "\n")
                 content = content.replace("\r\n", "\n")
 
-                # Fall 1: Patch passt perfekt
                 if orig_block in content:
                     content = content.replace(orig_block, edit_block)
                     self.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{actual_rel_file}' angewendet.")
                 else:
-                    # Fall 2: Interaktives Fuzzy Matching (Konfliktauflösung)
                     method_match = re.search(r'^(\.method\s+[^\n]+)', orig_block, re.MULTILINE)
                     if method_match:
                         method_sig = method_match.group(1).strip()
-                        # Suchen der exakten Methodensignatur in der aktuellen Datei
                         actual_method_pattern = re.compile(r'^' + re.escape(method_sig) + r'.*?^\.end method',
                                                            re.MULTILINE | re.DOTALL)
                         actual_match = actual_method_pattern.search(content)
@@ -285,13 +466,11 @@ class PipelineEngine:
                         if actual_match:
                             actual_block = actual_match.group(0)
 
-                            # Dialog für den Nutzer generieren
                             msg = f"Patch {idx + 1} weicht von der Datei ab!\n\n"
                             msg += f"Datei: {actual_rel_file}\n"
                             msg += f"Methode: {method_sig}\n\n"
-                            msg += "Die Decompiler-Formatierung (.line-Nummern, Kommentare) unterscheidet sich "
-                            msg += "vom gespeicherten Patch (Apktool vs APKEditor).\n\n"
-                            msg += "Soll die Methode trotzdem durch deinen Patch überschrieben werden?\n\n"
+                            msg += "Die Decompiler-Formatierung (.line-Nummern, Kommentare) unterscheidet sich.\n\n"
+                            msg += "Soll die Methode trotzdem überschrieben werden?\n\n"
                             msg += "[Ja] = Patch anwenden (Überschreiben)\n"
                             msg += "[Nein] = Diesen Patch überspringen\n"
                             msg += "[Abbrechen] = Pipeline sofort stoppen"
@@ -299,15 +478,12 @@ class PipelineEngine:
                             answer = messagebox.askyesnocancel("Patch Abweichung erkannt", msg)
 
                             if answer is True:
-                                # Nutzer stimmt zu: Methode komplett überschreiben
                                 content = content.replace(actual_block, edit_block)
                                 self.log(f"[*] Smali-Patch {idx + 1} (Fuzzy) durch Nutzer bestätigt und angewendet.")
                             elif answer is False:
-                                # Nutzer lehnt ab: Überspringen
                                 self.log(f"[*] Smali-Patch {idx + 1} vom Nutzer absichtlich übersprungen.")
                                 continue
                             else:
-                                # Nutzer klickt Abbrechen
                                 self.log(f"[!] Pipeline durch Nutzer bei Patch {idx + 1} abgebrochen.")
                                 return False
                         else:
@@ -319,7 +495,6 @@ class PipelineEngine:
                             f"[!] Original-Block in '{actual_rel_file}' nicht gefunden und keine .method Signatur erkannt!")
                         return False
 
-                # Änderungen speichern
                 with open(dst_file, "w", encoding="utf-8") as f:
                     f.write(content)
 
@@ -410,7 +585,8 @@ class PipelineEngine:
 
     def _start_trace_step(self, step):
         app_pkg = self.cfg.config.get("APP_PACKAGE", "")
-        pid_res = subprocess.run(f"adb shell pidof {app_pkg}", shell=True, capture_output=True, text=True)
+        adb_bin = self.cfg.paths.get("ADB", "adb")
+        pid_res = subprocess.run(f'"{adb_bin}" shell pidof {app_pkg}', shell=True, capture_output=True, text=True)
         pid = pid_res.stdout.strip()
 
         if not pid:

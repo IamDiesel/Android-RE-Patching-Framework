@@ -11,22 +11,35 @@ DEFAULT_CONFIG = {
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
     "MANIFEST_STRATEGY": "apkeditor",
     "PIPELINES": {
+        "PREPARE_WORKSPACE": [
+            {"name": "Merge Split APKs", "type": "merge_splits"},
+            {"name": "Decompile APK", "type": "decompile"}
+        ],
         "BUILD_FLUTTER": [
-            {"name": "Backup original APK", "type": "cmd", "cmd": "copy \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}.zip\"", "cwd": "{APP_SOURCE_DIR}"},
-            {"name": "Extract APK (tar)", "type": "cmd", "cmd": "tar -xf \"..\\{SPLIT_NAME}.zip\" -C .", "cwd": "{EXTRACT_DIR}"},
+            {"name": "Backup original APK", "type": "cmd", "cmd": "copy \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}.zip\"",
+             "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Extract APK (tar)", "type": "cmd", "cmd": "tar -xf \"..\\{SPLIT_NAME}.zip\" -C .",
+             "cwd": "{EXTRACT_DIR}"},
             {"name": "Apply Hex Patches", "type": "anchor_patch"},
-            {"name": "Repack APK (jar)", "type": "cmd", "cmd": "jar c0f \"{SPLIT_NAME}.apk\" AndroidManifest.xml lib stamp-cert-sha256 META-INF", "cwd": "{EXTRACT_DIR}"},
-            {"name": "Move repacked APK", "type": "cmd", "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"", "cwd": "{BASE_DIR}"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
+            {"name": "Repack APK (jar)", "type": "cmd",
+             "cmd": "jar c0f \"{SPLIT_NAME}.apk\" AndroidManifest.xml lib stamp-cert-sha256 META-INF",
+             "cwd": "{EXTRACT_DIR}"},
+            {"name": "Move repacked APK", "type": "cmd",
+             "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"",
+             "cwd": "{BASE_DIR}"},
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
+             "cwd": "{DEST_DIR}"}
         ],
         "BUILD_NATIVE": [
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
+             "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
-            {"name": "Install to Device", "type": "cmd", "cmd": "adb install-multiple -i com.android.vending {SIGNED_APKS}", "cwd": "{DEST_DIR}"}
+            {"name": "Install to Device", "type": "cmd",
+             "cmd": "adb install -r -t -d -i com.android.vending {SIGNED_APKS}", "cwd": "{DEST_DIR}"}
         ],
         "TRACE_START": [
             {"name": "Clear Logcat", "type": "cmd", "cmd": "adb logcat -c", "cwd": "{BASE_DIR}"},
@@ -54,6 +67,12 @@ class ConfigManager:
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     self.config = json.load(f)
+
+                # Fallback: Falls die neue Pipeline in einer bestehenden Config fehlt
+                if "PIPELINES" not in self.config:
+                    self.config["PIPELINES"] = {}
+                if "PREPARE_WORKSPACE" not in self.config["PIPELINES"]:
+                    self.config["PIPELINES"]["PREPARE_WORKSPACE"] = DEFAULT_CONFIG["PIPELINES"]["PREPARE_WORKSPACE"]
             except Exception:
                 self.config = DEFAULT_CONFIG.copy()
         else:
@@ -79,6 +98,10 @@ class ConfigManager:
         app_pkg = self.config.get("APP_PACKAGE", "")
         split = self.config.get("SPLIT_NAME", "")
 
+        adb_full_path = os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe")
+        if not os.path.exists(adb_full_path):
+            adb_full_path = "adb"
+
         self.paths = {
             "SOURCE_DIR": os.path.join(b_dir, "source"),
             "APP_SOURCE_DIR": os.path.join(b_dir, "source", app_pkg),
@@ -88,7 +111,8 @@ class ConfigManager:
             "JSON_HISTORY": os.path.join(b_dir, "RE_History.json"),
             "EXTRACT_DIR": os.path.join(b_dir, "source", app_pkg, split),
             "API_DB": os.path.join(b_dir, "api_traffic.db"),
-            "API_RULES": os.path.join(b_dir, "intercept_rules.json")
+            "API_RULES": os.path.join(b_dir, "intercept_rules.json"),
+            "ADB": adb_full_path
         }
 
         for d in ["SOURCE_DIR", "DEST_DIR", "ARCHIVE_DIR", "APP_SOURCE_DIR"]:

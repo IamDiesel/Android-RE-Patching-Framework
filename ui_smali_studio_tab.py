@@ -1,8 +1,7 @@
 import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import re
-import subprocess
 import threading
 import time
 
@@ -169,157 +168,49 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_outgoing.tag_configure("system_api", foreground="gray")
         self.right_nb.add(f_outgoing, text="Calls (Outgoing)")
 
-    def get_dir_size_mb(self, path):
-        total = 0
-        try:
-            for dirpath, _, filenames in os.walk(path):
-                for f in filenames:
-                    fp = os.path.join(dirpath, f)
-                    if not os.path.islink(fp):
-                        total += os.path.getsize(fp)
-        except:
-            pass
-        return total / (1024 * 1024)
-
     def unpack_apk_async(self):
         if self.app.check_lock(): return
-        app_source_dir = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
 
-        # Prüfen, welche APKs im Ordner liegen
+        # Prüfen, ob überhaupt APKs vorhanden sind
+        app_source_dir = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
         apks = [f for f in os.listdir(app_source_dir) if f.endswith(".apk")]
         if not apks:
             return messagebox.showwarning("Fehler", "Keine APKs im Source-Ordner gefunden!")
 
-        smali_dir = self.get_smali_dir()
+        # UI für den Entpack-Vorgang vorbereiten
+        self.progress_bar.pack(side="left", padx=5)
+        self.lbl_progress_status.pack(side="left", padx=5)
+        self.progress_bar.config(mode="indeterminate")
+        self.progress_bar.start()
+        self.lbl_progress_status.config(text="Bereite Workspace vor (Pipeline läuft)...")
 
         def task():
             self.app.is_unpacking = True
 
-            apkeditor_jar = os.path.join(self.app.cfg.config.get("BASE_DIR", ""),
-                                         self.app.cfg.config.get("APKEDITOR_JAR", "APKEditor.jar"))
+            # Führt die neue PREPARE_WORKSPACE Pipeline in der Engine aus
+            success = self.app.engine.run_pipeline("PREPARE_WORKSPACE")
 
-            self.app.after(0, lambda: self.progress_bar.pack(side="left", padx=5))
-            self.app.after(0, lambda: self.lbl_progress_status.pack(side="left", padx=5))
-            self.app.after(0, lambda: self.progress_var.set(5))
+            self.app.is_unpacking = False
+            self.app.after(0, self.progress_bar.stop)
+            self.app.after(0, self.progress_bar.pack_forget)
 
-            # --- NEU: SPLIT-APK MERGER (Verschmelzen zu Universal-APK) ---
-            target_apk = "base.apk"
-            if len(apks) > 1:
-                self.app.log(f"[*] {len(apks)} APKs erkannt. Verschmelze Split-APKs zu Universal-APK...")
-                self.app.after(0, lambda: self.lbl_progress_status.config(text="Verschmelze Splits..."))
+            if success:
+                self.app.after(0, lambda: self.lbl_progress_status.config(text="Erfolgreich entpackt! Indexiere..."))
 
-                # Der 'm' (Merge) Befehl des APKEditors
-                merge_cmd = f'java -jar "{apkeditor_jar}" m -i . -o merged_base.apk'
+                # Wenn das Entpacken geklappt hat, RAM-Index neu aufbauen
+                pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
+                source_smali = self.get_smali_dir()
+                dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), self.get_unpacked_dir_name())
 
-                try:
-                    # Wir nutzen subprocess.run für den schnellen, synchronen Merge
-                    subprocess.run(merge_cmd, shell=True, cwd=app_source_dir, check=True, stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
-                    self.app.log("[+] Split-APKs erfolgreich zu 'merged_base.apk' verschmolzen!")
-                    target_apk = "merged_base.apk"
-                except Exception as e:
-                    self.app.log(f"[!] Fehler beim Verschmelzen. Nutze normale base.apk. ({e})")
-            elif "merged_base.apk" in apks:
-                target_apk = "merged_base.apk"
-            # -------------------------------------------------------------
-
-            strategy = self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
-            unpacked_name = self.get_unpacked_dir_name()
-
-            if strategy == "apkeditor":
-                cmd = f'java -jar "{apkeditor_jar}" d -f -i "{target_apk}" -o "{unpacked_name}"'
-                tool_prefix = "[APKEditor]"
+                self.search_engine.build_ram_index(
+                    source_smali, dest_cache, pkg,
+                    lambda c: self.update_status(f"Bereit ({c} Dateien)")
+                )
             else:
-                cmd = f'apktool d "{target_apk}" -o "{unpacked_name}" -f'
-                tool_prefix = "[Apktool]"
+                self.app.after(0, lambda: self.lbl_progress_status.config(text="Fehler beim Vorbereiten!"))
 
-            self.app.log(f"[*] Starte Entpacken für Smali: {cmd}")
-            self.app.after(0, lambda: self.lbl_progress_status.config(text="Initialisiere..."))
-
-            try:
-                startupinfo = None
-                if os.name == 'nt':
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-                process = subprocess.Popen(cmd, shell=True, cwd=app_source_dir,
-                                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           text=True, bufsize=1, startupinfo=startupinfo,
-                                           errors="replace")
-
-                self.last_apktool_log = "Starte..."
-
-                def log_reader():
-                    for line in process.stdout:
-                        clean_line = line.strip()
-                        if clean_line:
-                            self.app.log(f"{tool_prefix} {clean_line}")
-                            self.last_apktool_log = clean_line
-                            if "Loading resource table" in clean_line or "Scanning XML directory" in clean_line:
-                                self.app.after(0, lambda: self.progress_var.set(20))
-                            elif "Decoding AndroidManifest.xml" in clean_line:
-                                self.app.after(0, lambda: self.progress_var.set(40))
-                            elif "Baksmaling" in clean_line or "Disassembling" in clean_line:
-                                self.app.after(0, lambda: self.progress_var.set(60))
-                            elif "Copying assets" in clean_line or "Copying raw" in clean_line or "Copying lib" in clean_line:
-                                self.app.after(0, lambda: self.progress_var.set(80))
-                            elif "Copying unknown" in clean_line or "Copying original" in clean_line:
-                                self.app.after(0, lambda: self.progress_var.set(90))
-
-                reader_thread = threading.Thread(target=log_reader, daemon=True)
-                reader_thread.start()
-
-                last_size = -1
-                stuck_counter = 0
-
-                while process.poll() is None:
-                    time.sleep(1)
-                    current_size = self.get_dir_size_mb(smali_dir)
-                    status_text = f"Entpacke... {current_size:.1f} MB geschrieben"
-
-                    if "Copying unknown" in self.last_apktool_log or "Copying original" in self.last_apktool_log:
-                        status_text = f"Kopiere Assets... {current_size:.1f} MB"
-
-                    self.app.after(0, lambda txt=status_text: self.lbl_progress_status.config(text=txt))
-
-                    if current_size == last_size and current_size > 5:
-                        stuck_counter += 1
-                        if stuck_counter >= 5 and "Copying" in self.last_apktool_log:
-                            self.app.log("[*] Ordner wächst nicht mehr. Beende blockierenden Prozess...")
-                            process.terminate()
-                            break
-                    else:
-                        stuck_counter = 0
-                        last_size = current_size
-
-                reader_thread.join(timeout=1.0)
-
-                if process.returncode in [0, 1, None]:
-                    self.app.after(0, lambda: self.progress_var.set(100))
-                    self.app.after(0, lambda: self.lbl_progress_status.config(text="Erfolgreich entpackt!"))
-                    self.app.log(f"[+] '{target_apk}' erfolgreich entpackt nach: {smali_dir}")
-
-                    pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
-                    source_smali = self.get_smali_dir()
-                    dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), unpacked_name)
-
-                    self.search_engine.build_ram_index(
-                        source_smali, dest_cache, pkg,
-                        lambda c: self.update_status(f"Bereit ({c} Dateien)")
-                    )
-                else:
-                    self.app.log(f"[!] Fehler beim Entpacken (Exit {process.returncode}).")
-                    self.app.after(0, lambda: self.lbl_progress_status.config(
-                        text=f"Fehler! Exit-Code: {process.returncode}"))
-
-            except Exception as e:
-                self.app.log(f"[!] Ausnahme beim Entpacken: {e}")
-            finally:
-                self.app.is_unpacking = False
-                self.app.after(3000, lambda: self.progress_bar.pack_forget())
-
+        # Asynchron starten, damit die GUI nicht blockiert
         threading.Thread(target=task, daemon=True).start()
-
 
     def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
         filepath = os.path.join(self.get_smali_dir(), rel_filepath)
