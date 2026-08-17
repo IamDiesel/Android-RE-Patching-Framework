@@ -30,12 +30,6 @@
                 "cwd": "{EXTRACT_DIR}"
             },
             {
-                "name": "Copy original splits to dest",
-                "type": "cmd",
-                "cmd": "copy *.apk \"{DEST_DIR}\\\"",
-                "cwd": "{APP_SOURCE_DIR}"
-            },
-            {
                 "name": "Move repacked APK",
                 "type": "cmd",
                 "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"",
@@ -56,12 +50,6 @@
             {
                 "name": "Apply Smali Patches",
                 "type": "smart_patch"
-            },
-            {
-                "name": "Copy original splits to dest",
-                "type": "cmd",
-                "cmd": "copy *.apk \"{DEST_DIR}\\\"",
-                "cwd": "{APP_SOURCE_DIR}"
             },
             {
                 "name": "Manifest & Build (Dynamic Strategy)",

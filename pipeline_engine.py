@@ -29,13 +29,14 @@ class SmaliOnlyStrategy(ManifestBuildStrategy):
 
     def build(self, engine):
         engine.log("[*] Baue App mit Standard Apktool (Ohne Ressourcen-Check)...")
-        cmd = "apktool b base_unpacked -o base.apk"
+        folder_name = engine.get_unpacked_dir_name()
+        cmd = f"apktool b {folder_name} -o base.apk"
         return engine._run_cmd_step({"cmd": cmd, "cwd": "{DEST_DIR}"})
 
 
 class Aapt2Strategy(ManifestBuildStrategy):
     def pre_process(self, engine):
-        engine.log("[*] AAPT2-Strategie: Achtung! Setzt Universal-APK oder fehlerfreie Ressourcen voraus.")
+        engine.log("[*] AAPT2-Strategie: Setzt Universal-APK oder fehlerfreie Ressourcen voraus.")
         return True
 
     def patch_manifest(self, engine):
@@ -43,8 +44,8 @@ class Aapt2Strategy(ManifestBuildStrategy):
 
     def build(self, engine):
         engine.log("[*] Baue App streng mit AAPT2...")
-        # FIX: --use-aapt2 entfernt, da es in v3 Standard ist
-        cmd = "apktool b base_unpacked -o base.apk"
+        folder_name = engine.get_unpacked_dir_name()
+        cmd = f"apktool b {folder_name} -o base.apk"
         return engine._run_cmd_step({"cmd": cmd, "cwd": "{DEST_DIR}"})
 
 
@@ -58,8 +59,8 @@ class ApkEditorStrategy(ManifestBuildStrategy):
 
     def build(self, engine):
         engine.log("[*] Baue App mit APKEditor (ohne AAPT2)...")
-        # FIX: Das '-f' Flag hinzugefügt, damit die alte base.apk gnadenlos überschrieben wird!
-        cmd = "java -jar \"{APKEDITOR_JAR}\" b -f -i base_unpacked -o base.apk"
+        folder_name = engine.get_unpacked_dir_name()
+        cmd = f"java -jar \"{{APKEDITOR_JAR}}\" b -f -i {folder_name} -o base.apk"
         return engine._run_cmd_step({"cmd": cmd, "cwd": "{DEST_DIR}"})
 
 
@@ -71,6 +72,11 @@ class PipelineEngine:
         self.get_archive_path = get_archive_path_func
         self.logcat_process = None
         self.logcat_out = None
+
+    def get_unpacked_dir_name(self):
+        """Ermittelt den dynamischen Ordnernamen basierend auf der Strategie."""
+        strategy = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+        return "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
 
     def run_pipeline(self, pipeline_name):
         pipeline = self.cfg.config.get("PIPELINES", {}).get(pipeline_name, [])
@@ -90,7 +96,7 @@ class PipelineEngine:
                 success = self._run_cmd_step(step)
             elif step_type == "mirror_workspace":
                 success = self._mirror_workspace()
-            elif step_type == "manifest_and_build":  # <--- Dynamischer Strategie-Aufruf
+            elif step_type == "manifest_and_build":
                 success = self._run_manifest_and_build_strategy()
             elif step_type == "anchor_patch":
                 success = self._apply_hex_patches()
@@ -112,17 +118,18 @@ class PipelineEngine:
         return True
 
     def _mirror_workspace(self):
-        """Kopiert den entpackten Ordner in die Destination (überschreibt bestehende Dateien für einen sauberen Build)."""
-        src = os.path.join(self.cfg.paths["APP_SOURCE_DIR"], "base_unpacked")
-        dst = os.path.join(self.cfg.paths["DEST_DIR"], "base_unpacked")
+        """Kopiert den entpackten Ordner in die Destination."""
+        folder_name = self.get_unpacked_dir_name()
+        src = os.path.join(self.cfg.paths["APP_SOURCE_DIR"], folder_name)
+        dst = os.path.join(self.cfg.paths["DEST_DIR"], folder_name)
 
         if not os.path.exists(src):
-            self.log("[!] Original-Ordner fehlt in Source. Hast du die APK entpackt?")
+            self.log(
+                f"[!] Original-Ordner '{folder_name}' fehlt in Source. Hast du die APK mit dieser Strategie entpackt?")
             return False
 
-        self.log("[*] Synchronisiere Original-Dateien in den Destination-Workspace...")
+        self.log(f"[*] Synchronisiere '{folder_name}' in den Destination-Workspace...")
         try:
-            # FIX: dirs_exist_ok=True erzwingt das Kopieren/Überschreiben, auch wenn der Ordner (durch die .pkl) schon existiert!
             shutil.copytree(src, dst, dirs_exist_ok=True)
             self.log("[+] Arbeitskopie erfolgreich synchronisiert.")
             return True
@@ -132,10 +139,9 @@ class PipelineEngine:
 
     def _inject_nsc(self):
         """Injiziert automatisch eine Network Security Config, um User-Zertifikate (Mitmproxy) zu erlauben."""
-        dest_dir = os.path.join(self.cfg.paths["DEST_DIR"], "base_unpacked")
+        folder_name = self.get_unpacked_dir_name()
+        dest_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name)
         manifest_path = os.path.join(dest_dir, "AndroidManifest.xml")
-        xml_dir = os.path.join(dest_dir, "res", "xml")
-        nsc_path = os.path.join(xml_dir, "kippy_nsc.xml")
 
         if not os.path.exists(manifest_path):
             self.log("[!] AndroidManifest.xml nicht gefunden. Überspringe NSC-Injection.")
@@ -143,8 +149,6 @@ class PipelineEngine:
 
         self.log("[*] Injiziere Network Security Config für Mitmproxy (User-Certs)...")
 
-        # 1. Freizügige XML-Datei anlegen
-        os.makedirs(xml_dir, exist_ok=True)
         nsc_content = '''<?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
     <base-config cleartextTrafficPermitted="true">
@@ -155,18 +159,33 @@ class PipelineEngine:
     </base-config>
 </network-security-config>'''
 
-        # 2. Manifest parsen und anpassen
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 manifest_data = f.read()
         except UnicodeDecodeError:
             self.log("[!] FEHLER: AndroidManifest.xml ist binär kompiliert (AXML)!")
             self.log("[!] NSC-Injection übersprungen. Bitte entpacke die App neu (ohne '-r' Flag).")
-            # Wir brechen den Build nicht ab, überspringen aber das Injizieren
             return True
 
         import re
         match = re.search(r'android:networkSecurityConfig="@xml/([^"]+)"', manifest_data)
+
+        # Finde das richtige res/xml Verzeichnis
+        strategy_name = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+        xml_dir = None
+        
+        if strategy_name == "apkeditor":
+            res_root = os.path.join(dest_dir, "resources")
+            for root, dirs, files in os.walk(res_root):
+                if os.path.basename(root) == "xml" and os.path.basename(os.path.dirname(root)) == "res":
+                    xml_dir = root
+                    break
+            if not xml_dir:
+                xml_dir = os.path.join(res_root, "package_1", "res", "xml")
+        else:
+            xml_dir = os.path.join(dest_dir, "res", "xml")
+
+        os.makedirs(xml_dir, exist_ok=True)
 
         if match:
             existing_nsc_name = match.group(1)
@@ -175,6 +194,7 @@ class PipelineEngine:
                 f.write(nsc_content)
             self.log(f"[+] Existierende NSC '{existing_nsc_name}.xml' mit User-Cert-Trust überschrieben!")
         else:
+            nsc_path = os.path.join(xml_dir, "kippy_nsc.xml")
             with open(nsc_path, "w", encoding="utf-8") as f:
                 f.write(nsc_content)
             manifest_data = manifest_data.replace("<application ",
@@ -186,30 +206,61 @@ class PipelineEngine:
         return True
 
     def _apply_smart_patches(self):
-        """Wendet Patches sicher in der Destination an (inklusive Undo-Funktion)."""
+        """Wendet Patches an. Bei Abweichungen der Decompiler-Formatierung wird der Nutzer interaktiv gefragt."""
         patches = [p for p in self.get_patches() if p.get("type") == "smali"]
         if not patches:
             self.log("[*] Keine Smali-Patches definiert, überspringe.")
             return True
 
-        src_dir = os.path.join(self.cfg.paths.get("APP_SOURCE_DIR", ""), "base_unpacked")
-        dst_dir = os.path.join(self.cfg.paths.get("DEST_DIR", ""), "base_unpacked")
+        folder_name = self.get_unpacked_dir_name()
+        src_dir = os.path.join(self.cfg.paths.get("APP_SOURCE_DIR", ""), folder_name)
+        dst_dir = os.path.join(self.cfg.paths.get("DEST_DIR", ""), folder_name)
+
+        target_tool = "apkeditor" if self.cfg.config.get("MANIFEST_STRATEGY",
+                                                         "smali_only") == "apkeditor" else "apktool"
 
         for idx, p in enumerate(patches):
-            rel_file = p.get("file", "")
-            src_file = os.path.join(src_dir, rel_file)
-            dst_file = os.path.join(dst_dir, rel_file)
+            rel_file = p.get("file", "").replace("\\", "/")
+            parts = rel_file.split("/")
 
-            # 1. Single-File Reset: Garantiert sauberen Status für entfernte/bearbeitete Patches
+            # --- DER INTELLIGENTE PFAD-KONVERTER ---
+            dex_idx = None
+            pure_path = rel_file
+
+            if parts[0] == "smali" and len(parts) > 1 and parts[1].startswith("classes"):
+                dex_idx = parts[1].replace("classes", "")
+                pure_path = "/".join(parts[2:])
+            elif parts[0].startswith("smali_classes"):
+                dex_idx = parts[0].replace("smali_classes", "")
+                pure_path = "/".join(parts[1:])
+            elif parts[0] == "smali":
+                dex_idx = ""
+                pure_path = "/".join(parts[1:])
+
+            if dex_idx is not None:
+                if target_tool == "apkeditor":
+                    actual_rel_file = f"smali/classes{dex_idx}/{pure_path}"
+                else:
+                    actual_rel_file = f"smali/{pure_path}" if dex_idx == "" else f"smali_classes{dex_idx}/{pure_path}"
+            else:
+                actual_rel_file = rel_file
+
+            actual_rel_file = actual_rel_file.replace("/", os.sep)
+            # ----------------------------------------
+
+            src_file = os.path.join(src_dir, actual_rel_file)
+            dst_file = os.path.join(dst_dir, actual_rel_file)
+
+            if not os.path.exists(src_file):
+                self.log(f"[!] Originaldatei nicht in Source gefunden: {actual_rel_file}")
+                return False
+
             if os.path.exists(src_file):
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
                 shutil.copy2(src_file, dst_file)
-            else:
-                self.log(f"[!] Originaldatei nicht in Source gefunden: {src_file}")
-                return False
 
-            # 2. Patchvorgang auf der Destination-Datei
             try:
+                import re
                 with open(dst_file, "r", encoding="utf-8") as f:
                     content = f.read()
 
@@ -217,15 +268,61 @@ class PipelineEngine:
                 edit_block = p.get("edit", "").replace("\r\n", "\n")
                 content = content.replace("\r\n", "\n")
 
-                if orig_block not in content:
-                    self.log(f"[!] Original-Block in '{rel_file}' nicht gefunden! (Hat sich der Code geändert?)")
-                    return False
+                # Fall 1: Patch passt perfekt
+                if orig_block in content:
+                    content = content.replace(orig_block, edit_block)
+                    self.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{actual_rel_file}' angewendet.")
+                else:
+                    # Fall 2: Interaktives Fuzzy Matching (Konfliktauflösung)
+                    method_match = re.search(r'^(\.method\s+[^\n]+)', orig_block, re.MULTILINE)
+                    if method_match:
+                        method_sig = method_match.group(1).strip()
+                        # Suchen der exakten Methodensignatur in der aktuellen Datei
+                        actual_method_pattern = re.compile(r'^' + re.escape(method_sig) + r'.*?^\.end method',
+                                                           re.MULTILINE | re.DOTALL)
+                        actual_match = actual_method_pattern.search(content)
 
-                content = content.replace(orig_block, edit_block)
+                        if actual_match:
+                            actual_block = actual_match.group(0)
 
+                            # Dialog für den Nutzer generieren
+                            msg = f"Patch {idx + 1} weicht von der Datei ab!\n\n"
+                            msg += f"Datei: {actual_rel_file}\n"
+                            msg += f"Methode: {method_sig}\n\n"
+                            msg += "Die Decompiler-Formatierung (.line-Nummern, Kommentare) unterscheidet sich "
+                            msg += "vom gespeicherten Patch (Apktool vs APKEditor).\n\n"
+                            msg += "Soll die Methode trotzdem durch deinen Patch überschrieben werden?\n\n"
+                            msg += "[Ja] = Patch anwenden (Überschreiben)\n"
+                            msg += "[Nein] = Diesen Patch überspringen\n"
+                            msg += "[Abbrechen] = Pipeline sofort stoppen"
+
+                            answer = messagebox.askyesnocancel("Patch Abweichung erkannt", msg)
+
+                            if answer is True:
+                                # Nutzer stimmt zu: Methode komplett überschreiben
+                                content = content.replace(actual_block, edit_block)
+                                self.log(f"[*] Smali-Patch {idx + 1} (Fuzzy) durch Nutzer bestätigt und angewendet.")
+                            elif answer is False:
+                                # Nutzer lehnt ab: Überspringen
+                                self.log(f"[*] Smali-Patch {idx + 1} vom Nutzer absichtlich übersprungen.")
+                                continue
+                            else:
+                                # Nutzer klickt Abbrechen
+                                self.log(f"[!] Pipeline durch Nutzer bei Patch {idx + 1} abgebrochen.")
+                                return False
+                        else:
+                            self.log(
+                                f"[!] Methodensignatur '{method_sig}' für Patch {idx + 1} in '{actual_rel_file}' nicht gefunden!")
+                            return False
+                    else:
+                        self.log(
+                            f"[!] Original-Block in '{actual_rel_file}' nicht gefunden und keine .method Signatur erkannt!")
+                        return False
+
+                # Änderungen speichern
                 with open(dst_file, "w", encoding="utf-8") as f:
                     f.write(content)
-                self.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{rel_file}' angewendet.")
+
             except Exception as e:
                 self.log(f"[!] Fehler beim Anwenden von Smali-Patch: {e}")
                 return False

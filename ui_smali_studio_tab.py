@@ -24,10 +24,15 @@ class SmaliStudioTab(ttk.Frame):
 
         self.create_widgets()
 
+    def get_unpacked_dir_name(self):
+        """Ermittelt den dynamischen Ordnernamen basierend auf der Strategie."""
+        strategy = self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+        return "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
+
     def get_smali_dir(self):
         """Liefert das Read-Only Source-Verzeichnis der entpackten App."""
         app_source = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
-        return os.path.join(app_source, "base_unpacked")
+        return os.path.join(app_source, self.get_unpacked_dir_name())
 
     def update_status(self, msg):
         self.app.after(0, lambda: self.lbl_progress_status.config(text=msg))
@@ -45,7 +50,9 @@ class SmaliStudioTab(ttk.Frame):
         source_smali = self.get_smali_dir()
         if os.path.exists(source_smali):
             pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
-            dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), "base_unpacked")
+            # FIX: Dynamischer Ordnername für den Cache
+            unpacked_name = self.get_unpacked_dir_name()
+            dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), unpacked_name)
 
             self.search_engine.build_ram_index(
                 source_smali,
@@ -57,7 +64,7 @@ class SmaliStudioTab(ttk.Frame):
                                 "Der gespeicherte Cache wird in den RAM geladen.\nBitte versuche es in 2-3 Sekunden nochmal!")
             return False
 
-        # Wenn der Ordner gar nicht existiert, muss Apktool ran
+        # Wenn der Ordner gar nicht existiert, muss Apktool/APKEditor ran
         messagebox.showwarning("Fehler",
                                "Kein entpackter Code gefunden!\n\nBitte klicke zuerst oben links auf '📦 APK Entpacken & Indexieren'.")
         return False
@@ -176,22 +183,58 @@ class SmaliStudioTab(ttk.Frame):
 
     def unpack_apk_async(self):
         if self.app.check_lock(): return
-
         app_source_dir = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
-        if not app_source_dir or not os.path.exists(os.path.join(app_source_dir, "base.apk")):
-            return messagebox.showwarning("Fehler", "base.apk fehlt im Source-Ordner!")
+
+        # Prüfen, welche APKs im Ordner liegen
+        apks = [f for f in os.listdir(app_source_dir) if f.endswith(".apk")]
+        if not apks:
+            return messagebox.showwarning("Fehler", "Keine APKs im Source-Ordner gefunden!")
 
         smali_dir = self.get_smali_dir()
 
         def task():
             self.app.is_unpacking = True
-            cmd = 'apktool d "base.apk" -o "base_unpacked" -f'
-            self.app.log(f"[*] Starte Entpacken für Smali: {cmd}")
+
+            apkeditor_jar = os.path.join(self.app.cfg.config.get("BASE_DIR", ""),
+                                         self.app.cfg.config.get("APKEDITOR_JAR", "APKEditor.jar"))
 
             self.app.after(0, lambda: self.progress_bar.pack(side="left", padx=5))
             self.app.after(0, lambda: self.lbl_progress_status.pack(side="left", padx=5))
             self.app.after(0, lambda: self.progress_var.set(5))
-            self.app.after(0, lambda: self.lbl_progress_status.config(text="Initialisiere Apktool..."))
+
+            # --- NEU: SPLIT-APK MERGER (Verschmelzen zu Universal-APK) ---
+            target_apk = "base.apk"
+            if len(apks) > 1:
+                self.app.log(f"[*] {len(apks)} APKs erkannt. Verschmelze Split-APKs zu Universal-APK...")
+                self.app.after(0, lambda: self.lbl_progress_status.config(text="Verschmelze Splits..."))
+
+                # Der 'm' (Merge) Befehl des APKEditors
+                merge_cmd = f'java -jar "{apkeditor_jar}" m -i . -o merged_base.apk'
+
+                try:
+                    # Wir nutzen subprocess.run für den schnellen, synchronen Merge
+                    subprocess.run(merge_cmd, shell=True, cwd=app_source_dir, check=True, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    self.app.log("[+] Split-APKs erfolgreich zu 'merged_base.apk' verschmolzen!")
+                    target_apk = "merged_base.apk"
+                except Exception as e:
+                    self.app.log(f"[!] Fehler beim Verschmelzen. Nutze normale base.apk. ({e})")
+            elif "merged_base.apk" in apks:
+                target_apk = "merged_base.apk"
+            # -------------------------------------------------------------
+
+            strategy = self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+            unpacked_name = self.get_unpacked_dir_name()
+
+            if strategy == "apkeditor":
+                cmd = f'java -jar "{apkeditor_jar}" d -f -i "{target_apk}" -o "{unpacked_name}"'
+                tool_prefix = "[APKEditor]"
+            else:
+                cmd = f'apktool d "{target_apk}" -o "{unpacked_name}" -f'
+                tool_prefix = "[Apktool]"
+
+            self.app.log(f"[*] Starte Entpacken für Smali: {cmd}")
+            self.app.after(0, lambda: self.lbl_progress_status.config(text="Initialisiere..."))
 
             try:
                 startupinfo = None
@@ -210,13 +253,13 @@ class SmaliStudioTab(ttk.Frame):
                     for line in process.stdout:
                         clean_line = line.strip()
                         if clean_line:
-                            self.app.log(f"[Apktool] {clean_line}")
+                            self.app.log(f"{tool_prefix} {clean_line}")
                             self.last_apktool_log = clean_line
-                            if "Loading resource table" in clean_line:
+                            if "Loading resource table" in clean_line or "Scanning XML directory" in clean_line:
                                 self.app.after(0, lambda: self.progress_var.set(20))
                             elif "Decoding AndroidManifest.xml" in clean_line:
                                 self.app.after(0, lambda: self.progress_var.set(40))
-                            elif "Baksmaling" in clean_line:
+                            elif "Baksmaling" in clean_line or "Disassembling" in clean_line:
                                 self.app.after(0, lambda: self.progress_var.set(60))
                             elif "Copying assets" in clean_line or "Copying raw" in clean_line or "Copying lib" in clean_line:
                                 self.app.after(0, lambda: self.progress_var.set(80))
@@ -232,8 +275,8 @@ class SmaliStudioTab(ttk.Frame):
                 while process.poll() is None:
                     time.sleep(1)
                     current_size = self.get_dir_size_mb(smali_dir)
-
                     status_text = f"Entpacke... {current_size:.1f} MB geschrieben"
+
                     if "Copying unknown" in self.last_apktool_log or "Copying original" in self.last_apktool_log:
                         status_text = f"Kopiere Assets... {current_size:.1f} MB"
 
@@ -242,7 +285,7 @@ class SmaliStudioTab(ttk.Frame):
                     if current_size == last_size and current_size > 5:
                         stuck_counter += 1
                         if stuck_counter >= 5 and "Copying" in self.last_apktool_log:
-                            self.app.log("[*] Ordner wächst nicht mehr. Beende blockierenden Apktool-Prozess...")
+                            self.app.log("[*] Ordner wächst nicht mehr. Beende blockierenden Prozess...")
                             process.terminate()
                             break
                     else:
@@ -254,11 +297,11 @@ class SmaliStudioTab(ttk.Frame):
                 if process.returncode in [0, 1, None]:
                     self.app.after(0, lambda: self.progress_var.set(100))
                     self.app.after(0, lambda: self.lbl_progress_status.config(text="Erfolgreich entpackt!"))
-                    self.app.log(f"[+] base.apk erfolgreich entpackt nach: {smali_dir}")
+                    self.app.log(f"[+] '{target_apk}' erfolgreich entpackt nach: {smali_dir}")
 
                     pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
                     source_smali = self.get_smali_dir()
-                    dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), "base_unpacked")
+                    dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), unpacked_name)
 
                     self.search_engine.build_ram_index(
                         source_smali, dest_cache, pkg,
@@ -276,6 +319,7 @@ class SmaliStudioTab(ttk.Frame):
                 self.app.after(3000, lambda: self.progress_bar.pack_forget())
 
         threading.Thread(target=task, daemon=True).start()
+
 
     def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
         filepath = os.path.join(self.get_smali_dir(), rel_filepath)
@@ -405,14 +449,35 @@ class SmaliStudioTab(ttk.Frame):
 
     def resolve_smali_path(self, rel_base):
         smali_dir = self.get_smali_dir()
+        pure_path_os = rel_base.replace("/", os.sep)
+
+        target_tool = "apkeditor" if self.app.cfg.config.get("MANIFEST_STRATEGY",
+                                                             "smali_only") == "apkeditor" else "apktool"
+
+        # 1. Ermittle nur die echten Root-Ordner basierend auf dem Tool
+        possible_roots = []
         try:
-            for item in os.listdir(smali_dir):
-                if item.startswith("smali") and os.path.isdir(os.path.join(smali_dir, item)):
-                    test_path = os.path.join(item, rel_base)
-                    if os.path.exists(os.path.join(smali_dir, test_path)):
-                        return test_path
+            if target_tool == "apkeditor":
+                base_smali = os.path.join(smali_dir, "smali")
+                if os.path.exists(base_smali):
+                    for d in os.listdir(base_smali):
+                        if d.startswith("classes"):
+                            possible_roots.append(os.path.join("smali", d))
+            else:
+                if os.path.exists(smali_dir):
+                    for d in os.listdir(smali_dir):
+                        if d == "smali" or d.startswith("smali_classes"):
+                            possible_roots.append(d)
+
+            # 2. Prüfe gezielt nur in diesen Root-Ordnern
+            for root in possible_roots:
+                test_path = os.path.join(smali_dir, root, pure_path_os)
+                if os.path.exists(test_path):
+                    # Wir zwingen die Ausgabe auf '/', da die UI-Elemente das erwarten
+                    return os.path.join(root, pure_path_os).replace("\\", "/")
         except:
             pass
+
         return None
 
     def find_incoming_xrefs(self):
@@ -585,7 +650,7 @@ class SmaliStudioTab(ttk.Frame):
         top = tk.Toplevel(self.app)
         self.search_window = top  # FIX: Referenz für den Singleton-Check speichern
 
-        top.title("  Globale RAM-Suche (Echtzeit)")
+        top.title("🔍 Globale RAM-Suche (Echtzeit)")
         top.geometry("900x550")
         top.attributes("-topmost", True)  # FIX: Korrektes Windows-Attribut
         # ---------------------------------------------------------------------------------

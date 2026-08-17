@@ -9,37 +9,24 @@ DEFAULT_CONFIG = {
     "APP_PACKAGE": "com.datamars.kippynew",
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
-    "MANIFEST_STRATEGY": "smali_only",
+    "MANIFEST_STRATEGY": "apkeditor",
     "PIPELINES": {
         "BUILD_FLUTTER": [
-            {"name": "Backup original APK", "type": "cmd", "cmd": "copy \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}.zip\"",
-             "cwd": "{APP_SOURCE_DIR}"},
-            {"name": "Extract APK (tar)", "type": "cmd", "cmd": "tar -xf \"..\\{SPLIT_NAME}.zip\" -C .",
-             "cwd": "{EXTRACT_DIR}"},
+            {"name": "Backup original APK", "type": "cmd", "cmd": "copy \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}.zip\"", "cwd": "{APP_SOURCE_DIR}"},
+            {"name": "Extract APK (tar)", "type": "cmd", "cmd": "tar -xf \"..\\{SPLIT_NAME}.zip\" -C .", "cwd": "{EXTRACT_DIR}"},
             {"name": "Apply Hex Patches", "type": "anchor_patch"},
-            {"name": "Repack APK (jar)", "type": "cmd",
-             "cmd": "jar c0f \"{SPLIT_NAME}.apk\" AndroidManifest.xml lib stamp-cert-sha256 META-INF",
-             "cwd": "{EXTRACT_DIR}"},
-            {"name": "Copy original splits to dest", "type": "cmd", "cmd": "copy *.apk \"{DEST_DIR}\\\"",
-             "cwd": "{APP_SOURCE_DIR}"},
-            {"name": "Move repacked APK", "type": "cmd",
-             "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"",
-             "cwd": "{BASE_DIR}"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
-             "cwd": "{DEST_DIR}"}
+            {"name": "Repack APK (jar)", "type": "cmd", "cmd": "jar c0f \"{SPLIT_NAME}.apk\" AndroidManifest.xml lib stamp-cert-sha256 META-INF", "cwd": "{EXTRACT_DIR}"},
+            {"name": "Move repacked APK", "type": "cmd", "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"", "cwd": "{BASE_DIR}"},
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "BUILD_NATIVE": [
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
-            {"name": "Copy original splits to dest", "type": "cmd", "cmd": "copy *.apk \"{DEST_DIR}\\\"",
-             "cwd": "{APP_SOURCE_DIR}"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
-             "cwd": "{DEST_DIR}"}
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
-            {"name": "Install to Device", "type": "cmd",
-             "cmd": "adb install-multiple -i com.android.vending {SIGNED_APKS}", "cwd": "{DEST_DIR}"}
+            {"name": "Install to Device", "type": "cmd", "cmd": "adb install-multiple -i com.android.vending {SIGNED_APKS}", "cwd": "{DEST_DIR}"}
         ],
         "TRACE_START": [
             {"name": "Clear Logcat", "type": "cmd", "cmd": "adb logcat -c", "cwd": "{BASE_DIR}"},
