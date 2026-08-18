@@ -8,6 +8,8 @@ import time
 from cg_manager import is_system_api
 from smali_editor import SmaliEditorWidget
 from smali_search import SmaliSearchEngine
+from smali_struct_manager import SmaliStructManager
+from ui_utils import UIUtils
 
 
 class SmaliStudioTab(ttk.Frame):
@@ -21,7 +23,19 @@ class SmaliStudioTab(ttk.Frame):
         # Init Search Engine
         self.search_engine = SmaliSearchEngine(self.app.log, self.update_status)
 
+        # Init Structure Manager für eigene Klassen
+        self.struct_manager = SmaliStructManager(
+            self.app,
+            self.get_smali_dir(),
+            self.search_engine,
+            self.refresh_custom_structures_list
+        )
+
         self.create_widgets()
+
+        # UI-Verbesserungen und Shortcuts initialisieren
+        UIUtils.apply_panedwindow_style()
+        UIUtils.setup_global_shortcuts(self.winfo_toplevel())
 
     def get_unpacked_dir_name(self):
         """Ermittelt den dynamischen Ordnernamen basierend auf der Strategie."""
@@ -45,11 +59,9 @@ class SmaliStudioTab(ttk.Frame):
             messagebox.showinfo("Warte", "RAM Index wird gerade aufgebaut. Bitte kurz warten.")
             return False
 
-        # Automatischer Lade-Versuch, falls der Ordner nach einem Neustart schon existiert
         source_smali = self.get_smali_dir()
         if os.path.exists(source_smali):
             pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
-            # FIX: Dynamischer Ordnername für den Cache
             unpacked_name = self.get_unpacked_dir_name()
             dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), unpacked_name)
 
@@ -63,7 +75,6 @@ class SmaliStudioTab(ttk.Frame):
                                 "Der gespeicherte Cache wird in den RAM geladen.\nBitte versuche es in 2-3 Sekunden nochmal!")
             return False
 
-        # Wenn der Ordner gar nicht existiert, muss Apktool/APKEditor ran
         messagebox.showwarning("Fehler",
                                "Kein entpackter Code gefunden!\n\nBitte klicke zuerst oben links auf '📦 APK Entpacken & Indexieren'.")
         return False
@@ -75,6 +86,9 @@ class SmaliStudioTab(ttk.Frame):
 
         ttk.Button(top_bar, text="📦 APK Entpacken & Indexieren", command=self.unpack_apk_async).pack(side="left",
                                                                                                      padx=5)
+
+        # NEU: "+" Button für eigene Strukturen
+        ttk.Button(top_bar, text="➕ Neue Struktur", command=self.open_create_struct_dialog).pack(side="left", padx=5)
 
         self.progress_var = tk.IntVar()
         self.progress_bar = ttk.Progressbar(top_bar, variable=self.progress_var, maximum=100, length=150)
@@ -99,11 +113,14 @@ class SmaliStudioTab(ttk.Frame):
         self.smali_tree.pack(side="left", fill="both", expand=True)
         self.smali_tree.bind("<Delete>", lambda e: self.remove_smali_patch())
 
+        # NEU: Doppelklick auf angewendete Patches zum Editieren
+        self.smali_tree.bind("<Double-1>", self.on_patch_double_click)
+
         # -- 3. MAIN IDE LAYOUT (Links, Mitte, Rechts) --
         main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_paned.pack(side="top", fill="both", expand=True, padx=5, pady=5)
 
-        # LINKES PANEL (Notebook: Outline, CallGraph, DataGraph)
+        # LINKES PANEL (Notebook: Outline, CallGraph, DataGraph, Eigene Strukturen)
         self.left_nb = ttk.Notebook(main_paned)
         main_paned.add(self.left_nb, weight=1)
 
@@ -138,13 +155,24 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_datagraph.heading("Target", text="Variable / Feld")
         self.tree_datagraph.column("Access", width=60, stretch=False)
         self.tree_datagraph.pack(fill="both", expand=True)
-        self.tree_datagraph.tag_configure("read", foreground="#6A9955")  # Grün für GET
-        self.tree_datagraph.tag_configure("write", foreground="#D16969")  # Rot für PUT
+        self.tree_datagraph.tag_configure("read", foreground="#6A9955")
+        self.tree_datagraph.tag_configure("write", foreground="#D16969")
         self.left_nb.add(f_datagraph, text="Data Graph")
+
+        # NEU: EGENE STRUKTUREN TAB
+        f_custom_structs = ttk.Frame(self.left_nb)
+        self.tree_custom_structs = ttk.Treeview(f_custom_structs, columns=("Path",), show="headings")
+        self.tree_custom_structs.heading("Path", text="Erstellte Smali Dateien")
+        self.tree_custom_structs.pack(fill="both", expand=True)
+        self.tree_custom_structs.bind("<Double-1>", self.on_custom_struct_double_click)
+        self.left_nb.add(f_custom_structs, text="Eigene Strukturen")
 
         # CENTER PANEL (Editor Component)
         self.editor = SmaliEditorWidget(main_paned)
         main_paned.add(self.editor, weight=3)
+
+        # Baukasten-Kontextmenü für den Editor einrichten
+        self.setup_snippet_context_menu()
 
         # RECHTES PANEL (Notebook: XREFs In/Out)
         self.right_nb = ttk.Notebook(main_paned)
@@ -171,13 +199,11 @@ class SmaliStudioTab(ttk.Frame):
     def unpack_apk_async(self):
         if self.app.check_lock(): return
 
-        # Prüfen, ob überhaupt APKs vorhanden sind
         app_source_dir = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
         apks = [f for f in os.listdir(app_source_dir) if f.endswith(".apk")]
         if not apks:
             return messagebox.showwarning("Fehler", "Keine APKs im Source-Ordner gefunden!")
 
-        # UI für den Entpack-Vorgang vorbereiten
         self.progress_bar.pack(side="left", padx=5)
         self.lbl_progress_status.pack(side="left", padx=5)
         self.progress_bar.config(mode="indeterminate")
@@ -186,10 +212,7 @@ class SmaliStudioTab(ttk.Frame):
 
         def task():
             self.app.is_unpacking = True
-
-            # Führt die neue PREPARE_WORKSPACE Pipeline in der Engine aus
             success = self.app.engine.run_pipeline("PREPARE_WORKSPACE")
-
             self.app.is_unpacking = False
             self.app.after(0, self.progress_bar.stop)
             self.app.after(0, self.progress_bar.pack_forget)
@@ -197,7 +220,9 @@ class SmaliStudioTab(ttk.Frame):
             if success:
                 self.app.after(0, lambda: self.lbl_progress_status.config(text="Erfolgreich entpackt! Indexiere..."))
 
-                # Wenn das Entpacken geklappt hat, RAM-Index neu aufbauen
+                # Aktualisiere den Pfad im Struktur-Manager nach dem Entpacken
+                self.struct_manager.smali_dir = self.get_smali_dir()
+
                 pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
                 source_smali = self.get_smali_dir()
                 dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), self.get_unpacked_dir_name())
@@ -209,8 +234,206 @@ class SmaliStudioTab(ttk.Frame):
             else:
                 self.app.after(0, lambda: self.lbl_progress_status.config(text="Fehler beim Vorbereiten!"))
 
-        # Asynchron starten, damit die GUI nicht blockiert
         threading.Thread(target=task, daemon=True).start()
+
+    # --- NEU: DIALOG & LOGIK FÜR NEUE STRUKTUREN ---
+
+    def open_create_struct_dialog(self):
+        """Öffnet das Dialogfenster zum Erstellen neuer Klassen."""
+        if not self.search_engine.is_indexed:
+            return messagebox.showwarning("Index fehlt",
+                                          "Bitte entpacke zuerst eine APK, um Strukturen anlegen zu können.")
+
+        dialog = tk.Toplevel(self)
+        dialog.title("➕ Neue Smali-Struktur anlegen")
+        dialog.geometry("600x250")
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Relativer Pfad (ab Workspace-Root):", font=("Segoe UI", 9, "bold")).pack(anchor="w",
+                                                                                                         padx=10,
+                                                                                                         pady=5)
+
+        f_path = ttk.Frame(dialog)
+        f_path.pack(fill="x", padx=10, pady=2)
+
+        ent_path = ttk.Entry(f_path)
+        ent_path.pack(side="left", fill="x", expand=True)
+        # Vorschlagspfad generieren
+        ent_path.insert(0, self.struct_manager.get_default_path(self.current_smali_file))
+
+        def browse_path():
+            # Öffnet den File-Manager im aktuellen Smali-Verzeichnis
+            init_dir = self.get_smali_dir()
+            chosen_file = filedialog.asksaveasfilename(
+                initialdir=init_dir,
+                title="Smali-Speicherort wählen",
+                filetypes=[("Smali Files", "*.smali")],
+                defaultextension=".smali"
+            )
+            if chosen_file:
+                # Schneide den absoluten Pfadanteil des Workspace-Roots ab
+                rel = os.path.relpath(chosen_file, init_dir).replace("\\", "/")
+                ent_path.delete(0, tk.END)
+                ent_path.insert(0, rel)
+
+        ttk.Button(f_path, text="📁 Auswählen", command=browse_path).pack(side="right", padx=5)
+
+        ttk.Label(dialog, text="Klassen-Typ Vorlage:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=5)
+        combo_type = ttk.Combobox(dialog, values=["Standard-Klasse", "BroadcastReceiver-Komponente"], state="readonly")
+        combo_type.pack(fill="x", padx=10, pady=2)
+        combo_type.current(0)
+
+        def confirm():
+            rel_p = ent_path.get().strip()
+            if not rel_p: return
+
+            # Dalvik Pfad aus Dateiname berechnen (z.B. smali/com/test/Class.smali -> Lcom/test/Class;)
+            clean_p = rel_p.replace(".smali", "")
+            parts = clean_p.split("/")
+            # Wenn ein Root-Ordner wie smali_classes2 vorne steht, ignorieren wir ihn für den Klassennamen
+            start_idx = 1 if parts[0].startswith("smali") else 0
+            dalvik_classname = "L" + "/".join(parts[start_idx:]) + ";"
+
+            if combo_type.get() == "BroadcastReceiver-Komponente":
+                base_code = self.struct_manager.snippets.get("Android API (Intents/Context)", {}).get(
+                    "BroadcastReceiver Klasse", "")
+                base_code = base_code.replace("Lcom/example/MyBroadcastReceiver;", dalvik_classname)
+            else:
+                base_code = self.struct_manager.snippets.get("Struktur & Interfaces", {}).get("Neue Klasse (.class)",
+                                                                                              "")
+                base_code = base_code.replace("Lcom/example/MyClass;", dalvik_classname)
+
+            # Physisch anlegen
+            if self.struct_manager.create_new_structure(rel_p, base_code):
+                dialog.destroy()
+                # Direkt im Editor zum Bearbeiten laden
+                self.load_custom_structure_into_editor(rel_p)
+
+        ttk.Button(dialog, text="🚀 Struktur generieren", command=confirm).pack(pady=20)
+
+    def refresh_custom_structures_list(self):
+        """Aktualisiert die Treeview-Liste mit den eigenen Klassen."""
+        for i in self.tree_custom_structs.get_children():
+            self.tree_custom_structs.delete(i)
+        for f in self.struct_manager.custom_files:
+            self.tree_custom_structs.insert("", "end", values=(f,))
+
+    def on_custom_struct_double_click(self, event):
+        sel = self.tree_custom_structs.selection()
+        if sel:
+            rel_p = self.tree_custom_structs.item(sel[0], "values")[0]
+            self.load_custom_structure_into_editor(rel_p)
+
+    def load_custom_structure_into_editor(self, rel_filepath):
+        """Lädt eine benutzerdefinierte Struktur komplett (ohne Methoden-Einschränkung) in den Editor."""
+        filepath = os.path.join(self.get_smali_dir(), rel_filepath)
+        if not os.path.exists(filepath): return
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            block = f.read()
+
+        self.current_smali_file = rel_filepath.replace("\\", "/")
+        self.current_method_name = "<Eigene Struktur>"
+        self.lbl_smali_file.config(text=os.path.basename(self.current_smali_file))
+
+        self.editor.load_code(block)
+
+        # Leere die XREF/Calls-Listen, da es sich um eine neue Datei handelt
+        for i in self.tree_outgoing.get_children(): self.tree_outgoing.delete(i)
+        for i in self.tree_datagraph.get_children(): self.tree_datagraph.delete(i)
+        for i in self.tree_outline.get_children(): self.tree_outline.delete(i)
+
+    # --- NEU: BAUKASTEN CONTEXT MENÜ FÜR DEN EDITOR ---
+
+    def setup_snippet_context_menu(self):
+        """Erstellt das Kontextmenü für Code-Injections im Edit-Feld."""
+        self.snippet_menu = tk.Menu(self, tearoff=0)
+
+        # Iteriere durch die geladenen Kategorien aus snippets.json
+        for category, items in self.struct_manager.snippets.items():
+            sub_menu = tk.Menu(self.snippet_menu, tearoff=0)
+            self.snippet_menu.add_cascade(label=category, menu=sub_menu)
+
+            for name, code in items.items():
+                # Trick: Um das 'code'-Argument im Loop einzufrieren, nutzen wir ein Lambda mit Default-Argument
+                sub_menu.add_command(label=name, command=lambda c=code: self.insert_snippet_into_editor(c))
+
+        # Binde den Rechtsklick des Edit-Code Textfeldes an dieses Menü
+        self.editor.txt_edit.bind("<Button-3>", self.show_snippet_menu)
+
+    def show_snippet_menu(self, event):
+        self.snippet_menu.post(event.x_root, event.y_top)
+
+    def insert_snippet_into_editor(self, code_snippet):
+        """Fügt das gewählte Snippet an der Cursorposition im Editierter-Code-Feld ein."""
+        try:
+            self.editor.txt_edit.insert(tk.INSERT, f"\n{code_snippet}\n")
+            # Trigger das Syntax-Highlighting des Editors nach dem Einfügen
+            if hasattr(self.editor, "rehighlight"):
+                self.editor.rehighlight()
+        except Exception as e:
+            self.app.log(f"[!] Fehler beim Einfügen des Snippets: {e}")
+
+    def on_patch_double_click(self, event):
+        """Lädt einen bereits existierenden Patch zurück in die IDE, um ihn zu bearbeiten."""
+        sel = self.smali_tree.selection()
+        if not sel: return
+
+        idx = self.smali_tree.index(sel[0])
+        patch = self.smali_patches[idx]
+
+        # Speichere die ID/Index des aktuell editierten Patches im Tab-State
+        self.editing_patch_idx = idx
+
+        rel_file = patch.get("file", "")
+        orig_code = patch.get("orig", "")
+        edit_code = patch.get("edit", "")
+
+        self.current_smali_file = rel_file
+        self.current_method_name = "<Patch-Bearbeitung>"
+        self.lbl_smali_file.config(text=f"Patch: {os.path.basename(rel_file)}")
+
+        self.editor.txt_orig.config(state="normal")
+        self.editor.load_code("")
+
+        self.editor.txt_orig.insert("1.0", orig_code)
+        self.editor.txt_orig.config(state="disabled")
+        self.editor.txt_edit.insert("1.0", edit_code)
+
+        if hasattr(self.editor, "rehighlight"):
+            self.editor.rehighlight()
+
+    def add_smali_patch(self):
+        f = self.current_smali_file
+        orig = self.editor.get_orig_text()
+        edit = self.editor.get_edit_text()
+
+        if self.current_method_name == "<Eigene Struktur>":
+            self.struct_manager.save_existing_structure(f, edit)
+            return
+
+        if not f or not orig or not edit:
+            return messagebox.showwarning("Fehlt", "Original oder Edit ist leer!")
+
+        # Falls wir den Patch über den Doppelklick geladen haben, überschreiben wir ihn direkt am Index
+        if hasattr(self, 'editing_patch_idx') and self.editing_patch_idx is not None:
+            self.smali_patches[self.editing_patch_idx] = {"type": "smali", "file": f, "orig": orig, "edit": edit}
+            self.editing_patch_idx = None  # State zurücksetzen
+            self.app.log(f"[*] Existierender Patch für {f} aktualisiert.")
+        else:
+            # Normaler Fallback für neue Patches
+            for p in self.smali_patches:
+                if p["file"] == f and p["orig"] == orig:
+                    if not messagebox.askyesno("Patch existiert",
+                                               "Möchtest du den vorhandenen Patch überschreiben?"): return
+                    self.smali_patches.remove(p)
+                    break
+            self.smali_patches.append({"type": "smali", "file": f, "orig": orig, "edit": edit})
+            self.app.log(f"[+] Patch für {f} gespeichert.")
+
+        self.refresh_smali_tree()
+        self.editor.clear_edit()
 
     def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
         filepath = os.path.join(self.get_smali_dir(), rel_filepath)
@@ -239,7 +462,6 @@ class SmaliStudioTab(ttk.Frame):
                         break
                     idx += 1
             else:
-                # Class Header Fallback
                 start_idx = 0
                 end_idx = len(lines) - 1
                 for i in range(len(lines)):
@@ -279,7 +501,7 @@ class SmaliStudioTab(ttk.Frame):
                     node_id = f"{self.current_smali_file}|{self.current_method_name}"
                     self.app.cg.make_root(node_id)
                 self.parse_outgoing_calls(block)
-                self.parse_data_flow(block)  # Befüllt den neuen Data Graph
+                self.parse_data_flow(block)
             else:
                 for i in self.tree_outgoing.get_children(): self.tree_outgoing.delete(i)
                 for i in self.tree_datagraph.get_children(): self.tree_datagraph.delete(i)
@@ -290,11 +512,8 @@ class SmaliStudioTab(ttk.Frame):
             self.app.log("[!] Konnte den Block in der Datei nicht extrahieren.")
 
     def update_outline(self, lines):
-        """Erkennt nun sowohl .method als auch .field Deklarationen."""
         for i in self.tree_outline.get_children(): self.tree_outline.delete(i)
-
         is_system = is_system_api("L" + self.current_smali_file.replace(".smali", "") + ";")
-
         for line in lines:
             line = line.strip()
             if line.startswith(".method"):
@@ -317,21 +536,15 @@ class SmaliStudioTab(ttk.Frame):
             cls_part, meth_part = call.split(";->")
             tags = ("system_api",) if is_system_api(cls_part) else ()
             self.tree_outgoing.insert("", "end", values=(call,), tags=tags)
-
-            # Kante im CallGraph-Manager speichern
             rel_base = cls_part[1:] + ".smali"
             found_path = self.resolve_smali_path(rel_base)
             callee_path = found_path if found_path else cls_part[1:]
             self.app.cg.add_edge(self.current_smali_file, self.current_method_name, callee_path, meth_part)
 
     def parse_data_flow(self, method_block):
-        """Befüllt den Data Graph mit gelesenen (get) und geschriebenen (put) Feldern."""
         for i in self.tree_datagraph.get_children(): self.tree_datagraph.delete(i)
-
-        # Regex erfasst iget, sget, iput, sput und zieht das Target-Feld raus
         matches = re.findall(r'\b([is](?:get|put)(?:-[a-z]+)?)\s+[^,]+(?:,\s*[^,]+)?,\s*(L[^;]+;->[^\s]+)',
                              method_block)
-
         for instruction, target in list(dict.fromkeys(matches)):
             if "get" in instruction:
                 self.tree_datagraph.insert("", "end", values=("READ", target), tags=("read", target))
@@ -341,40 +554,28 @@ class SmaliStudioTab(ttk.Frame):
     def resolve_smali_path(self, rel_base):
         smali_dir = self.get_smali_dir()
         pure_path_os = rel_base.replace("/", os.sep)
-
         target_tool = "apkeditor" if self.app.cfg.config.get("MANIFEST_STRATEGY",
                                                              "smali_only") == "apkeditor" else "apktool"
-
-        # 1. Ermittle nur die echten Root-Ordner basierend auf dem Tool
         possible_roots = []
         try:
             if target_tool == "apkeditor":
                 base_smali = os.path.join(smali_dir, "smali")
                 if os.path.exists(base_smali):
                     for d in os.listdir(base_smali):
-                        if d.startswith("classes"):
-                            possible_roots.append(os.path.join("smali", d))
+                        if d.startswith("classes"): possible_roots.append(os.path.join("smali", d))
             else:
                 if os.path.exists(smali_dir):
                     for d in os.listdir(smali_dir):
-                        if d == "smali" or d.startswith("smali_classes"):
-                            possible_roots.append(d)
-
-            # 2. Prüfe gezielt nur in diesen Root-Ordnern
+                        if d == "smali" or d.startswith("smali_classes"): possible_roots.append(d)
             for root in possible_roots:
                 test_path = os.path.join(smali_dir, root, pure_path_os)
-                if os.path.exists(test_path):
-                    # Wir zwingen die Ausgabe auf '/', da die UI-Elemente das erwarten
-                    return os.path.join(root, pure_path_os).replace("\\", "/")
+                if os.path.exists(test_path): return os.path.join(root, pure_path_os).replace("\\", "/")
         except:
             pass
-
         return None
 
     def find_incoming_xrefs(self):
-        if not self._ensure_index_loaded() or not self.current_smali_file:
-            return
-
+        if not self._ensure_index_loaded() or not self.current_smali_file: return
         parts = self.current_smali_file.split("/")
         d_class = f"L{'/'.join(parts[1:]).replace('.smali', '')};" if parts[0].startswith(
             "smali") else f"L{self.current_smali_file.replace('.smali', '')};"
@@ -393,66 +594,47 @@ class SmaliStudioTab(ttk.Frame):
 
     def _update_incoming_ui(self, results):
         for i in self.tree_incoming.get_children(): self.tree_incoming.delete(i)
-
         current_node_id = f"{self.current_smali_file}|{self.current_method_name}"
-
         for r in results:
             tags = ("system_api", r[1]) if is_system_api("L" + r[0]) else (r[1],)
             self.tree_incoming.insert("", "end", values=(r[0], r[1].split('(')[0]), tags=tags)
-
-            # Im CallGraph Manager eintragen
             self.app.cg.add_edge(r[0], r[1], self.current_smali_file, self.current_method_name)
             self.app.cg.make_root(f"{r[0]}|{r[1]}")
-
         self.app.cg.remove_root(current_node_id)
         self.refresh_callgraph_ui()
 
     def refresh_callgraph_ui(self):
-        """Zeichnet den CallGraph Baum anhand des cg_manager neu."""
         for i in self.tree_callstack.get_children(): self.tree_callstack.delete(i)
-        for root_id in self.app.cg.roots:
-            self._insert_cg_node("", root_id)
+        for root_id in self.app.cg.roots: self._insert_cg_node("", root_id)
 
     def _insert_cg_node(self, parent_item, node_id):
         node = self.app.cg.get_node(node_id)
         if not node: return None
-
         disp_text = node.signature.split('(')[0]
         tags = ["system_api"] if is_system_api("L" + node.filepath) else []
         tags.append(node_id)
-
         item = self.tree_callstack.insert(parent_item, "end", text=disp_text, values=(os.path.basename(node.filepath),),
                                           tags=tags)
-
-        # Füge einen Dummy-Knoten hinzu, falls diese Methode weitere aufruft (erzeugt das "+" Icon zum Aufklappen)
-        if node.callees:
-            self.tree_callstack.insert(item, "end", text="*dummy*")
+        if node.callees: self.tree_callstack.insert(item, "end", text="*dummy*")
         return item
 
     def on_cg_node_expand(self, event):
-        """Lädt die Child-Nodes (Callees) lazy nach, wenn der Nutzer auf '+' klickt."""
         item = self.tree_callstack.focus()
         children = self.tree_callstack.get_children(item)
         if len(children) == 1 and self.tree_callstack.item(children[0], "text") == "*dummy*":
             self.tree_callstack.delete(children[0])
             tags = self.tree_callstack.item(item, "tags")
             node_id = tags[1] if "system_api" in tags else tags[0]
-
             node = self.app.cg.get_node(node_id)
             if node:
-                for callee_id in node.callees:
-                    self._insert_cg_node(item, callee_id)
+                for callee_id in node.callees: self._insert_cg_node(item, callee_id)
 
     def on_callgraph_double_click(self, event):
-        """Lädt die Methode in den Editor, wenn man im CallGraph doppelt darauf klickt."""
         sel = self.tree_callstack.selection()
         if not sel: return
         tags = self.tree_callstack.item(sel[0], "tags")
         node_id = tags[1] if "system_api" in tags else tags[0]
-
-        if "system_api" in tags:
-            return self.app.log(f"[!] {node_id.split('|')[0]} ist eine System-API und kann nicht geöffnet werden.")
-
+        if "system_api" in tags: return self.app.log(f"[!] {node_id.split('|')[0]} ist eine System-API.")
         if "|" in node_id:
             filepath, sig = node_id.split("|", 1)
             self.load_method(filepath, method_signature=sig, add_as_root=False)
@@ -496,25 +678,6 @@ class SmaliStudioTab(ttk.Frame):
         path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
         if path and self.app.cg.load(path): self.refresh_callgraph_ui()
 
-    def add_smali_patch(self):
-        f = self.current_smali_file
-        orig = self.editor.get_orig_text()
-        edit = self.editor.get_edit_text()
-        if not f or not orig or not edit:
-            return messagebox.showwarning("Fehlt", "Original oder Edit ist leer!")
-
-        for p in self.smali_patches:
-            if p["file"] == f and p["orig"] == orig:
-                if not messagebox.askyesno("Patch existiert",
-                                           "Möchtest du den vorhandenen Patch überschreiben?"): return
-                self.smali_patches.remove(p)
-                break
-
-        self.smali_patches.append({"type": "smali", "file": f, "orig": orig, "edit": edit})
-        self.refresh_smali_tree()
-        self.editor.clear_edit()
-        self.app.log(f"[+] Patch für {f} gespeichert.")
-
     def remove_smali_patch(self):
         sel = self.smali_tree.selection()
         if sel:
@@ -527,24 +690,17 @@ class SmaliStudioTab(ttk.Frame):
             self.smali_tree.insert("", "end", values=(p["file"], p["edit"][:60].replace("\n", " ") + "..."))
 
     def open_global_search(self):
-        if not self._ensure_index_loaded():
-            return
-
-        # NEU: Singleton-Check verhindert mehrfaches Öffnen und Crashes!
+        if not self._ensure_index_loaded(): return
         if hasattr(self, "search_window") and self.search_window.winfo_exists():
-            self.search_window.lift()  # Holt das Fenster nach vorne
-            self.search_window.focus_force()  # Gibt ihm den Fokus
+            self.search_window.lift()
+            self.search_window.focus_force()
             return
 
-        # --- FIX: Fenster an die Haupt-App binden (self.app) statt an den Frame (self)! ---
-        # Das verhindert, dass die Suche beim Abdocken zerschossen wird.
         top = tk.Toplevel(self.app)
-        self.search_window = top  # FIX: Referenz für den Singleton-Check speichern
-
+        self.search_window = top
         top.title("🔍 Globale RAM-Suche (Echtzeit)")
         top.geometry("900x550")
-        top.attributes("-topmost", True)  # FIX: Korrektes Windows-Attribut
-        # ---------------------------------------------------------------------------------
+        top.attributes("-topmost", True)
 
         f_top = ttk.Frame(top)
         f_top.pack(fill="x", padx=10, pady=10)
@@ -580,11 +736,8 @@ class SmaliStudioTab(ttk.Frame):
         def apply_filter(event=None):
             for i in tree.get_children(): tree.delete(i)
             f_term = ent_filter.get().lower()
-
             filtered = [r for r in all_results if f_term in r[0].lower() or f_term in r[2].lower()]
-            for r in filtered:
-                tree.insert("", "end", values=r)
-
+            for r in filtered: tree.insert("", "end", values=r)
             if f_term and all_results:
                 lbl_status.config(text=f"Filter aktiv: {len(filtered)} von {len(all_results)} Treffern.")
             elif all_results:
@@ -607,7 +760,6 @@ class SmaliStudioTab(ttk.Frame):
             ent_filter.delete(0, tk.END)
             self.cancel_search_flag = False
             top.update()
-
             start_time = time.time()
 
             def search_thread():
@@ -657,5 +809,6 @@ class SmaliStudioTab(ttk.Frame):
         tree.bind("<Double-1>", lambda e: self.load_method(tree.item(tree.selection()[0], "values")[0],
                                                            target_line=int(tree.item(tree.selection()[0], "values")[1]),
                                                            add_as_root=True) if tree.selection() else None)
-        tree.bind("<Control-a>", lambda e: [tree.selection_set(tree.get_children()), "break"][1])
-        tree.bind("<Control-c>", copy_search_results)
+
+        # HINWEIS: <Control-a> und <Control-c> wurden hier absichtlich entfernt.
+        # Die UIUtils-Klasse fängt diese Events nun global ab und kopiert die markierten Treeview-Daten sauber in die Zwischenablage.

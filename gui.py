@@ -7,6 +7,7 @@ from config import ConfigManager
 from pipeline_engine import PipelineEngine
 from history import HistoryManager
 from cg_manager import CallGraphManager
+
 from api_inspector import APIInspectorTab
 from app_manager import AppManagerTab
 from ui_workspace_tab import WorkspaceTab
@@ -37,7 +38,7 @@ class KippyReFrameworkApp(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Initialize Sub-Tabs
+        # Initialize Sub-Tabs (KEIN eigenständiges Smali Studio mehr hier!)
         self.app_manager_tab = AppManagerTab(self.notebook, self.cfg.paths.get("SOURCE_DIR", "source"), self.log, self.handle_app_imported)
         self.workspace_tab = WorkspaceTab(self.notebook, self)
         self.api_tab = APIInspectorTab(self.notebook, self.cfg, self.log)
@@ -54,7 +55,6 @@ class KippyReFrameworkApp(tk.Tk):
     def handle_app_imported(self, session_data):
         pkg = session_data["package_name"]
         arch = session_data["architecture"]
-
         self.log(f"[*] Wende Auto-Config für {pkg} ({arch}) an...")
 
         self.cfg.config["APP_PACKAGE"] = pkg
@@ -90,13 +90,11 @@ class KippyReFrameworkApp(tk.Tk):
 
     def log(self, msg):
         """Globale Log-Funktion, leitet in den Workspace weiter (Thread-Safe)."""
-
         def _append():
             if hasattr(self, 'workspace_tab') and hasattr(self.workspace_tab, 'console'):
                 self.workspace_tab.console.insert("end", msg + "\n")
                 self.workspace_tab.console.see("end")
 
-        # after(0, ...) zwingt Tkinter, das UI im Haupt-Thread zu aktualisieren
         self.after(0, _append)
 
 if __name__ == "__main__":

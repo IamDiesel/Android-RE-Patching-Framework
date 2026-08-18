@@ -1,0 +1,43 @@
+{
+  "Struktur & Interfaces": {
+    "Neue Klasse (.class)": ".class public Lcom/example/MyClass;\n.super Ljava/lang/Object;\n.source \"MyClass.java\"\n\n# Interfaces, Felder und Methoden folgen hier",
+    "Interface implementieren": ".implements Ljava/lang/Runnable;"
+  },
+  "Felder (Variables)": {
+    "Instanz-Variable": ".field private myVariable:Ljava/lang/String;",
+    "Statische Konstante": ".field public static final TAG:Ljava/lang/String; = \"MY_APP_TAG\""
+  },
+  "Methoden & Konstruktoren": {
+    "Konstruktor (Default)": ".method public constructor <init>()V\n    .registers 1\n\n    invoke-direct {p0}, Ljava/lang/Object;-><init>()V\n\n    return-void\n.end method",
+    "Standard Methode": ".method public myMethod(Ljava/lang/String;)I\n    .registers 3\n\n    const/x01 v0, 0x0\n\n    return v0\n.end method"
+  },
+  "Kontrollfluss (Control Flow)": {
+    "If-Else Block": "    # Wenn v0 == 0 (false/null), springe zu :cond_0\n    if-eqz v0, :cond_0\n\n    # IF-Zweig\n    goto :goto_0\n\n    :cond_0\n    # ELSE-Zweig\n\n    :goto_0",
+    "While Schleife": "    const/x01 v0, 0x0   # Zaehler\n    const/x01 v1, 0x5   # Limit\n\n    :loop_start\n    if-ge v0, v1, :loop_end\n\n    # Schleifen-Inhalt\n    \n    add-int/lit8 v0, v0, 0x1\n    goto :loop_start\n\n    :loop_end",
+    "Switch-Case": "    packed-switch v0, :pswitch_data_0\n\n    goto :pswitch_end\n\n    :pswitch_0\n    # Case 0\n    goto :pswitch_end\n\n    :pswitch_1\n    # Case 1\n    goto :pswitch_end\n\n    :pswitch_end\n    \n    # MUSS AM ENDE DER METHODE STEHEN:\n    .locals 0\n    .packed-switch 0x0\n        :pswitch_0\n        :pswitch_1\n    .end packed-switch"
+  },
+  "Arrays & Error Handling": {
+    "Try-Catch Block": "    :try_start_0\n    # Kritischer Code\n    :try_end_0\n    .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0\n\n    goto :try_exit\n\n    :catch_0\n    move-exception v0\n    # Fehlerbehandlung (Exception in v0)\n\n    :try_exit",
+    "Neues Array (String)": "    # Array der Groesse 3 (Typ: String)\n    const/x01 v0, 0x3\n    new-array v0, v0, [Ljava/lang/String;\n\n    # Index 0 befuellen\n    const/x01 v1, 0x0\n    const-string v2, \"Eintrag 1\"\n    aput-object v2, v0, v1"
+  },
+  "Objekte & Konvertierung": {
+    "Neues Objekt (Instance)": "    new-instance v0, Ljava/lang/StringBuilder;\n    invoke-direct {v0}, Ljava/lang/StringBuilder;-><init>()V",
+    "Typkonvertierung (Cast)": "    # Primitiv: Int zu Float\n    int-to-float v0, v1\n\n    # Object Cast: v0 zu String\n    check-cast v0, Ljava/lang/String;"
+  },
+  "Aufrufe (Invokes) & Reflection": {
+    "Virtueller Aufruf": "    invoke-virtual {v1}, Ljava/lang/Object;->toString()Ljava/lang/String;\n    move-result-object v0",
+    "Statischer Aufruf": "    invoke-static {v1}, Landroid/text/TextUtils;->isEmpty(Ljava/lang/CharSequence;)Z\n    move-result v0",
+    "Reflection Aufruf": "    const-class v0, Lcom/example/TargetClass;\n    const-string v1, \"hiddenMethod\"\n    const/x01 v2, 0x0 # Keine Parameter\n\n    invoke-virtual {v0, v1, v2}, Ljava/lang/Class;->getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;\n    move-result-object v0"
+  },
+  "Android API (Intents/Context)": {
+    "Global Context holen": "    invoke-static {}, Landroid/app/ActivityThread;->currentApplication()Landroid/app/Application;\n    move-result-object v0",
+    "Activity starten": "    new-instance v1, Landroid/content/Intent;\n    invoke-direct {v1}, Landroid/content/Intent;-><init>()V\n\n    const-class v2, Lcom/example/TargetActivity;\n    invoke-virtual {v1, v0, v2}, Landroid/content/Intent;->setClass(Landroid/content/Context;Ljava/lang/Class;)Landroid/content/Intent;\n\n    invoke-virtual {v0, v1}, Landroid/content/Context;->startActivity(Landroid/content/Intent;)V",
+    "Intent Extra setzen": "    const-string v2, \"key_data\"\n    const-string v3, \"Geheim\"\n    invoke-virtual {v1, v2, v3}, Landroid/content/Intent;->putExtra(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+    "Broadcast senden": "    new-instance v1, Landroid/content/Intent;\n    const-string v2, \"com.example.MY_SIGNAL\"\n    invoke-direct {v1, v2}, Landroid/content/Intent;-><init>(Ljava/lang/String;)\n\n    invoke-virtual {v0, v1}, Landroid/content/Context;->sendBroadcast(Landroid/content/Intent;)V",
+    "BroadcastReceiver Klasse": ".class public Lcom/example/MyBroadcastReceiver;\n.super Landroid/content/BroadcastReceiver;\n\n.method public constructor <init>()V\n    .registers 1\n    invoke-direct {p0}, Landroid/content/BroadcastReceiver;-><init>()V\n    return-void\n.end method\n\n.method public onReceive(Landroid/content/Context;Landroid/content/Intent;)V\n    .registers 4\n    return-void\n.end method"
+  },
+  "Debugging & Logging": {
+    "Logcat (Log.d)": "    const-string v0, \"SMALI_DEBUG\"\n    const-string v1, \"Code erreicht!\"\n    invoke-static {v0, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I",
+    "Toast Nachricht": "    const-string v0, \"Injektiert!\"\n    const/x01 v1, 0x1\n    invoke-static {p0, v0, v1}, Landroid/widget/Toast;->makeText(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;\n    move-result-object v0\n    invoke-virtual {v0}, Landroid/widget/Toast;->show()V"
+  }
+}
