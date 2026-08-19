@@ -967,3 +967,501 @@ Termine angezeigt
 Termin gebucht & Storniert
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260819-002705)
+* **App:** com.arjonasoftware.babycam (v1.0.0)
+* **Name:** com.arjonasoftware.babycam
+* **Testergebnis:** WORKING
+
+  * **Smali Patch 1** in Datei: `smali/classes2/okhttp3/internal/platform/AndroidPlatform$AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public clean(Ljava/util/List;Ljava/lang/String;)Ljava/util/List;
+    .locals 4
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "(",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;",
+            "Ljava/lang/String;",
+            ")",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;"
+        }
+    .end annotation
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljavax/net/ssl/SSLPeerUnverifiedException;
+        }
+    .end annotation
+    return-object p1
+
+    .line 1
+    :try_start_0
+    invoke-interface {p1}, Ljava/util/List;->size()I
+
+    .line 4
+    move-result v0
+
+    .line 5
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    .line 7
+    invoke-interface {p1, v0}, Ljava/util/List;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    .line 10
+    move-result-object p1
+
+    .line 11
+    check-cast p1, [Ljava/security/cert/X509Certificate;
+
+    .line 13
+    iget-object v0, p0, Lokhttp3/internal/platform/AndroidPlatform$AndroidCertificateChainCleaner;->checkServerTrusted:Ljava/lang/reflect/Method;
+
+    .line 15
+    iget-object v1, p0, Lokhttp3/internal/platform/AndroidPlatform$AndroidCertificateChainCleaner;->x509TrustManagerExtensions:Ljava/lang/Object;
+
+    .line 17
+    const/4 v2, 0x3
+
+    .line 18
+    new-array v2, v2, [Ljava/lang/Object;
+
+    .line 20
+    const/4 v3, 0x0
+
+    .line 21
+    aput-object p1, v2, v3
+
+    .line 23
+    const-string p1, "RSA"
+
+    .line 25
+    const/4 v3, 0x1
+
+    .line 26
+    aput-object p1, v2, v3
+
+    .line 28
+    const/4 p1, 0x2
+
+    .line 29
+    aput-object p2, v2, p1
+
+    .line 31
+    invoke-virtual {v0, v1, v2}, Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+
+    .line 34
+    move-result-object p1
+
+    .line 35
+    check-cast p1, Ljava/util/List;
+
+    .line 37
+    :try_end_0
+    .catch Ljava/lang/reflect/InvocationTargetException; {:try_start_0 .. :try_end_0} :catch_1
+    .catch Ljava/lang/IllegalAccessException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p1
+
+    .line 38
+    :catch_0
+    move-exception p1
+
+    .line 39
+    goto :goto_0
+
+    .line 40
+    :catch_1
+    move-exception p1
+
+    .line 41
+    goto :goto_1
+
+    .line 42
+    :goto_0
+    invoke-static {p1}, Lcom/google/zxing/qrcode/a;->f(Ljava/lang/Object;)V
+
+    .line 45
+    const/4 p1, 0x0
+
+    .line 46
+    return-object p1
+
+    .line 47
+    :goto_1
+    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    .line 49
+    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;
+
+    .line 52
+    move-result-object v0
+
+    .line 53
+    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    .line 56
+    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    .line 59
+    throw p2
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali\classes\okhttp3\internal\tls\OkHostnameVerifier.smali`
+  ```smali
+.method public verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z
+    .locals 1
+
+    const/4 v0, 0x1
+    return v0
+.end method
+  ```
+
+  * **Smali Patch 3** in Datei: `smali\classes\com\applovin\shadow\okhttp3\internal\platform\android\AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public clean(Ljava/util/List;Ljava/lang/String;)Ljava/util/List;
+    .locals 2
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "(",
+            "Ljava/util/List<",
+            "+",
+            "Ljava/security/cert/Certificate;",
+            ">;",
+            "Ljava/lang/String;",
+            ")",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;"
+        }
+    .end annotation
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljavax/net/ssl/SSLPeerUnverifiedException;
+        }
+    .end annotation
+    return-object p1
+
+    .line 1
+    invoke-virtual {p1}, Ljava/lang/Object;->getClass()Ljava/lang/Class;
+
+    .line 4
+    invoke-virtual {p2}, Ljava/lang/Object;->getClass()Ljava/lang/Class;
+
+    .line 7
+    const/4 v0, 0x0
+
+    .line 8
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    .line 10
+    invoke-interface {p1, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    .line 13
+    move-result-object p1
+
+    .line 14
+    check-cast p1, [Ljava/security/cert/X509Certificate;
+
+    .line 16
+    :try_start_0
+    iget-object v0, p0, Lcom/applovin/shadow/okhttp3/internal/platform/android/AndroidCertificateChainCleaner;->x509TrustManagerExtensions:Landroid/net/http/X509TrustManagerExtensions;
+
+    .line 18
+    const-string v1, "RSA"
+
+    .line 20
+    invoke-virtual {v0, p1, v1, p2}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;
+
+    .line 23
+    move-result-object p1
+
+    .line 24
+    invoke-virtual {p1}, Ljava/lang/Object;->getClass()Ljava/lang/Class;
+
+    .line 27
+    :try_end_0
+    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p1
+
+    .line 28
+    :catch_0
+    move-exception p1
+
+    .line 29
+    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    .line 31
+    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;
+
+    .line 34
+    move-result-object v0
+
+    .line 35
+    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    .line 38
+    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    .line 41
+    throw p2
+.end method
+  ```
+
+**Beobachtung:**
+API visible
+
+---
+
+### 🔧 RE-Patch-Report (PID-20260819-012334)
+* **App:** com.arjonasoftware.babycam (v1.0.0)
+* **Name:** com.arjonasoftware.babycam
+* **Testergebnis:** WORKING
+
+  * **Smali Patch 1** in Datei: `smali\classes\okhttp3\internal\tls\OkHostnameVerifier.smali`
+  ```smali
+.method public verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z
+    .locals 1
+
+    const/4 v0, 0x1
+    return v0
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali\classes\com\applovin\shadow\okhttp3\internal\platform\android\AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public clean(Ljava/util/List;Ljava/lang/String;)Ljava/util/List;
+    .locals 2
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "(",
+            "Ljava/util/List<",
+            "+",
+            "Ljava/security/cert/Certificate;",
+            ">;",
+            "Ljava/lang/String;",
+            ")",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;"
+        }
+    .end annotation
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljavax/net/ssl/SSLPeerUnverifiedException;
+        }
+    .end annotation
+    return-object p1
+
+    .line 1
+    invoke-virtual {p1}, Ljava/lang/Object;->getClass()Ljava/lang/Class;
+
+    .line 4
+    invoke-virtual {p2}, Ljava/lang/Object;->getClass()Ljava/lang/Class;
+
+    .line 7
+    const/4 v0, 0x0
+
+    .line 8
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    .line 10
+    invoke-interface {p1, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    .line 13
+    move-result-object p1
+
+    .line 14
+    check-cast p1, [Ljava/security/cert/X509Certificate;
+
+    .line 16
+    :try_start_0
+    iget-object v0, p0, Lcom/applovin/shadow/okhttp3/internal/platform/android/AndroidCertificateChainCleaner;->x509TrustManagerExtensions:Landroid/net/http/X509TrustManagerExtensions;
+
+    .line 18
+    const-string v1, "RSA"
+
+    .line 20
+    invoke-virtual {v0, p1, v1, p2}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;
+
+    .line 23
+    move-result-object p1
+
+    .line 24
+    invoke-virtual {p1}, Ljava/lang/Object;->getClass()Ljava/lang/Class;
+
+    .line 27
+    :try_end_0
+    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p1
+
+    .line 28
+    :catch_0
+    move-exception p1
+
+    .line 29
+    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    .line 31
+    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;
+
+    .line 34
+    move-result-object v0
+
+    .line 35
+    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    .line 38
+    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    .line 41
+    throw p2
+.end method
+  ```
+
+  * **Smali Patch 3** in Datei: `smali\classes2\okhttp3\internal\platform\AndroidPlatform$AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public clean(Ljava/util/List;Ljava/lang/String;)Ljava/util/List;
+    .locals 4
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "(",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;",
+            "Ljava/lang/String;",
+            ")",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;"
+        }
+    .end annotation
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljavax/net/ssl/SSLPeerUnverifiedException;
+        }
+    .end annotation
+    return-object p1
+
+    .line 1
+    :try_start_0
+    invoke-interface {p1}, Ljava/util/List;->size()I
+
+    .line 4
+    move-result v0
+
+    .line 5
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    .line 7
+    invoke-interface {p1, v0}, Ljava/util/List;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    .line 10
+    move-result-object p1
+
+    .line 11
+    check-cast p1, [Ljava/security/cert/X509Certificate;
+
+    .line 13
+    iget-object v0, p0, Lokhttp3/internal/platform/AndroidPlatform$AndroidCertificateChainCleaner;->checkServerTrusted:Ljava/lang/reflect/Method;
+
+    .line 15
+    iget-object v1, p0, Lokhttp3/internal/platform/AndroidPlatform$AndroidCertificateChainCleaner;->x509TrustManagerExtensions:Ljava/lang/Object;
+
+    .line 17
+    const/4 v2, 0x3
+
+    .line 18
+    new-array v2, v2, [Ljava/lang/Object;
+
+    .line 20
+    const/4 v3, 0x0
+
+    .line 21
+    aput-object p1, v2, v3
+
+    .line 23
+    const-string p1, "RSA"
+
+    .line 25
+    const/4 v3, 0x1
+
+    .line 26
+    aput-object p1, v2, v3
+
+    .line 28
+    const/4 p1, 0x2
+
+    .line 29
+    aput-object p2, v2, p1
+
+    .line 31
+    invoke-virtual {v0, v1, v2}, Ljava/lang/reflect/Method;->invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;
+
+    .line 34
+    move-result-object p1
+
+    .line 35
+    check-cast p1, Ljava/util/List;
+
+    .line 37
+    :try_end_0
+    .catch Ljava/lang/reflect/InvocationTargetException; {:try_start_0 .. :try_end_0} :catch_1
+    .catch Ljava/lang/IllegalAccessException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p1
+
+    .line 38
+    :catch_0
+    move-exception p1
+
+    .line 39
+    goto :goto_0
+
+    .line 40
+    :catch_1
+    move-exception p1
+
+    .line 41
+    goto :goto_1
+
+    .line 42
+    :goto_0
+    invoke-static {p1}, Lcom/google/zxing/qrcode/a;->f(Ljava/lang/Object;)V
+
+    .line 45
+    const/4 p1, 0x0
+
+    .line 46
+    return-object p1
+
+    .line 47
+    :goto_1
+    new-instance p2, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    .line 49
+    invoke-virtual {p1}, Ljava/lang/Throwable;->getMessage()Ljava/lang/String;
+
+    .line 52
+    move-result-object v0
+
+    .line 53
+    invoke-direct {p2, v0}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    .line 56
+    invoke-virtual {p2, p1}, Ljava/lang/Throwable;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    .line 59
+    throw p2
+.end method
+  ```
+
+**Beobachtung:**
+API Sichtbar
+
+---

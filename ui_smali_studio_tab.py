@@ -344,34 +344,41 @@ class SmaliStudioTab(ttk.Frame):
         for i in self.tree_datagraph.get_children(): self.tree_datagraph.delete(i)
         for i in self.tree_outline.get_children(): self.tree_outline.delete(i)
 
-    # --- NEU: BAUKASTEN CONTEXT MENÜ FÜR DEN EDITOR ---
+        # --- BAUKASTEN CONTEXT MENÜ FÜR DEN EDITOR ---
 
     def setup_snippet_context_menu(self):
         """Erstellt das Kontextmenü für Code-Injections im Edit-Feld."""
         self.snippet_menu = tk.Menu(self, tearoff=0)
 
-        # Iteriere durch die geladenen Kategorien aus snippets.json
         for category, items in self.struct_manager.snippets.items():
             sub_menu = tk.Menu(self.snippet_menu, tearoff=0)
             self.snippet_menu.add_cascade(label=category, menu=sub_menu)
 
             for name, code in items.items():
-                # Trick: Um das 'code'-Argument im Loop einzufrieren, nutzen wir ein Lambda mit Default-Argument
                 sub_menu.add_command(label=name, command=lambda c=code: self.insert_snippet_into_editor(c))
 
-        # Binde den Rechtsklick des Edit-Code Textfeldes an dieses Menü
+        # Rechtsklick im Textfeld anbinden
         self.editor.txt_edit.bind("<Button-3>", self.show_snippet_menu)
 
+        # NEU: Den sichtbaren Button anbinden
+        if hasattr(self.editor, "btn_snippet"):
+            self.editor.btn_snippet.config(command=self.show_snippet_menu_btn)
+
     def show_snippet_menu(self, event):
-        self.snippet_menu.post(event.x_root, event.y_top)
+        # Zeigt das Menü an der Mausposition (Rechtsklick)
+        self.snippet_menu.post(event.x_root, event.y_root)
+
+    def show_snippet_menu_btn(self):
+        # Zeigt das Menü exakt unterhalb des Buttons an
+        x = self.editor.btn_snippet.winfo_rootx()
+        y = self.editor.btn_snippet.winfo_rooty() + self.editor.btn_snippet.winfo_height()
+        self.snippet_menu.post(x, y)
 
     def insert_snippet_into_editor(self, code_snippet):
-        """Fügt das gewählte Snippet an der Cursorposition im Editierter-Code-Feld ein."""
         try:
             self.editor.txt_edit.insert(tk.INSERT, f"\n{code_snippet}\n")
-            # Trigger das Syntax-Highlighting des Editors nach dem Einfügen
-            if hasattr(self.editor, "rehighlight"):
-                self.editor.rehighlight()
+            if hasattr(self.editor, "apply_highlighting"):
+                self.editor.apply_highlighting(self.editor.txt_edit)
         except Exception as e:
             self.app.log(f"[!] Fehler beim Einfügen des Snippets: {e}")
 
@@ -394,15 +401,19 @@ class SmaliStudioTab(ttk.Frame):
         self.current_method_name = "<Patch-Bearbeitung>"
         self.lbl_smali_file.config(text=f"Patch: {os.path.basename(rel_file)}")
 
+        # FIX: Wir nutzen direkt die Textfelder und stellen sicher, dass BEIDE geleert werden.
         self.editor.txt_orig.config(state="normal")
-        self.editor.load_code("")
-
+        self.editor.txt_orig.delete("1.0", tk.END)
         self.editor.txt_orig.insert("1.0", orig_code)
         self.editor.txt_orig.config(state="disabled")
+
+        self.editor.txt_edit.delete("1.0", tk.END)
         self.editor.txt_edit.insert("1.0", edit_code)
 
         if hasattr(self.editor, "rehighlight"):
             self.editor.rehighlight()
+
+
 
     def add_smali_patch(self):
         f = self.current_smali_file

@@ -44,21 +44,120 @@ class WorkspaceTab(ttk.Frame):
         self.top_paned = ttk.PanedWindow(self.main_paned, orient=tk.HORIZONTAL)
         self.main_paned.add(self.top_paned, weight=3)
 
-        f_left_side = ttk.Frame(self.top_paned)
+        # WICHTIG: tk.Frame (nicht ttk) für abdockbare Bereiche!
+        f_left_side = tk.Frame(self.top_paned)
         self.top_paned.add(f_left_side, weight=1)
-
+        self.build_dock_header(f_left_side, "⚙️ Steuerung & Metadaten", f_left_side, self.top_paned, 1)
         self.build_pipeline_controls(f_left_side)
         self.build_documentation_box(f_left_side)
 
-        f_right_side = ttk.Frame(self.top_paned)
+        f_right_side = tk.Frame(self.top_paned)
         self.top_paned.add(f_right_side, weight=3)
+        self.build_dock_header(f_right_side, "📝 Patch Editor", f_right_side, self.top_paned, 3)
         self.build_editor(f_right_side)
 
-        f_console_side = ttk.Frame(self.main_paned)
+        f_console_side = tk.Frame(self.main_paned)
         self.main_paned.add(f_console_side, weight=1)
+        self.build_dock_header(f_console_side, "🖥️ Konsole", f_console_side, self.main_paned, 1)
         self.build_console(f_console_side)
 
         self.load_current_workspace_meta()
+
+    def build_dock_header(self, parent, title, widget_to_dock, target_paned, weight):
+        """Erzeugt einen Header mit Abdock-Button für jedes Panel."""
+        f_header = ttk.Frame(parent, style="Secondary.TFrame")
+        f_header.pack(side="top", fill="x")
+
+        lbl = ttk.Label(f_header, text=title, font=("Segoe UI", 9, "bold"), background="#e0e0e0", padding=3)
+        lbl.pack(side="left", fill="x", expand=True)
+
+        btn = ttk.Button(f_header, text="⧉ Abdocken", width=12)
+        btn.pack(side="right", padx=5)
+        btn.config(command=lambda: self.toggle_dock(parent, title, widget_to_dock, target_paned, weight, btn))
+
+    def toggle_dock(self, container_frame, title, inner_widget, target_paned, weight, btn):
+        """Logik für das native Abdocken und Andocken (Löst das Grau-Fenster-Problem)."""
+        if hasattr(container_frame, "_is_undocked") and container_frame._is_undocked:
+            # Andocken
+            try:
+                container_frame.tk.call('wm', 'forget', container_frame._w)
+            except:
+                pass
+            btn.config(text="⧉ Abdocken")
+            target_paned.add(container_frame, weight=weight)
+            container_frame._is_undocked = False
+        else:
+            # Abdocken
+            target_paned.forget(container_frame)
+            try:
+                container_frame.tk.call('wm', 'manage', container_frame._w)
+                container_frame.tk.call('wm', 'title', container_frame._w, title)
+                geom = "1000x700" if "Editor" in title else "600x500"
+                container_frame.tk.call('wm', 'geometry', container_frame._w, geom)
+
+                def on_close():
+                    self.toggle_dock(container_frame, title, inner_widget, target_paned, weight, btn)
+
+                # Bindet das 'X' oben rechts am neuen Fenster an unsere on_close Logik
+                cb_name = container_frame.register(on_close)
+                container_frame.tk.call('wm', 'protocol', container_frame._w, 'WM_DELETE_WINDOW', cb_name)
+
+                container_frame._is_undocked = True
+                btn.config(text="⬎ Andocken")
+            except Exception as e:
+                self.app.log(f"[!] System unterstützt kein natives Abdocken: {e}")
+                target_paned.add(container_frame, weight=weight)
+
+    def build_editor(self, parent):
+        patch_book = ttk.Notebook(parent)
+        patch_book.pack(side="top", fill="both", expand=True, padx=5, pady=5)
+
+        tab_hex = ttk.Frame(patch_book)
+
+        self.smali_studio = SmaliStudioTab(patch_book, self.app)
+
+        patch_book.add(tab_hex, text="Hex Patcher (Flutter / C++)")
+        patch_book.add(self.smali_studio, text="Smali Studio (Java / Kotlin)")
+
+        ttk.Button(tab_hex, text="+ Add Hex Patch", command=self.add_patch_row).pack(anchor="w", padx=5, pady=5)
+
+        canvas = tk.Canvas(tab_hex, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(tab_hex, orient="vertical", command=canvas.yview)
+        self.p_container = ttk.Frame(canvas)
+
+        self.p_container.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.p_container, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        self.add_patch_row()
+
+    def build_console(self, parent):
+        self.console = tk.Text(parent, height=12, bg="black", fg="lightgreen")
+        self.console.pack(side="bottom", fill="both", expand=True, padx=5, pady=5)
+
+        self.console_menu = tk.Menu(parent, tearoff=0)
+        self.console_menu.add_command(label="Konsole leeren", command=lambda: self.console.delete("1.0", tk.END))
+
+        def show_menu(e):
+            self.console_menu.post(e.x_root, e.y_root)
+
+        self.console.bind("<Button-3>", show_menu)
+
+
+
+    def build_dock_header(self, parent, title, widget_to_dock, target_paned, weight):
+        """Erzeugt einen Header mit Abdock-Button für jedes Panel."""
+        header = ttk.Frame(parent)
+        header.pack(side="top", fill="x", pady=2)
+        ttk.Label(header, text=title, font=("Segoe UI", 10, "bold")).pack(side="left", padx=5)
+        btn = ttk.Button(header, text="⧉ Abdocken", width=12)
+        btn.pack(side="right", padx=5)
+        btn.config(command=lambda: self.toggle_dock(parent, title, widget_to_dock, target_paned, weight, btn))
+        return header
+
 
     def renew_id(self):
         if messagebox.askyesno("Neue ID",
@@ -76,12 +175,6 @@ class WorkspaceTab(ttk.Frame):
         self.ent_name.insert(0, pkg)
         self.ent_version.delete(0, tk.END)
         self.ent_version.insert(0, "1.0.0")
-
-    def build_dock_header(self, parent, title, target_frame, paned_window, min_size):
-        f_header = ttk.Frame(parent, style="Secondary.TFrame")
-        f_header.pack(side="top", fill="x")
-        lbl = ttk.Label(f_header, text=title, font=("Segoe UI", 9, "bold"), background="#e0e0e0", padding=3)
-        lbl.pack(side="left", fill="x", expand=True)
 
     def build_pipeline_controls(self, parent):
         f_favs = ttk.LabelFrame(parent, text="⭐ Patch Verwaltung & Favoriten")
@@ -135,46 +228,6 @@ class WorkspaceTab(ttk.Frame):
 
         ttk.Button(f_docs, text="💾 Session permanent sichern", command=self.save_result).pack(fill="x", padx=5, pady=2)
 
-    def build_editor(self, parent):
-        self.build_dock_header(parent, "📝 Patch Editor", parent, self.top_paned, 4)
-
-        patch_book = ttk.Notebook(parent)
-        patch_book.pack(side="top", fill="both", expand=True, padx=5, pady=5)
-
-        tab_hex = ttk.Frame(patch_book)
-
-        self.smali_studio = SmaliStudioTab(patch_book, self.app)
-
-        patch_book.add(tab_hex, text="Hex Patcher (Flutter / C++)")
-        patch_book.add(self.smali_studio, text="Smali Studio (Java / Kotlin)")
-
-        ttk.Button(tab_hex, text="+ Add Hex Patch", command=self.add_patch_row).pack(anchor="w", padx=5, pady=5)
-
-        canvas = tk.Canvas(tab_hex, borderwidth=0, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(tab_hex, orient="vertical", command=canvas.yview)
-        self.p_container = ttk.Frame(canvas)
-
-        self.p_container.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.p_container, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-
-        self.add_patch_row()
-
-    def build_console(self, parent):
-        self.build_dock_header(parent, "🖥️ Konsole", parent, self.main_paned, 1)
-        self.console = tk.Text(parent, height=12, bg="black", fg="lightgreen")
-        self.console.pack(side="bottom", fill="both", expand=True, padx=5, pady=5)
-
-        self.console_menu = tk.Menu(parent, tearoff=0)
-        self.console_menu.add_command(label="Konsole leeren", command=lambda: self.console.delete("1.0", tk.END))
-
-        def show_menu(e):
-            self.console_menu.post(e.x_root, e.y_root)
-
-        self.console.bind("<Button-3>", show_menu)
 
     def on_strategy_changed(self, event):
         new_strat = self.combo_strat.get()

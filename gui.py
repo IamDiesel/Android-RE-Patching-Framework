@@ -84,7 +84,17 @@ class KippyReFrameworkApp(tk.Tk):
         return self.current_archive_path
 
     def generate_new_id(self):
+        # 1. Neue ID basierend auf Zeit generieren
         self.current_id = f"PID-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+        # 2. FEHLENDE LOGIK REKONSTRUIEREN: Archiv-Verzeichnis berechnen & anlegen
+        if "ARCHIVE_DIR" in self.cfg.paths:
+            self.current_archive_path = os.path.join(self.cfg.paths["ARCHIVE_DIR"], self.current_id)
+            os.makedirs(self.current_archive_path, exist_ok=True)
+        else:
+            self.current_archive_path = ""
+
+        # 3. UI updaten
         if hasattr(self, 'workspace_tab'):
             self.workspace_tab.lbl_id.config(text=self.current_id)
 
