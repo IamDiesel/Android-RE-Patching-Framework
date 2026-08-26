@@ -1465,3 +1465,233 @@ API visible
 API Sichtbar
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260820-013442)
+* **App:** org.nativescript.LibreLinkUp (v1.0.0)
+* **Name:** org.nativescript.LibreLinkUp
+* **Testergebnis:** CRASH
+
+  * **Smali Patch 1** in Datei: `smali\classes\okhttp3\internal\tls\OkHostnameVerifier.smali`
+  ```smali
+.method public verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z
+    .locals 2
+
+    const/4 v1, 0x1
+    return v1
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali\classes\okhttp3\internal\platform\android\AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public clean(Ljava/util/List;Ljava/lang/String;)Ljava/util/List;
+    .locals 1
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "(",
+            "Ljava/util/List<",
+            "+",
+            "Ljava/security/cert/Certificate;",
+            ">;",
+            "Ljava/lang/String;",
+            ")",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;"
+        }
+    .end annotation
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljavax/net/ssl/SSLPeerUnverifiedException;
+        }
+    .end annotation
+
+    return-object p0
+
+    const-string v0, "chain"
+
+    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
+
+    const-string v0, "hostname"
+
+    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
+
+    .line 43
+    check-cast p1, Ljava/util/Collection;
+
+    const/4 v0, 0x0
+
+    .line 76
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    invoke-interface {p1, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    move-result-object p1
+
+    .line 43
+    check-cast p1, [Ljava/security/cert/X509Certificate;
+
+    .line 45
+    :try_start_0
+    iget-object p0, p0, Lokhttp3/internal/platform/android/AndroidCertificateChainCleaner;->x509TrustManagerExtensions:Landroid/net/http/X509TrustManagerExtensions;
+
+    const-string v0, "RSA"
+
+    invoke-virtual {p0, p1, v0, p2}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;
+
+    move-result-object p0
+
+    const-string/jumbo p1, "x509TrustManagerExtensio\u2026ficates, \"RSA\", hostname)"
+
+    invoke-static {p0, p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullExpressionValue(Ljava/lang/Object;Ljava/lang/String;)V
+
+    :try_end_0
+    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p0
+
+    :catch_0
+    move-exception p0
+
+    .line 47
+    new-instance p1, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    invoke-virtual {p0}, Ljava/security/cert/CertificateException;->getMessage()Ljava/lang/String;
+
+    move-result-object p2
+
+    invoke-direct {p1, p2}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    check-cast p0, Ljava/lang/Throwable;
+
+    invoke-virtual {p1, p0}, Ljavax/net/ssl/SSLPeerUnverifiedException;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    check-cast p1, Ljava/lang/Throwable;
+
+    throw p1
+.end method
+  ```
+
+**Beobachtung:**
+App crasht direkt beim Start
+
+---
+
+### 🔧 RE-Patch-Report (PID-20260820-013442)
+* **App:** org.nativescript.LibreLinkUp (v1.0.0)
+* **Name:** org.nativescript.LibreLinkUp
+* **Testergebnis:** CRASH
+
+**Beobachtung:**
+App crasht direkt beim Start
+
+---
+
+### 🔧 RE-Patch-Report (PID-20260820-013442)
+* **App:** org.nativescript.LibreLinkUp (v1.0.0)
+* **Name:** org.nativescript.LibreLinkUp
+* **Testergebnis:** CRASH
+
+  * **Smali Patch 1** in Datei: `smali\okhttp3\internal\tls\OkHostnameVerifier.smali`
+  ```smali
+.method public verify(Ljava/lang/String;Ljavax/net/ssl/SSLSession;)Z
+    .locals 2
+
+    const/4 v1, 0x1
+    return v1
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali\okhttp3\internal\platform\android\AndroidCertificateChainCleaner.smali`
+  ```smali
+.method public clean(Ljava/util/List;Ljava/lang/String;)Ljava/util/List;
+    .locals 1
+    .annotation system Ldalvik/annotation/Signature;
+        value = {
+            "(",
+            "Ljava/util/List<",
+            "+",
+            "Ljava/security/cert/Certificate;",
+            ">;",
+            "Ljava/lang/String;",
+            ")",
+            "Ljava/util/List<",
+            "Ljava/security/cert/Certificate;",
+            ">;"
+        }
+    .end annotation
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljavax/net/ssl/SSLPeerUnverifiedException;
+        }
+    .end annotation
+
+    return-object p0
+
+    const-string v0, "chain"
+
+    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
+
+    const-string v0, "hostname"
+
+    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
+
+    .line 43
+    check-cast p1, Ljava/util/Collection;
+
+    const/4 v0, 0x0
+
+    .line 76
+    new-array v0, v0, [Ljava/security/cert/X509Certificate;
+
+    invoke-interface {p1, v0}, Ljava/util/Collection;->toArray([Ljava/lang/Object;)[Ljava/lang/Object;
+
+    move-result-object p1
+
+    .line 43
+    check-cast p1, [Ljava/security/cert/X509Certificate;
+
+    .line 45
+    :try_start_0
+    iget-object p0, p0, Lokhttp3/internal/platform/android/AndroidCertificateChainCleaner;->x509TrustManagerExtensions:Landroid/net/http/X509TrustManagerExtensions;
+
+    const-string v0, "RSA"
+
+    invoke-virtual {p0, p1, v0, p2}, Landroid/net/http/X509TrustManagerExtensions;->checkServerTrusted([Ljava/security/cert/X509Certificate;Ljava/lang/String;Ljava/lang/String;)Ljava/util/List;
+
+    move-result-object p0
+
+    const-string/jumbo p1, "x509TrustManagerExtensio\u2026ficates, \"RSA\", hostname)"
+
+    invoke-static {p0, p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullExpressionValue(Ljava/lang/Object;Ljava/lang/String;)V
+
+    :try_end_0
+    .catch Ljava/security/cert/CertificateException; {:try_start_0 .. :try_end_0} :catch_0
+
+    return-object p0
+
+    :catch_0
+    move-exception p0
+
+    .line 47
+    new-instance p1, Ljavax/net/ssl/SSLPeerUnverifiedException;
+
+    invoke-virtual {p0}, Ljava/security/cert/CertificateException;->getMessage()Ljava/lang/String;
+
+    move-result-object p2
+
+    invoke-direct {p1, p2}, Ljavax/net/ssl/SSLPeerUnverifiedException;-><init>(Ljava/lang/String;)V
+
+    check-cast p0, Ljava/lang/Throwable;
+
+    invoke-virtual {p1, p0}, Ljavax/net/ssl/SSLPeerUnverifiedException;->initCause(Ljava/lang/Throwable;)Ljava/lang/Throwable;
+
+    check-cast p1, Ljava/lang/Throwable;
+
+    throw p1
+.end method
+  ```
+
+**Beobachtung:**
+App crasht direkt beim Start
+
+---

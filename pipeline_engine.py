@@ -638,6 +638,24 @@ class PipelineEngine:
 
         if not strategy.pre_process(self): return False
         if not strategy.patch_manifest(self): return False
+
+        # --- HERMES OOM FIX: Kompression für JS-Bundles deaktivieren ---
+        yml_path = os.path.join(self.cfg.paths["DEST_DIR"], self.get_unpacked_dir_name(), "apktool.yml")
+        if os.path.exists(yml_path):
+            with open(yml_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Prüfen ob doNotCompress existiert und Erweiterungen hinzufügen
+            if "doNotCompress:" in content:
+                for ext in ["bundle", "hbc"]:
+                    if f"- {ext}" not in content:
+                        content = content.replace("doNotCompress:\n", f"doNotCompress:\n- {ext}\n")
+
+                with open(yml_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                self.log("[+] Hermes-Fix: Kompression für JS-Bundles in apktool.yml deaktiviert.")
+        # ---------------------------------------------------------------
+
         if not strategy.build(self): return False
 
         return True

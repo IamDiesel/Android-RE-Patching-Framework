@@ -27,6 +27,8 @@ DEFAULT_CONFIG = {
             {"name": "Move repacked APK", "type": "cmd",
              "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"",
              "cwd": "{BASE_DIR}"},
+            {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-aligned-debugSigned*.apk\" 2>nul",
+             "cwd": "{DEST_DIR}"},
             {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
              "cwd": "{DEST_DIR}"}
         ],
@@ -34,6 +36,8 @@ DEFAULT_CONFIG = {
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
+            {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-aligned-debugSigned*.apk\" 2>nul",
+             "cwd": "{DEST_DIR}"},
             {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
              "cwd": "{DEST_DIR}"}
         ],
