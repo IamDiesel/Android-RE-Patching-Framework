@@ -7,9 +7,11 @@ This tool automates the tedious cycle of unpacking, binary hex patching, Smali c
 ⚠️ **Disclaimer:**  
 *This project is for educational and security research purposes only. No copyrighted APK files, libraries, or proprietary binaries are provided or distributed in this repository. Users must supply their own legally obtained binaries. The tools provided are intended solely to automate the local testing workflow for security analysis.*
 
-<img width="1174" height="964" alt="image" src="https://github.com/user-attachments/assets/e4a01e5a-77cc-408e-86bb-74ccba64ca9b" />
-<img width="1193" height="978" alt="image" src="https://github.com/user-attachments/assets/3af764b9-6ac4-49ae-b9ac-44ef852cd2a7" />
-<img width="1188" height="970" alt="image" src="https://github.com/user-attachments/assets/aaa1f447-b6e3-42a7-82ac-e95863b06303" />
+<img width="1917" height="966" alt="image" src="https://github.com/user-attachments/assets/5ad8332b-5768-4885-a229-46d2aca488db" />
+<img width="1095" height="666" alt="image" src="https://github.com/user-attachments/assets/be5ab47e-edf7-4402-9203-1d743b1b9f58" />
+<img width="1919" height="1147" alt="image" src="https://github.com/user-attachments/assets/358e343a-73a8-4f2e-8e1b-4cecaf21e29f" />
+<img width="1911" height="421" alt="image" src="https://github.com/user-attachments/assets/08fb1c88-b546-4240-adc0-f4a6ecc05086" />
+
 
 ---
 
@@ -109,5 +111,3 @@ Since Flutter/Dart applications typically ignore global HTTP proxy settings, thi
 
 * **Intercept Rules (On-the-fly Manipulation):** Define dynamic manipulation rules based on URL matching to automatically replace Request or Response payloads before they reach the app/server.
 * **Database Editing & Export:** Modify intercepted packets directly in the GUI and save them to the local SQLite database (`api_traffic.db`). Export selected packets for external analysis.
-
-```
