@@ -1,9 +1,8 @@
-
 # Android RE Patching Framework (Case Study) 🔧
 
 A Python-based automation framework designed to massively accelerate the iterative reverse engineering workflow on Android.
 
-This tool automates the tedious cycle of unpacking, binary hex patching, signing, ADB flashing, and logcat tracing. It was originally developed as a proof-of-concept to analyze and modify statically linked SSL certificate checks (BoringSSL) in Flutter-based (Dart AOT) Android applications at the ARM64 assembly level.
+This tool automates the tedious cycle of unpacking, binary hex patching, Smali code modification, repackaging, signing, ADB flashing, and logcat tracing. It bridges the gap between static analysis and dynamic instrumentation, handling everything from statically linked SSL certificate checks (BoringSSL) in Flutter-based (Dart AOT) apps to complex Java/Kotlin modifications (Smali) using a built-in IDE.
 
 ⚠️ **Disclaimer:**  
 *This project is for educational and security research purposes only. No copyrighted APK files, libraries, or proprietary binaries are provided or distributed in this repository. Users must supply their own legally obtained binaries. The tools provided are intended solely to automate the local testing workflow for security analysis.*
@@ -18,9 +17,10 @@ This tool automates the tedious cycle of unpacking, binary hex patching, signing
 
 1. **Python 3.x** (with `tkinter` support).
 2. **Android SDK Platform-Tools:** `adb` must be available in the system PATH.
-3. **Java Development Kit (JDK):** Required for repackaging (`jar`) and signing.
-4. **Uber-APK-Signer:** Download the latest version of [patrickfav/uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) and place it in the root directory.
-5. **mitmproxy:** Required for the API Inspector (`pip install mitmproxy`).
+3. **Java Development Kit (JDK):** Required for repackaging (`jar`, `apktool`) and signing.
+4. **Apktool & APKEditor:** Required for unpacking and rebuilding APKs (AXML/ARSC manipulation).
+5. **Uber-APK-Signer:** Download the latest version of [patrickfav/uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) and place it in the root directory.
+6. **mitmproxy:** Required for the API Inspector (`pip install mitmproxy`).
 
 ### Directory Structure
 
@@ -29,9 +29,12 @@ The framework automatically creates the required workspace upon the first launch
 ```text
 ├── AutoPatcher.py          # Main framework script
 ├── uber-apk-signer.jar     # Third-party tool (Not included in repo!)
+├── APKEditor.jar           # Third-party tool for manifest strategies
 ├── source/                 # Place original APK files here
 ├── destination/            # Output directory for patched & signed APKs
 ├── archives/               # Version archive of all builds & traces
+├── snippets.json           # Smali code injection templates
+├── favorite_patches.json   # Saved batch patches (e.g., SSL pinning bypasses)
 ├── RE_History.json         # Machine-readable patch history
 └── Kippy_RE_Log.md         # Human-readable reverse engineering logbook
 
@@ -39,59 +42,74 @@ The framework automatically creates the required workspace upon the first launch
 
 ---
 
-## 🔬 Module 1: Automated Patching Pipeline
+## 📱 App Manager & Workspace Extraction
 
-When reverse engineering Dart/Flutter applications, traditional Man-in-the-Middle attacks or standard hooking tools (like Frida) can fail due to statically linked libraries or extreme obfuscation. Understanding the internal callbacks at the assembly level (ARM64) requires countless iterative patch attempts. A manual cycle of decompiling, patching, repacking, signing, and flashing takes minutes and disrupts the analytical flow. This framework reduces this cycle to a few seconds and automates the scientific documentation of the results.
+No need to manually pull APKs anymore. The built-in **App Manager** allows you to:
 
-### Features
-
-* **Dynamic Multi-Patching:** Apply multiple hex patches to specific RAM offsets within compiled shared libraries (e.g., `libflutter.so`) via a dynamic Tkinter GUI.
-* **Automated Build Pipeline:** Automatically unpack split APKs (`split_config.arm64_v8a`), inject patches, and repackage via `jar`.
-* **Auto-Signing & Flashing:** Seamless integration of `uber-apk-signer` to automatically resign modified APKs, followed by direct deployment to the test device via ADB (`adb install-multiple`).
-* **Integrated Tracing:** Start and stop targeted `logcat` traces based on the process ID (PID) of the target app directly from the GUI.
-* **Systematic Test Documentation:** All test runs, patches, and observations are versioned and stored in both machine-readable (`RE_History.json`) and structured Markdown reports (`Kippy_RE_Log.md`) for later analysis.
-
-### Workflow & Usage
-
-1. **Extraction:** Install the target application on a test device via the App Store and transfer it to the development PC using ADB (`adb pull`). Place the original APK files (including architecture splits) into the `source/` folder.
-2. **Static Analysis (Ghidra):** Search for distinct strings (e.g., SSL error messages) within the extracted binary and trace the assembly code backward through the call graph using cross-references (XREFs).
-3. **Injection:** Launch the GUI via `python AutoPatcher.py`. Enter the identified RAM offsets, the base address (default: `00100000`), and the desired hex patch.
-4. **Deployment:** Click the **Build & Sign** button to patch the binaries and repackage the app. Use **Flash to Device** to push the application to the test device connected via USB/WLAN.
-5. **Verification:** The integrated Logcat trace immediately reveals whether the patch resulted in a SIGSEGV crash, a logic error, or a successful bypass. Log your analyses in the "Test Results" section.
+* **Extract Directly from Device:** Automatically list all third-party apps installed on the connected device and extract the base and split APKs (`adb pull`) with a single click.
+* **Architecture Detection:** The framework automatically detects the target architecture (e.g., ARM64, x86_64) and configures the workspace accordingly.
+* **Auto-Merge Split APKs:** Merges extracted Split-APKs into a single Universal APK for easier decompilation and manipulation.
 
 ---
 
-## 🌐 Module 2: API Inspector (DAST & MITM Proxy)
+## 🔬 Module 1: Smali Studio & Advanced Static Analysis
 
-The framework includes a fully integrated Dynamic Application Security Testing (DAST) suite powered by `mitmproxy`. This allows you to intercept, analyze, and manipulate API traffic on the fly.
+A full-fledged IDE built directly into the framework to analyze and modify Java/Kotlin code at the Smali level without needing external editors.
+
+### Features
+
+* **High-Performance RAM Indexer:** Decompiles the APK and builds an in-memory index of all `.smali` files, enabling lightning-fast global searches across thousands of files.
+* **Call Graph & XREF Engine:** Instantly resolve incoming and outgoing cross-references (XREFs). Track which methods call your target, and what your target calls.
+* **Data Flow Graph:** Automatically tracks read (`sget`/`iget`) and write (`sput`/`iput`) operations for variables and fields.
+* **Outline View:** Extracts and categorizes class methods, fields, and System APIs for quick navigation.
+* **Code Injection & Struct Manager:** Right-click inside the editor to inject predefined snippets (e.g., Try-Catch blocks, Android Intents, Logcat debugging) from `snippets.json`. You can also generate entirely new custom `.smali` classes (like BroadcastReceivers) and inject them into the app.
+* **Syntax Highlighting:** Live regex-based syntax highlighting for Smali instructions, registers, strings, and comments.
+
+---
+
+## ⭐ Module 2: Patch Favorites & Fuzzy Matching
+
+When an app updates, hardcoded offsets and exact code blocks change. The framework solves this with an intelligent patch management system.
+
+* **Batch Patching:** Save complex, multi-file modifications (like complete OkHttp/TrustManager SSL Pinning bypasses) into `favorite_patches.json`. Apply the entire batch to a new app with a single click.
+* **Fuzzy Matching Engine:** If a saved patch doesn't exactly match the decompiled code of a new app version, the built-in Fuzzy Matcher intervenes. It uses method signature resolution and code diffing to locate the new insertion point and opens an interactive side-by-side diff editor to resolve the conflict.
+
+---
+
+## 🏗️ Module 3: Automated Build & Patching Pipeline
+
+A manual cycle of patching, repacking, signing, and flashing disrupts the analytical flow. This module reduces the cycle to seconds.
+
+* **Dynamic Manifest Strategies:** Choose between `Smali_Only` (fastest), `APKEditor` (native AXML compilation), and `AAPT2` (strict). The pipeline automatically removes Split-APK restrictions and injects a custom `Network Security Config` (NSC) to allow user-level MitM certificates.
+* **Multi-Target Patching:** Apply Smali modifications alongside Hex patches for compiled shared libraries (e.g., `libflutter.so`).
+* **Auto-Signing & Flashing:** Seamless integration of `uber-apk-signer` to resign modified APKs, followed by direct deployment to the test device via ADB (`adb install-multiple`).
+* **Integrated Tracing:** Start and stop targeted `logcat` traces based on the process ID (PID) of the target app directly from the GUI.
+* **Systematic Test Documentation:** All test runs, patches, and observations are versioned and stored in structured Markdown reports (`Kippy_RE_Log.md`) and JSON history.
+
+---
+
+## 🌐 Module 4: API Inspector (DAST & MITM Proxy)
+
+The framework includes a fully integrated Dynamic Application Security Testing (DAST) suite powered by `mitmproxy` to intercept and manipulate API traffic on the fly.
 
 ### 1️⃣ Setup & Commissioning (The VPN Trick for Flutter)
 
-Since Flutter/Dart applications typically ignore global HTTP proxy settings, this tool utilizes a local VPN routing trick to capture the traffic:
+Since Flutter/Dart applications typically ignore global HTTP proxy settings, this tool utilizes a local VPN routing trick:
 
-1. **Start the Proxy:** In the framework GUI, navigate to the "API Inspector" tab and click **▶ Start Proxy**.
-2. **Push & Install Certificate:** Click **📱 Push Cert**. This copies the `mitmproxy-ca-cert.cer` file to your device's `/Download/` folder. On your Android device, go to *Settings -> Security -> Encryption & Credentials -> Install a certificate*. Choose **CA Certificate** and install it.
-3. **Establish USB Tunnel:** Connect your phone via USB and click **🔌 Route USB** in the GUI. This executes `adb reverse tcp:8080 tcp:8080`, linking your phone's local port 8080 directly to your PC's proxy.
-4. **Configure SuperProxy (The Bypass):** Download and install a proxy-forwarding app like **SuperProxy** on your Android device. Add a new profile: Protocol `HTTP`, Server `127.0.0.1`, Port `8080`.
-5. **Trust the Session:** Start the SuperProxy profile. Once connected, open SuperProxy again and accept/trust the proxy's certificate for the VPN session.
+1. **Start Proxy & Establish USB Tunnel:** Start the proxy and click **🔌 Route USB** to execute `adb reverse tcp:8080 tcp:8080`.
+2. **Push Certificate:** Click **📱 Push Cert** to copy the CA certificate to the device for installation.
+3. **Configure SuperProxy:** Use an app like **SuperProxy** on Android (HTTP, `127.0.0.1:8080`) to tunnel the traffic, bypassing framework-level proxy ignores.
 
 ### 2️⃣ Traffic Monitoring & Data Extraction
 
-Once the setup is complete, all intercepted traffic from the target app will automatically populate the local SQLite database (`api_traffic.db`) and appear in the GUI in real-time.
+* **Custom Columns Engine (⚙️ Spalten-Logik):** Dynamically extract hidden data from Request/Response bodies or headers using **JSON Paths**, **Regex**, or **Byte Offsets** and display them as dedicated columns.
+* **Column Display Manager (👁️ Ansicht):** Hide, show, and reorder columns on the fly. Save setups as application-specific `.json` profiles.
 
-* **Custom Columns Engine (⚙️ Spalten-Logik):** Dynamically extract hidden data from Request/Response bodies or headers and display them as dedicated columns in your grid. The engine supports three extraction methods:
-* **JSON Path:** Extract data from complex JSON structures (e.g., `data.user.id`).
-* **Regex:** Use Regular Expressions to capture dynamic tokens from unformatted text.
-* **Byte Offset:** Extract raw bytes (Hex, Int, String) from specific positions and lengths (crucial for reverse engineering custom binary protocols).
+### 3️⃣ Traffic Manipulation
 
+* **Intercept Rules (On-the-fly Manipulation):** Define dynamic manipulation rules based on URL matching to automatically replace Request or Response payloads before they reach the app/server.
+* **Database Editing & Export:** Modify intercepted packets directly in the GUI and save them to the local SQLite database (`api_traffic.db`). Export selected packets for external analysis.
 
-* **Column Display Manager (👁️ Ansicht):** Hide, show, and reorder your columns on the fly without reloading the database.
-* **Profile Management:** Save your custom column and extraction configurations as `.json` profiles and load them depending on the application you are currently analyzing.
-
-### 3️⃣ Traffic Manipulation & Portability
-
-* **Intercept Rules (On-the-fly Manipulation):** Navigate to the "Intercept Regeln" tab to define dynamic manipulation rules. Enter a **URL Match**, select an **Action** (e.g., `replace_res_body`), and provide the new **Payload**. The proxy will immediately intercept any matching future request and swap the payload before it reaches the app or the server.
-* **Database Editing:** Modify intercepted Request/Response bodies or add custom analytical comments directly in the GUI. Click **💾 Änderungen speichern** to permanently update the database entry.
-* **Export & Import:** Export selected packets to a `.json` file for backup or external analysis, and import them back into the framework at any time.
+```
 
 ```
