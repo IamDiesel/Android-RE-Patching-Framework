@@ -111,5 +111,3 @@ Since Flutter/Dart applications typically ignore global HTTP proxy settings, thi
 * **Database Editing & Export:** Modify intercepted packets directly in the GUI and save them to the local SQLite database (`api_traffic.db`). Export selected packets for external analysis.
 
 ```
-
-```
