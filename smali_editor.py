@@ -14,8 +14,16 @@ class SmaliEditorWidget(ttk.Frame):
         paned.pack(fill="both", expand=True)
 
         # Original Code (Read-Only)
-        f_orig = ttk.LabelFrame(paned, text="Original Code (Read-Only)")
+        f_orig = ttk.LabelFrame(paned)
         paned.add(f_orig, weight=1)
+
+        # NEU: Custom Header mit Button für den Call Graph
+        f_orig_header = ttk.Frame(f_orig)
+        ttk.Label(f_orig_header, text="Original Code (Read-Only)").pack(side="left")
+        self.btn_find_cg = ttk.Button(f_orig_header, text="🔍 Find in Call Graph")
+        self.btn_find_cg.pack(side="left", padx=10)
+        f_orig.config(labelwidget=f_orig_header)
+
         self.txt_orig = tk.Text(f_orig, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
                                 insertbackground="white")
         self.txt_orig.pack(fill="both", expand=True, padx=2, pady=2)
@@ -29,7 +37,6 @@ class SmaliEditorWidget(ttk.Frame):
                                                                                                   expand=True, padx=2,
                                                                                                   pady=4)
 
-        # NEU: Der sichtbare Baukasten-Button
         self.btn_snippet = ttk.Button(f_mid, text="➕ Snippet einfügen")
         self.btn_snippet.pack(side="right", fill="x", expand=True, padx=2, pady=4)
 

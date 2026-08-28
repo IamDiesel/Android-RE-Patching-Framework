@@ -1,7 +1,7 @@
 {
-    "BASE_DIR": "C:\\Users\\Lenovo\\Documents\\GitHub\\Android RE Patching Framework",
-    "SPLIT_NAME": "com.arjonasoftware.babycam",
-    "APP_PACKAGE": "com.arjonasoftware.babycam",
+    "BASE_DIR": "C:\\Users\\Dogma\\PycharmProjects\\Android-RE-Patching-Framework",
+    "SPLIT_NAME": "com.datamars.kippynew",
+    "APP_PACKAGE": "com.datamars.kippynew",
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
     "MANIFEST_STRATEGY": "apkeditor",

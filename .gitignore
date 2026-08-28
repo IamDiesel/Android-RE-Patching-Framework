@@ -30,7 +30,7 @@ trace.txt
 *.rep/
 *.lock
 
-.idea
+*.idea/
 doc/virtuagymTrace.txt
 RE_History.json
 tstconfig.json

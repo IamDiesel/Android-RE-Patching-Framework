@@ -169,6 +169,7 @@ class SmaliStudioTab(ttk.Frame):
 
         # CENTER PANEL (Editor Component)
         self.editor = SmaliEditorWidget(main_paned)
+        self.editor.btn_find_cg.config(command=lambda: self.find_current_in_callgraph(highlight_only=False))  # <--- NEU
         main_paned.add(self.editor, weight=3)
 
         # Baukasten-Kontextmenü für den Editor einrichten
@@ -530,6 +531,7 @@ class SmaliStudioTab(ttk.Frame):
 
             self.update_outline(lines)
             self.refresh_callgraph_ui()
+            self.app.after(50, lambda: self.find_current_in_callgraph(highlight_only=True))
         else:
             self.app.log("[!] Konnte den Block in der Datei nicht extrahieren.")
 
@@ -565,6 +567,11 @@ class SmaliStudioTab(ttk.Frame):
 
     def parse_data_flow(self, method_block):
         for i in self.tree_datagraph.get_children(): self.tree_datagraph.delete(i)
+
+        # Tag für Strings konfigurieren (Farbton analog zum Editor-Syntax-Highlighting)
+        self.tree_datagraph.tag_configure("string", foreground="#CE9178")
+
+        # 1. State-Manipulation: Felder (SGET/SPUT/IGET/IPUT) tracken
         matches = re.findall(r'\b([is](?:get|put)(?:-[a-z]+)?)\s+[^,]+(?:,\s*[^,]+)?,\s*(L[^;]+;->[^\s]+)',
                              method_block)
         for instruction, target in list(dict.fromkeys(matches)):
@@ -572,6 +579,13 @@ class SmaliStudioTab(ttk.Frame):
                 self.tree_datagraph.insert("", "end", values=("READ", target), tags=("read", target))
             elif "put" in instruction:
                 self.tree_datagraph.insert("", "end", values=("WRITE", target), tags=("write", target))
+
+        # 2. Hardkodierte Strings tracken (const-string & const-string/jumbo)
+        string_matches = re.findall(r'const-string(?:/jumbo)?\s+[vp]\d+,\s*"(.*?)"', method_block)
+        for string_val in list(dict.fromkeys(string_matches)):
+            # Überlange Strings (z.B. Base64 Blobs, Zertifikate) optisch kürzen
+            display_str = string_val if len(string_val) < 80 else string_val[:77] + "..."
+            self.tree_datagraph.insert("", "end", values=("STRING", f'"{display_str}"'), tags=("string", string_val))
 
     def resolve_smali_path(self, rel_base):
         smali_dir = self.get_smali_dir()
@@ -599,52 +613,49 @@ class SmaliStudioTab(ttk.Frame):
     def find_incoming_xrefs(self):
         if not self._ensure_index_loaded() or not self.current_smali_file: return
 
-        # --- FIX: Dalvik-Klassenname korrekt aus APKEditor ODER Apktool Pfaden extrahieren ---
         parts = self.current_smali_file.split("/")
 
         if parts[0] == "smali" and len(parts) > 1 and parts[1].startswith("classes"):
-            # APKEditor Format: smali/classes2/com/test/...
             pure_path = "/".join(parts[2:])
         elif parts[0].startswith("smali_classes"):
-            # Apktool Format: smali_classes2/com/test/...
             pure_path = "/".join(parts[1:])
         elif parts[0] == "smali":
-            # Standard Apktool Format: smali/com/test/...
             pure_path = "/".join(parts[1:])
         else:
-            # Fallback für Root-Files oder eigene Strukturen
             pure_path = self.current_smali_file
 
-        # Dalvik Klasse bauen (z.B. Lcom/test/App;)
         d_class = f"L{pure_path.replace('.smali', '')};"
 
-        # Methodennamen bereinigen (z.B. public static final onCreate -> onCreate)
-        m_name = \
-            re.sub(
-                r'^(public |private |protected |static |final |constructor |synthetic |bridge |declared-synchronized )*',
-                '', self.current_method_name).split('(')[0]
+        clean_def = re.sub(
+            r'^(public |private |protected |static |final |constructor |synthetic |bridge |declared-synchronized |abstract |varargs |native |strictfp )*',
+            '', self.current_method_name)
 
-        search_term = f"{d_class}->{m_name}("
+        # FIX: Die Parameter und der Rückgabetyp MÜSSEN im Suchbegriff bleiben!
+        # Vorher wurde hier alles ab der Klammer '(' abgeschnitten. Das führte dazu, dass
+        # das System bei Überladungen (wie <init>) alle Konstruktoren in einen Topf geworfen hat.
+        search_term = f"{d_class}->{clean_def}"
 
-        # UI leeren und Such-Hinweis anzeigen
         for i in self.tree_incoming.get_children(): self.tree_incoming.delete(i)
         self.tree_incoming.insert("", "end", values=("Suche läuft...", ""))
 
         def on_results(results, cancelled):
             self.app.after(0, lambda: self._update_incoming_ui(results))
 
-        # Asynchrone RAM-Suche starten
         self.search_engine.search_xrefs_incoming(search_term, on_results)
 
     def _update_incoming_ui(self, results):
         for i in self.tree_incoming.get_children(): self.tree_incoming.delete(i)
         current_node_id = f"{self.current_smali_file}|{self.current_method_name}"
 
+        # FIX: Wenn keine Aufrufer gefunden wurden, brechen wir ab, bevor die Methode aus dem Graphen gelöscht wird!
+        if not results:
+            self.tree_incoming.insert("", "end", values=("Keine Aufrufer gefunden.", ""))
+            self.app.log("[*] Keine eingehenden Aufrufe (XREFs) für diese Methode im RAM gefunden.")
+            return
+
         seen_callers = set()
 
         for r in results:
-            # FIX: Windows-Pfade (\) aus der Suchmaschine rigoros in Unix-Pfade (/) umwandeln!
-            # Nur so matchen sie zu 100 % mit den Pfaden im Editor.
             norm_path = r[0].replace("\\", "/")
 
             clean_sig = re.sub(
@@ -657,19 +668,21 @@ class SmaliStudioTab(ttk.Frame):
             seen_callers.add(caller_id)
 
             tags = ("system_api", clean_sig) if is_system_api("L" + norm_path) else (clean_sig,)
-            # Die Anzeige in der Tabelle nutzt jetzt ebenfalls den normierten Pfad
             self.tree_incoming.insert("", "end", values=(norm_path, clean_sig.split('(')[0]), tags=tags)
 
-            # Kanten mit dem normierten Pfad erstellen
             caller, callee = self.app.cg.add_edge(norm_path, clean_sig, self.current_smali_file,
                                                   self.current_method_name)
 
             if not caller.callers:
                 self.app.cg.make_root(caller.id)
 
-        # Jetzt wird die alte Wurzel auch garantiert gefunden und restlos entfernt
+        # Nur wenn es wirklich neue Eltern-Knoten gibt, darf die aktuelle Methode ihren Root-Status verlieren
         self.app.cg.remove_root(current_node_id)
         self.refresh_callgraph_ui()
+
+        # UX-Plus: Nach der XREF-Suche den Baum aufklappen und die aktuelle Methode direkt wieder fokussieren
+        self.app.after(50, lambda: self.find_current_in_callgraph(highlight_only=True))
+
 
     def refresh_callgraph_ui(self):
         # 1. State sichern (welche Pfade sind offen / selektiert?)
@@ -841,7 +854,7 @@ class SmaliStudioTab(ttk.Frame):
         top = tk.Toplevel(self.app)
         self.search_window = top
         top.title("🔍 Globale RAM-Suche (Echtzeit)")
-        top.geometry("900x550")
+        top.geometry("900x580")
         top.attributes("-topmost", True)
 
         f_top = ttk.Frame(top)
@@ -851,9 +864,13 @@ class SmaliStudioTab(ttk.Frame):
         ent_search = ttk.Entry(f_top, width=50)
         ent_search.grid(row=0, column=1, padx=5, pady=2)
 
-        ttk.Label(f_top, text="Ergebnisse filtern:").grid(row=1, column=0, sticky="w", pady=2)
+        ttk.Label(f_top, text="Ergebnisse filtern (AND, per Leerzeichen):").grid(row=1, column=0, sticky="w", pady=2)
         ent_filter = ttk.Entry(f_top, width=50)
         ent_filter.grid(row=1, column=1, padx=5, pady=2)
+
+        ttk.Label(f_top, text="Ausschließen (kommasepariert, Pfad o. Code):").grid(row=2, column=0, sticky="w", pady=2)
+        ent_exclude = ttk.Entry(f_top, width=50)
+        ent_exclude.grid(row=2, column=1, padx=5, pady=2)
 
         lbl_status = ttk.Label(top, text=f"Bereit. Durchsuche {len(self.search_engine.ram_cache)} Dateien im RAM.")
         lbl_status.pack(pady=2)
@@ -877,10 +894,24 @@ class SmaliStudioTab(ttk.Frame):
 
         def apply_filter(event=None):
             for i in tree.get_children(): tree.delete(i)
-            f_term = ent_filter.get().lower()
-            filtered = [r for r in all_results if f_term in r[0].lower() or f_term in r[2].lower()]
+
+            f_terms = [t.strip().lower() for t in ent_filter.get().split() if t.strip()]
+
+            filtered = []
+            for r in all_results:
+                target_str = (r[0] + " " + r[2]).lower()
+
+                match = True
+                for ft in f_terms:
+                    if ft not in target_str:
+                        match = False
+                        break
+
+                if match:
+                    filtered.append(r)
+
             for r in filtered: tree.insert("", "end", values=r)
-            if f_term and all_results:
+            if f_terms and all_results:
                 lbl_status.config(text=f"Filter aktiv: {len(filtered)} von {len(all_results)} Treffern.")
             elif all_results:
                 lbl_status.config(text=f"{len(all_results)} Treffer geladen.")
@@ -891,6 +922,7 @@ class SmaliStudioTab(ttk.Frame):
             for i in tree.get_children(): tree.delete(i)
             ent_search.delete(0, tk.END)
             ent_filter.delete(0, tk.END)
+            ent_exclude.delete(0, tk.END)
             lbl_status.config(text="Suche geleert.")
 
         def do_search(event=None):
@@ -899,18 +931,41 @@ class SmaliStudioTab(ttk.Frame):
             if not term: return
 
             lbl_status.config(text="Suche läuft im RAM...")
-            ent_filter.delete(0, tk.END)
+            # FIX: Diese Zeile wurde entfernt, damit dein Filter erhalten bleibt!
+            # ent_filter.delete(0, tk.END)
+
             self.cancel_search_flag = False
             top.update()
             start_time = time.time()
+
+            ex_terms = [t.strip().lower() for t in ent_exclude.get().split(",") if t.strip()]
 
             def search_thread():
                 results = []
                 for rel_path, content in self.search_engine.ram_cache:
                     if len(results) >= 10000 or self.cancel_search_flag: break
+
+                    if ex_terms:
+                        skip_file = False
+                        path_lower = rel_path.lower()
+                        for ex in ex_terms:
+                            if ex in path_lower:
+                                skip_file = True
+                                break
+                        if skip_file: continue
+
                     if term in content:
                         for line_no, line in enumerate(content.splitlines(), 1):
                             if term in line:
+                                if ex_terms:
+                                    skip_line = False
+                                    line_lower = line.lower()
+                                    for ex in ex_terms:
+                                        if ex in line_lower:
+                                            skip_line = True
+                                            break
+                                    if skip_line: continue
+
                                 results.append((rel_path, line_no, line.strip()))
                                 if len(results) >= 10000: break
                 self.app.after(0, lambda: finish_search(results))
@@ -922,24 +977,15 @@ class SmaliStudioTab(ttk.Frame):
                 nonlocal all_results
                 all_results = results
                 elapsed = time.time() - start_time
-                apply_filter()
+                apply_filter()  # Filtert die neuen Ergebnisse sofort wieder durch!
                 msg = f"{len(results)} Treffer in {elapsed:.3f} Sekunden."
                 if len(results) >= 10000: msg += " (UI-Limit 10.000 erreicht!)"
                 lbl_status.config(text=msg)
 
             threading.Thread(target=search_thread, daemon=True).start()
 
-        def copy_search_results(event):
-            selected = tree.selection()
-            if not selected: return "break"
-            lines = [f"{tree.item(i, 'values')[0]}:{tree.item(i, 'values')[1]} - {tree.item(i, 'values')[2]}" for i in
-                     selected]
-            top.clipboard_clear()
-            top.clipboard_append("\n".join(lines))
-            return "break"
-
         btn_frame = ttk.Frame(f_top)
-        btn_frame.grid(row=0, column=2, rowspan=2, padx=10, sticky="ns")
+        btn_frame.grid(row=0, column=2, rowspan=3, padx=10, sticky="ns")
 
         ttk.Button(btn_frame, text="Suchen", command=do_search).pack(side="top", fill="x", pady=2)
         ttk.Button(btn_frame, text="🗑 Leeren", command=clear_search).pack(side="top", fill="x", pady=2)
@@ -947,10 +993,45 @@ class SmaliStudioTab(ttk.Frame):
             side="top", fill="x", pady=2)
 
         ent_search.bind("<Return>", do_search)
+        ent_exclude.bind("<Return>", do_search)
         ent_filter.bind("<KeyRelease>", apply_filter)
         tree.bind("<Double-1>", lambda e: self.load_method(tree.item(tree.selection()[0], "values")[0],
                                                            target_line=int(tree.item(tree.selection()[0], "values")[1]),
                                                            add_as_root=True) if tree.selection() else None)
 
-        # HINWEIS: <Control-a> und <Control-c> wurden hier absichtlich entfernt.
-        # Die UIUtils-Klasse fängt diese Events nun global ab und kopiert die markierten Treeview-Daten sauber in die Zwischenablage.
+    def find_current_in_callgraph(self, highlight_only=False):
+        if not self.current_smali_file: return
+        target_id = f"{self.current_smali_file}|{self.current_method_name}"
+
+        found_items = []
+
+        # Rekursive Suche durch ALLE sichtbaren Tree-Nodes
+        def search_tree(item):
+            tags = self.tree_callstack.item(item, "tags")
+            if tags:
+                node_id = tags[1] if "system_api" in tags else tags[0]
+                if node_id == target_id:
+                    found_items.append(item)  # Treffer sammeln statt abbrechen!
+
+            for child in self.tree_callstack.get_children(item):
+                search_tree(child)
+
+        for root_item in self.tree_callstack.get_children(""):
+            search_tree(root_item)
+
+        if found_items:
+            # 1. Alle Elternknoten für JEDEN gefundenen Treffer aufklappen
+            for item in found_items:
+                curr = self.tree_callstack.parent(item)
+                while curr:
+                    self.tree_callstack.item(curr, open=True)
+                    curr = self.tree_callstack.parent(curr)
+
+            # 2. Alle Treffer gleichzeitig markieren
+            self.tree_callstack.selection_set(found_items)
+
+            # 3. Zum ersten Treffer scrollen, damit das Fenster nicht wild springt
+            self.tree_callstack.see(found_items[0])
+        else:
+            if not highlight_only:
+                self.app.log("[*] Aktuelle Methode ist (noch) nicht im Call Graph verknüpft/sichtbar.")
