@@ -499,18 +499,29 @@ class SmaliStudioTab(ttk.Frame):
         if start_idx != -1 and end_idx != -1:
             block = "".join(lines[start_idx:end_idx + 1])
             self.current_smali_file = rel_filepath.replace("\\", "/")
-            self.current_method_name = method_def
 
-            disp_name = method_def.split('(')[0] if "(" in method_def else method_def
+            # Signatur hart normalisieren
+            if not method_def.startswith("<"):
+                clean_def = re.sub(
+                    r'^(public |private |protected |static |final |constructor |synthetic |bridge |declared-synchronized |abstract |varargs |native |strictfp )*',
+                    '', method_def)
+                self.current_method_name = clean_def
+            else:
+                self.current_method_name = method_def
+
+            disp_name = self.current_method_name.split('(')[
+                0] if "(" in self.current_method_name else self.current_method_name
             self.lbl_smali_file.config(text=f"{os.path.basename(self.current_smali_file)} -> {disp_name}")
 
             self.editor.load_code(block)
 
-            if method_def != "<Klassen-Header & Felder>":
-                self.app.cg.add_node(self.current_smali_file, self.current_method_name)
+            if not self.current_method_name.startswith("<"):
+                # FIX: Hole den Knotenpunkt und prüfe, ob er schon Aufrufer hat!
+                node = self.app.cg.add_node(self.current_smali_file, self.current_method_name)
                 if add_as_root:
-                    node_id = f"{self.current_smali_file}|{self.current_method_name}"
-                    self.app.cg.make_root(node_id)
+                    if not node.callers:
+                        self.app.cg.make_root(node.id)
+
                 self.parse_outgoing_calls(block)
                 self.parse_data_flow(block)
             else:
@@ -587,36 +598,151 @@ class SmaliStudioTab(ttk.Frame):
 
     def find_incoming_xrefs(self):
         if not self._ensure_index_loaded() or not self.current_smali_file: return
+
+        # --- FIX: Dalvik-Klassenname korrekt aus APKEditor ODER Apktool Pfaden extrahieren ---
         parts = self.current_smali_file.split("/")
-        d_class = f"L{'/'.join(parts[1:]).replace('.smali', '')};" if parts[0].startswith(
-            "smali") else f"L{self.current_smali_file.replace('.smali', '')};"
+
+        if parts[0] == "smali" and len(parts) > 1 and parts[1].startswith("classes"):
+            # APKEditor Format: smali/classes2/com/test/...
+            pure_path = "/".join(parts[2:])
+        elif parts[0].startswith("smali_classes"):
+            # Apktool Format: smali_classes2/com/test/...
+            pure_path = "/".join(parts[1:])
+        elif parts[0] == "smali":
+            # Standard Apktool Format: smali/com/test/...
+            pure_path = "/".join(parts[1:])
+        else:
+            # Fallback für Root-Files oder eigene Strukturen
+            pure_path = self.current_smali_file
+
+        # Dalvik Klasse bauen (z.B. Lcom/test/App;)
+        d_class = f"L{pure_path.replace('.smali', '')};"
+
+        # Methodennamen bereinigen (z.B. public static final onCreate -> onCreate)
         m_name = \
-        re.sub(r'^(public |private |protected |static |final |constructor |synthetic |bridge |declared-synchronized )*',
-               '', self.current_method_name).split('(')[0]
+            re.sub(
+                r'^(public |private |protected |static |final |constructor |synthetic |bridge |declared-synchronized )*',
+                '', self.current_method_name).split('(')[0]
+
         search_term = f"{d_class}->{m_name}("
 
+        # UI leeren und Such-Hinweis anzeigen
         for i in self.tree_incoming.get_children(): self.tree_incoming.delete(i)
         self.tree_incoming.insert("", "end", values=("Suche läuft...", ""))
 
         def on_results(results, cancelled):
             self.app.after(0, lambda: self._update_incoming_ui(results))
 
+        # Asynchrone RAM-Suche starten
         self.search_engine.search_xrefs_incoming(search_term, on_results)
 
     def _update_incoming_ui(self, results):
         for i in self.tree_incoming.get_children(): self.tree_incoming.delete(i)
         current_node_id = f"{self.current_smali_file}|{self.current_method_name}"
+
+        seen_callers = set()
+
         for r in results:
-            tags = ("system_api", r[1]) if is_system_api("L" + r[0]) else (r[1],)
-            self.tree_incoming.insert("", "end", values=(r[0], r[1].split('(')[0]), tags=tags)
-            self.app.cg.add_edge(r[0], r[1], self.current_smali_file, self.current_method_name)
-            self.app.cg.make_root(f"{r[0]}|{r[1]}")
+            # FIX: Windows-Pfade (\) aus der Suchmaschine rigoros in Unix-Pfade (/) umwandeln!
+            # Nur so matchen sie zu 100 % mit den Pfaden im Editor.
+            norm_path = r[0].replace("\\", "/")
+
+            clean_sig = re.sub(
+                r'^(public |private |protected |static |final |constructor |synthetic |bridge |declared-synchronized |abstract |varargs |native |strictfp )*',
+                '', r[1])
+
+            caller_id = f"{norm_path}|{clean_sig}"
+            if caller_id in seen_callers:
+                continue
+            seen_callers.add(caller_id)
+
+            tags = ("system_api", clean_sig) if is_system_api("L" + norm_path) else (clean_sig,)
+            # Die Anzeige in der Tabelle nutzt jetzt ebenfalls den normierten Pfad
+            self.tree_incoming.insert("", "end", values=(norm_path, clean_sig.split('(')[0]), tags=tags)
+
+            # Kanten mit dem normierten Pfad erstellen
+            caller, callee = self.app.cg.add_edge(norm_path, clean_sig, self.current_smali_file,
+                                                  self.current_method_name)
+
+            if not caller.callers:
+                self.app.cg.make_root(caller.id)
+
+        # Jetzt wird die alte Wurzel auch garantiert gefunden und restlos entfernt
         self.app.cg.remove_root(current_node_id)
         self.refresh_callgraph_ui()
 
     def refresh_callgraph_ui(self):
-        for i in self.tree_callstack.get_children(): self.tree_callstack.delete(i)
-        for root_id in self.app.cg.roots: self._insert_cg_node("", root_id)
+        # 1. State sichern (welche Pfade sind offen / selektiert?)
+        open_paths = set()
+        selected_paths = set()
+
+        # Selektion sichern
+        for sel_item in self.tree_callstack.selection():
+            path = []
+            curr = sel_item
+            while curr:
+                tags = self.tree_callstack.item(curr, "tags")
+                if tags:
+                    node_id = tags[1] if "system_api" in tags else tags[0]
+                    path.insert(0, node_id)
+                curr = self.tree_callstack.parent(curr)
+            selected_paths.add(tuple(path))
+
+        # Offene Knoten sichern
+        def save_open_paths(item_id, current_path):
+            tags = self.tree_callstack.item(item_id, "tags")
+            if not tags: return
+            node_id = tags[1] if "system_api" in tags else tags[0]
+            new_path = current_path + (node_id,)
+
+            if self.tree_callstack.item(item_id, "open"):
+                open_paths.add(new_path)
+                for child in self.tree_callstack.get_children(item_id):
+                    save_open_paths(child, new_path)
+
+        for child in self.tree_callstack.get_children():
+            save_open_paths(child, ())
+
+        # 2. Baum komplett leeren
+        for i in self.tree_callstack.get_children():
+            self.tree_callstack.delete(i)
+
+        # 3. Wurzeln (Roots) neu einfügen
+        for root_id in self.app.cg.roots:
+            self._insert_cg_node("", root_id)
+
+        # 4. State rekursiv wiederherstellen (inkl. Lazy-Loading Umgehung)
+        def restore_state(item_id, current_path):
+            tags = self.tree_callstack.item(item_id, "tags")
+            if not tags: return
+            node_id = tags[1] if "system_api" in tags else tags[0]
+            new_path = current_path + (node_id,)
+
+            # Selektion wiederherstellen
+            if new_path in selected_paths:
+                self.tree_callstack.selection_add(item_id)
+                self.tree_callstack.see(item_id)
+
+            # Aufklapp-Zustand wiederherstellen
+            if new_path in open_paths:
+                # Lazy-Loading manuell auflösen, da die echten Kinder noch nicht existieren
+                children = self.tree_callstack.get_children(item_id)
+                if len(children) == 1 and self.tree_callstack.item(children[0], "text") == "*dummy*":
+                    self.tree_callstack.delete(children[0])
+                    node = self.app.cg.get_node(node_id)
+                    if node:
+                        for callee_id in node.callees:
+                            self._insert_cg_node(item_id, callee_id)
+
+                # Item im UI aufklappen
+                self.tree_callstack.item(item_id, open=True)
+
+                # Kinder weiter prüfen
+                for child in self.tree_callstack.get_children(item_id):
+                    restore_state(child, new_path)
+
+        for child in self.tree_callstack.get_children():
+            restore_state(child, ())
 
     def _insert_cg_node(self, parent_item, node_id):
         node = self.app.cg.get_node(node_id)
@@ -642,13 +768,18 @@ class SmaliStudioTab(ttk.Frame):
 
     def on_callgraph_double_click(self, event):
         sel = self.tree_callstack.selection()
-        if not sel: return
+        if not sel: return "break"
         tags = self.tree_callstack.item(sel[0], "tags")
         node_id = tags[1] if "system_api" in tags else tags[0]
-        if "system_api" in tags: return self.app.log(f"[!] {node_id.split('|')[0]} ist eine System-API.")
+        if "system_api" in tags:
+            self.app.log(f"[!] {node_id.split('|')[0]} ist eine System-API.")
+            return "break"
         if "|" in node_id:
             filepath, sig = node_id.split("|", 1)
             self.load_method(filepath, method_signature=sig, add_as_root=False)
+
+        # NEU: Verhindert das automatische Ein-/Ausklappen von Tkinter!
+        return "break"
 
     def on_outline_double_click(self, event):
         sel = self.tree_outline.selection()
