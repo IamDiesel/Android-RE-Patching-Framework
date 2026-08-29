@@ -16,20 +16,16 @@ class SmaliStudioTab(ttk.Frame):
         super().__init__(parent)
         self.app = app
 
-        # Basis-Engines instanziieren (werden vom Controller genutzt)
         self.search_engine = SmaliSearchEngine(self.app.log, self.update_status)
         self.struct_manager = SmaliStructManager(self.app, self.get_smali_dir(), self.search_engine,
                                                  self.refresh_custom_structures_list)
 
         self.create_widgets()
-
-        # Controller injizieren
         self.controller = SmaliStudioController(self, app)
 
         UIUtils.apply_panedwindow_style()
         UIUtils.setup_global_shortcuts(self.winfo_toplevel())
 
-    # --- HILFSFUNKTIONEN FÜR DEN CONTROLLER ---
     def get_unpacked_dir_name(self):
         strategy = self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
         return "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
@@ -57,9 +53,7 @@ class SmaliStudioTab(ttk.Frame):
         messagebox.showwarning("Fehler", "Kein entpackter Code gefunden! Bitte zuerst 'APK Entpacken' klicken.")
         return False
 
-    # --- UI LAYOUT ---
     def create_widgets(self):
-        # 1. TOOLBAR
         top_bar = ttk.Frame(self)
         top_bar.pack(side="top", fill="x", pady=5, padx=5)
 
@@ -81,7 +75,6 @@ class SmaliStudioTab(ttk.Frame):
         self.lbl_smali_file = ttk.Label(top_bar, text="Keine Datei geladen", font=("Segoe UI", 9, "bold"))
         self.lbl_smali_file.pack(side="right", padx=10)
 
-        # 2. PATCH-LISTE
         f_patches = ttk.LabelFrame(self, text="Aktive Smali Patches (Warten auf Build)")
         f_patches.pack(side="bottom", fill="both", expand=False, padx=5, pady=5)
 
@@ -94,14 +87,12 @@ class SmaliStudioTab(ttk.Frame):
             self.smali_tree.index(self.smali_tree.selection()[0])) if self.smali_tree.selection() else None)
         self.smali_tree.bind("<Double-1>", self.on_patch_double_click)
 
-        # 3. MAIN IDE
         main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_paned.pack(side="top", fill="both", expand=True, padx=5, pady=5)
 
         self.left_nb = ttk.Notebook(main_paned)
         main_paned.add(self.left_nb, weight=1)
 
-        # Outline
         f_outline = ttk.Frame(self.left_nb)
         self.tree_outline = ttk.Treeview(f_outline, columns=("Type", "Name"), show="headings")
         self.tree_outline.heading("Type", text="Typ")
@@ -114,19 +105,60 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_outline.tag_configure("method", foreground="#A31515")
         self.left_nb.add(f_outline, text="Outline")
 
-        # Call Graph
+        # --- CALL GRAPH ---
         f_callgraph = ttk.Frame(self.left_nb)
+
+        # 1. Zeile: Exploration & Steuerung
+        cg_toolbar_top = ttk.Frame(f_callgraph)
+        cg_toolbar_top.pack(side="top", fill="x", padx=2, pady=2)
+
+        ttk.Button(cg_toolbar_top, text="🔍 Explore", width=9,
+                   command=lambda: self.controller.start_auto_explore()).pack(side="left", padx=1)
+        ttk.Button(cg_toolbar_top, text="🛑 Stop", width=8, command=lambda: self.controller.stop_auto_explore()).pack(
+            side="left", padx=1)
+        ttk.Button(cg_toolbar_top, text="🗑 Clear", width=7, command=lambda: self.controller.clear_callgraph()).pack(
+            side="right", padx=1)
+
+        # 2. Zeile: Live-Filter & Navigation
+        cg_toolbar_bottom = ttk.Frame(f_callgraph)
+        cg_toolbar_bottom.pack(side="top", fill="x", padx=2, pady=2)
+
+        ttk.Label(cg_toolbar_bottom, text="Filter:").pack(side="left", padx=(2, 2))
+        self.ent_cg_filter = ttk.Entry(cg_toolbar_bottom)
+        self.ent_cg_filter.pack(side="left", fill="x", expand=True, padx=2)
+        self.ent_cg_filter.bind("<KeyRelease>", lambda e: self.controller.on_cg_filter_change())
+
+        ttk.Button(cg_toolbar_bottom, text="⬇", width=3, command=lambda: self.controller.cg_controller.next_hit()).pack(
+            side="right", padx=1)
+        ttk.Button(cg_toolbar_bottom, text="⬆", width=3, command=lambda: self.controller.cg_controller.prev_hit()).pack(
+            side="right", padx=1)
+        self.lbl_cg_hits = ttk.Label(cg_toolbar_bottom, text="0/0")
+        self.lbl_cg_hits.pack(side="right", padx=2)
+
         self.tree_callstack = ttk.Treeview(f_callgraph, columns=("File",), show="tree headings")
         self.tree_callstack.heading("#0", text="Methode")
         self.tree_callstack.heading("File", text="Pfad")
-        self.tree_callstack.pack(fill="both", expand=True)
+
+        # Scrollbar Call Graph (FIX)
+        scroll_cg = ttk.Scrollbar(f_callgraph, orient="vertical", command=self.tree_callstack.yview)
+        self.tree_callstack.configure(yscrollcommand=scroll_cg.set)
+        scroll_cg.pack(side="right", fill="y")
+        self.tree_callstack.pack(side="left", fill="both", expand=True)
+
         self.tree_callstack.bind("<Double-1>", self.on_callgraph_double_click)
         self.tree_callstack.bind("<<TreeviewOpen>>", lambda e: self.controller.cg_controller.handle_node_expand(
             self.tree_callstack.focus()))
+
+        # WICHTIG: Tkinter priorisiert Tags nach Reihenfolge der Registrierung.
+        # Die Filter-Tags (match_exact) müssen nach den Standard-Tags kommen!
         self.tree_callstack.tag_configure("system_api", foreground="gray")
+        self.tree_callstack.tag_configure("dimmed", foreground="#555555")  # Dunkelgrau
+        self.tree_callstack.tag_configure("match_parent", foreground="#D7BA7D")  # Gelblich (Pfad)
+        self.tree_callstack.tag_configure("match_exact", foreground="#00FF00", background="#1a4d1a")  # Neon Grün
+
         self.left_nb.add(f_callgraph, text="Call Graph")
 
-        # Data Graph
+        # --- REST IDE ---
         f_datagraph = ttk.Frame(self.left_nb)
         self.tree_datagraph = ttk.Treeview(f_datagraph, columns=("Access", "Target"), show="headings")
         self.tree_datagraph.heading("Access", text="Zugriff")
@@ -137,7 +169,6 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_datagraph.tag_configure("write", foreground="#D16969")
         self.left_nb.add(f_datagraph, text="Data Graph")
 
-        # Eigene Strukturen
         f_custom_structs = ttk.Frame(self.left_nb)
         self.tree_custom_structs = ttk.Treeview(f_custom_structs, columns=("Path",), show="headings")
         self.tree_custom_structs.heading("Path", text="Erstellte Smali Dateien")
@@ -147,14 +178,12 @@ class SmaliStudioTab(ttk.Frame):
                 0]) if self.tree_custom_structs.selection() else None)
         self.left_nb.add(f_custom_structs, text="Eigene Strukturen")
 
-        # Editor
         self.editor = SmaliEditorWidget(main_paned)
         self.editor.btn_find_cg.config(command=lambda: self.controller.cg_controller.find_and_highlight(
             f"{self.controller.current_smali_file}|{self.controller.current_method_name}", highlight_only=False))
         main_paned.add(self.editor, weight=3)
         self.setup_snippet_context_menu()
 
-        # XREFs Notebook
         self.right_nb = ttk.Notebook(main_paned)
         main_paned.add(self.right_nb, weight=1)
 
@@ -177,7 +206,6 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_outgoing.tag_configure("system_api", foreground="gray")
         self.right_nb.add(f_outgoing, text="Calls (Outgoing)")
 
-    # --- UI EVENT BINDINGS -> CONTROLLER DELEGATES ---
     def on_outline_double_click(self, event):
         sel = self.tree_outline.selection()
         if sel:
@@ -225,7 +253,6 @@ class SmaliStudioTab(ttk.Frame):
         self.controller.current_method_name = "<Patch-Bearbeitung>"
 
         self.lbl_smali_file.config(text=f"Patch: {os.path.basename(self.controller.current_smali_file)}")
-
         self.editor.txt_orig.config(state="normal")
         self.editor.txt_orig.delete("1.0", tk.END)
         self.editor.txt_orig.insert("1.0", patch.get("orig", ""))
@@ -244,7 +271,6 @@ class SmaliStudioTab(ttk.Frame):
         for i in self.tree_custom_structs.get_children(): self.tree_custom_structs.delete(i)
         for f in self.struct_manager.custom_files: self.tree_custom_structs.insert("", "end", values=(f,))
 
-    # --- SNIPPETS (Bleiben als UI-Feature hier) ---
     def setup_snippet_context_menu(self):
         self.snippet_menu = tk.Menu(self, tearoff=0)
         for category, items in self.struct_manager.snippets.items():

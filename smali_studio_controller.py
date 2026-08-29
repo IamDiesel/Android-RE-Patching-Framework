@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 from tkinter import messagebox
 
 from cg_manager import is_system_api
@@ -17,42 +18,52 @@ class SmaliStudioController:
         self.view = view
         self.app = app
 
-        # State
         self.smali_patches = []
         self.current_smali_file = ""
         self.current_method_name = ""
         self.editing_patch_idx = None
+        self._cg_filter_timer = None
 
-        # Services & Controller
         self.fs_service = SmaliStudioFSService(self.view.get_smali_dir,
                                                lambda: self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only"))
         self.cg_controller = SmaliCGController(self.view.tree_callstack, self.app.cg, self.app.log)
-
         self.struct_manager = view.struct_manager
         self.search_engine = view.search_engine
 
-    def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
-        """Lädt eine Methode über den FS-Service, parst sie und aktualisiert die View."""
-        block, method_def, lines = self.fs_service.extract_method_block(rel_filepath, target_line, method_signature)
+    # --- Call Graph Live Filter (Debounce & Trigger) ---
+    def on_cg_filter_change(self):
+        """Wird bei jedem Tastendruck aufgerufen, wartet aber 300ms (Debouncing)."""
+        if self._cg_filter_timer:
+            self.app.after_cancel(self._cg_filter_timer)
+        self._cg_filter_timer = self.app.after(300, self.apply_cg_filter)
 
+    def apply_cg_filter(self):
+        term = self.view.ent_cg_filter.get().strip()
+
+        # Einmalig das schnelle Dictionary aus dem RAM aufbauen, falls noch nicht vorhanden
+        if not hasattr(self, '_ram_dict') or len(self._ram_dict) != len(self.search_engine.ram_cache):
+            self._ram_dict = {path.replace("\\", "/"): content for path, content in self.search_engine.ram_cache}
+
+        self.cg_controller.apply_filter(term, self._ram_dict, self.view.lbl_cg_hits)
+
+    # --- Standard Loading ---
+    def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
+        block, method_def, lines = self.fs_service.extract_method_block(rel_filepath, target_line, method_signature)
         if not block:
             self.app.log("[!] Konnte den Block in der Datei nicht extrahieren.")
             return
 
         self.current_smali_file = rel_filepath.replace("\\", "/")
-
         if method_def != "<Klassen-Header & Felder>":
             self.current_method_name = SmaliStudioParser.clean_signature(method_def)
         else:
             self.current_method_name = method_def
 
-        # Update UI Editor
         disp_name = self.current_method_name.split('(')[
             0] if "(" in self.current_method_name else self.current_method_name
         self.view.lbl_smali_file.config(text=f"{os.path.basename(self.current_smali_file)} -> {disp_name}")
         self.view.editor.load_code(block)
 
-        # Update Call Graph & Data
         if self.current_method_name != "<Klassen-Header & Felder>":
             node = self.app.cg.add_node(self.current_smali_file, self.current_method_name)
             if add_as_root:
@@ -65,11 +76,14 @@ class SmaliStudioController:
             for i in self.view.tree_outgoing.get_children(): self.view.tree_outgoing.delete(i)
             for i in self.view.tree_datagraph.get_children(): self.view.tree_datagraph.delete(i)
 
-        # Update Outline & Call Graph UI
         self._update_outline(lines)
         self.cg_controller.refresh_ui()
         self.app.after(50, lambda: self.cg_controller.find_and_highlight(
             f"{self.current_smali_file}|{self.current_method_name}", highlight_only=True))
+
+        # WICHTIG: Wenn eine neue Methode geladen wird, Filter sofort wieder anwenden!
+        if self.view.ent_cg_filter.get().strip():
+            self.app.after(100, self.apply_cg_filter)
 
     def _is_reachable_in_cg(self, target_id):
         visited = set()
@@ -106,7 +120,6 @@ class SmaliStudioController:
 
     def find_incoming_xrefs(self):
         if not self.view._ensure_index_loaded() or not self.current_smali_file: return
-
         parts = self.current_smali_file.split("/")
         if parts[0] == "smali" and len(parts) > 1 and parts[1].startswith("classes"):
             pure_path = "/".join(parts[2:])
@@ -167,7 +180,6 @@ class SmaliStudioController:
         self.current_method_name = "<Eigene Struktur>"
         self.view.lbl_smali_file.config(text=os.path.basename(self.current_smali_file))
         self.view.editor.load_code(block)
-
         for tree in [self.view.tree_outgoing, self.view.tree_datagraph, self.view.tree_outline]:
             for i in tree.get_children(): tree.delete(i)
 
@@ -180,8 +192,7 @@ class SmaliStudioController:
             self.struct_manager.save_existing_structure(f, edit)
             return
 
-        if not f or not orig or not edit:
-            return messagebox.showwarning("Fehlt", "Original oder Edit ist leer!")
+        if not f or not orig or not edit: return messagebox.showwarning("Fehlt", "Original oder Edit ist leer!")
 
         if self.editing_patch_idx is not None:
             self.smali_patches[self.editing_patch_idx] = {"type": "smali", "file": f, "orig": orig, "edit": edit}
@@ -246,3 +257,88 @@ class SmaliStudioController:
                 self.app.after(0, lambda: self.view.lbl_progress_status.config(text="Fehler beim Vorbereiten!"))
 
         threading.Thread(target=task, daemon=True).start()
+
+    # --- Call Graph Exploration ---
+    def start_auto_explore(self):
+        from tkinter import simpledialog
+        selected = self.view.tree_callstack.selection()
+        if not selected: return messagebox.showwarning("Fehlt", "Bitte wähle mindestens einen Startknoten aus!")
+
+        start_nodes = []
+        for item in selected:
+            tags = self.view.tree_callstack.item(item, "tags")
+            node_id = tags[1] if "system_api" in tags else tags[0]
+            start_nodes.append(node_id)
+
+        depth_str = simpledialog.askstring("Deep Explore",
+                                           "Wie viele Ebenen in die Tiefe scannen?\n(Zahl eingeben oder 'max' für kompletten Ast):",
+                                           initialvalue="3")
+        if not depth_str: return
+
+        if depth_str.strip().lower() == "max":
+            max_depth = 9999
+        else:
+            try:
+                max_depth = int(depth_str.strip())
+            except ValueError:
+                return messagebox.showerror("Fehler", "Ungültige Eingabe.")
+
+        self.app.log(f"[*] Starte automatische Exploration für {len(start_nodes)} Knoten (Tiefe: {max_depth})...")
+        self.explore_flag = True
+        threading.Thread(target=self._exploration_thread, args=(start_nodes, max_depth), daemon=True).start()
+
+    def stop_auto_explore(self):
+        if getattr(self, 'explore_flag', False):
+            self.explore_flag = False
+            self.app.log("[*] Exploration wird gestoppt...")
+
+    def _exploration_thread(self, start_nodes, max_depth):
+        visited = set()
+        queue = [(nid, 0) for nid in start_nodes]
+        last_ui_update = time.time()
+        processed_count = 0
+
+        while queue and self.explore_flag:
+            curr_id, current_depth = queue.pop(0)
+
+            if current_depth >= max_depth: continue
+            if curr_id in visited: continue
+            visited.add(curr_id)
+
+            filepath, sig = curr_id.split("|", 1)
+            if is_system_api("L" + filepath): continue
+
+            block, _, _ = self.fs_service.extract_method_block(filepath, method_signature=sig)
+            if block:
+                processed_count += 1
+                calls = SmaliStudioParser.parse_outgoing_calls(block)
+                for c in calls:
+                    callee_path = self.fs_service.resolve_smali_path(c["class_part"][1:] + ".smali") or c["class_part"][
+                                                                                                        1:]
+                    self.app.cg.add_edge(filepath, sig, callee_path, c["method_part"])
+                    queue.append((f"{callee_path}|{c['method_part']}", current_depth + 1))
+
+            if time.time() - last_ui_update > 0.5:
+                self.app.after(0, self.cg_controller.refresh_ui_stable)
+                last_ui_update = time.time()
+
+            if processed_count > 5000:
+                self.app.log("[!] Sicherheitslimit von 5000 analysierten Methoden erreicht. Stoppe.")
+                break
+
+        self.app.after(0, self.cg_controller.refresh_ui_stable)
+
+        # NACH der Exploration: Filter automatisch anwenden, falls etwas in der Maske steht!
+        if self.view.ent_cg_filter.get().strip():
+            self.app.after(100, self.apply_cg_filter)
+
+        self.explore_flag = False
+        self.app.log(f"[+] Exploration beendet! {processed_count} Methoden analysiert.")
+
+    def clear_callgraph(self):
+        """Löscht das Call Graph Lexikon und leert die UI."""
+        self.app.cg.clear()
+        self.cg_controller.refresh_ui()
+        self.view.ent_cg_filter.delete(0, 'end')
+        self.cg_controller.clear_filter()
+        self.app.log("[*] Call Graph vollständig geleert.")
