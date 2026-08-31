@@ -3,6 +3,8 @@ import subprocess
 import time
 import shutil
 import threading
+import json
+import glob
 from tkinter import messagebox
 from abc import ABC, abstractmethod
 
@@ -75,7 +77,6 @@ class PipelineEngine:
         self.logcat_out = None
 
     def get_unpacked_dir_name(self):
-        """Ermittelt den dynamischen Ordnernamen basierend auf der Strategie."""
         strategy = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
         return "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
 
@@ -107,6 +108,10 @@ class PipelineEngine:
                 success = self._merge_splits()
             elif step_type == "decompile":
                 success = self._decompile()
+            elif step_type == "inject_frida":
+                success = self._inject_frida()
+            elif step_type == "apply_lspatch":
+                success = self._apply_lspatch()
             elif step_type == "trace_start":
                 success = self._start_trace_step(step)
             elif step_type == "trace_stop":
@@ -170,7 +175,7 @@ class PipelineEngine:
                 strategy = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
                 if strategy == "aapt2":
                     self.log("[!] WARNUNG: AAPT2-Strategie wird vermutlich fehlschlagen, da Ressourcen fehlen!")
-                return True  # Erlaubt Fallback auf base.apk
+                return True
         except Exception as e:
             self.log(f"[!] Ausnahme beim Verschmelzen: {e}")
             return True
@@ -230,7 +235,6 @@ class PipelineEngine:
                 time.sleep(1)
                 current_size = self._get_dir_size_mb(smali_dir)
 
-                # Check for frozen compilation (like "Copying original..." hang)
                 if current_size == last_size and current_size > 5:
                     stuck_counter += 1
                     if stuck_counter >= 5 and "Copying" in self.last_log_line:
@@ -254,19 +258,13 @@ class PipelineEngine:
             self.log(f"[!] Ausnahme beim Entpacken: {e}")
             return False
 
-    # -------------------------------------------------------------
-
     def _mirror_workspace(self):
-        """Kopiert den entpackten Ordner in die Destination."""
         folder_name = self.get_unpacked_dir_name()
         src = os.path.join(self.cfg.paths["APP_SOURCE_DIR"], folder_name)
         dst = os.path.join(self.cfg.paths["DEST_DIR"], folder_name)
 
         if not os.path.exists(src):
-            self.log(
-                f"[!] Original-Ordner '{folder_name}' fehlt in Source. Hast du die APK mit dieser Strategie entpackt?")
-            self.log(
-                "[!] Klicke oben links auf 'APK Entpacken & Indexieren', um den Ordner für diese Strategie zu erstellen.")
+            self.log(f"[!] Original-Ordner '{folder_name}' fehlt in Source.")
             return False
 
         self.log(f"[*] Synchronisiere '{folder_name}' in den Destination-Workspace...")
@@ -279,13 +277,12 @@ class PipelineEngine:
             return False
 
     def _inject_nsc(self):
-        """Injiziert automatisch eine Network Security Config und entfernt Split-Zwänge für AAPT2."""
         folder_name = self.get_unpacked_dir_name()
         dest_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name)
         manifest_path = os.path.join(dest_dir, "AndroidManifest.xml")
 
         if not os.path.exists(manifest_path):
-            self.log("[!] AndroidManifest.xml nicht gefunden. Überspringe NSC-Injection.")
+            self.log("[!] AndroidManifest.xml nicht gefunden. Überspringe Manifest-Patches.")
             return False
 
         self.log("[*] Injiziere Network Security Config für Mitmproxy (User-Certs)...")
@@ -305,7 +302,7 @@ class PipelineEngine:
                 manifest_data = f.read()
         except UnicodeDecodeError:
             self.log("[!] FEHLER: AndroidManifest.xml ist binär kompiliert (AXML)!")
-            self.log("[!] NSC-Injection übersprungen. Bitte entpacke die App neu (ohne '-r' Flag).")
+            self.log("[!] Manifest-Patches übersprungen. Bitte entpacke die App neu (ohne '-r' Flag).")
             return True
 
         import re
@@ -326,10 +323,8 @@ class PipelineEngine:
             xml_dir = os.path.join(dest_dir, "res", "xml")
 
         os.makedirs(xml_dir, exist_ok=True)
-
         manifest_changed = False
 
-        # --- 1. Zertifikats-Injection ---
         if match:
             existing_nsc_name = match.group(1)
             existing_nsc_path = os.path.join(xml_dir, f"{existing_nsc_name}.xml")
@@ -345,7 +340,6 @@ class PipelineEngine:
             self.log("[+] Manifest erfolgreich gepatcht (kippy_nsc hinzugefügt)!")
             manifest_changed = True
 
-        # --- 2. Split-Zwang (NUR für AAPT2) ---
         if strategy_name == "aapt2":
             app_source_dir = self.cfg.paths.get("APP_SOURCE_DIR", "")
             has_merged_base = os.path.exists(os.path.join(app_source_dir, "merged_base.apk"))
@@ -353,36 +347,30 @@ class PipelineEngine:
 
             if has_merged_base or len(apks) > 1:
                 original_len = len(manifest_data)
-
-                # a) Entfernt <meta-data android:name="com.android.vending.splits.required" ... />
-                #    Nutze re.DOTALL und re.IGNORECASE, um Zeilenumbrüche etc. abzufangen.
                 manifest_data = re.sub(
                     r'<meta-data[^>]*?android:name="com\.android\.vending\.splits\.required"[^>]*?>\s*</meta-data>|<meta-data[^>]*?android:name="com\.android\.vending\.splits\.required"[^>]*?/>',
                     '', manifest_data, flags=re.IGNORECASE | re.DOTALL)
-
-                # b) Entfernt android:requiredSplitTypes="..." aus dem <manifest>-Tag
                 manifest_data = re.sub(r'\s*android:requiredSplitTypes="[^"]*"', '', manifest_data)
-
-                # c) Entfernt android:splitTypes="..." aus dem <manifest>-Tag
                 manifest_data = re.sub(r'\s*android:splitTypes="[^"]*"', '', manifest_data)
-
-                # d) Entfernt android:isSplitRequired="true" (Sicherheitshalber)
                 manifest_data = re.sub(r'\s*android:isSplitRequired="[^"]*"', '', manifest_data)
-
-                # e) Native Libs Fix
-                if 'android:extractNativeLibs="false"' in manifest_data:
-                    manifest_data = manifest_data.replace('android:extractNativeLibs="false"',
-                                                          'android:extractNativeLibs="true"')
-                elif 'android:extractNativeLibs="true"' not in manifest_data:
-                    manifest_data = manifest_data.replace("<application ",
-                                                          '<application android:extractNativeLibs="true" ')
 
                 if len(manifest_data) != original_len:
                     self.log(
                         "[+] Split-Zwang (isSplitRequired/splitTypes/meta-data) für AAPT2-Universal-Build aus Manifest entfernt!")
                     manifest_changed = True
 
-        # --- 3. Manifest speichern ---
+        native_strategy = self.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign")
+        if native_strategy == "extractNativeLibs":
+            if 'android:extractNativeLibs="false"' in manifest_data:
+                manifest_data = manifest_data.replace('android:extractNativeLibs="false"',
+                                                      'android:extractNativeLibs="true"')
+                self.log("[+] Manifest-Hack angewendet: extractNativeLibs='true' (Crash-Prevention).")
+                manifest_changed = True
+            elif 'android:extractNativeLibs="true"' not in manifest_data:
+                manifest_data = manifest_data.replace("<application ", '<application android:extractNativeLibs="true" ')
+                self.log("[+] Manifest-Hack angewendet: extractNativeLibs='true' (Crash-Prevention).")
+                manifest_changed = True
+
         if manifest_changed:
             with open(manifest_path, "w", encoding="utf-8") as f:
                 f.write(manifest_data)
@@ -390,7 +378,6 @@ class PipelineEngine:
         return True
 
     def _apply_smart_patches(self):
-        """Wendet Patches an. Bei Abweichungen der Decompiler-Formatierung wird der Nutzer interaktiv gefragt."""
         patches = [p for p in self.get_patches() if p.get("type") == "smali"]
         if not patches:
             self.log("[*] Keine Smali-Patches definiert, überspringe.")
@@ -407,7 +394,6 @@ class PipelineEngine:
             rel_file = p.get("file", "").replace("\\", "/")
             parts = rel_file.split("/")
 
-            # --- DER INTELLIGENTE PFAD-KONVERTER ---
             dex_idx = None
             pure_path = rel_file
 
@@ -430,7 +416,6 @@ class PipelineEngine:
                 actual_rel_file = rel_file
 
             actual_rel_file = actual_rel_file.replace("/", os.sep)
-            # ----------------------------------------
 
             src_file = os.path.join(src_dir, actual_rel_file)
             dst_file = os.path.join(dst_dir, actual_rel_file)
@@ -504,6 +489,215 @@ class PipelineEngine:
 
         return True
 
+    def _inject_frida(self):
+        if not self.cfg.config.get("INJECT_FRIDA", False):
+            self.log("[*] Frida Injection deaktiviert. Überspringe...")
+            return True
+
+        self.log("[*] Bereite Frida Early-Instrumentation vor...")
+
+        try:
+            folder_name = self.get_unpacked_dir_name()
+            lib_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name, "lib", "arm64-v8a")
+            os.makedirs(lib_dir, exist_ok=True)
+
+            gadget_src = os.path.join(self.cfg.config.get("BASE_DIR", ""), "tools", "libfrida-gadget.so")
+            if not os.path.exists(gadget_src):
+                self.log("[!] libfrida-gadget.so fehlt! Bitte in 'tools/' ablegen.")
+                return False
+
+            if os.path.isdir(gadget_src):
+                self.log("[!] FEHLER: libfrida-gadget.so ist ein Ordner! Bitte die .xz Datei entpacken.")
+                return False
+
+            if os.path.getsize(gadget_src) < 15 * 1024 * 1024:
+                self.log(
+                    "[!] WARNUNG: libfrida-gadget.so ist sehr klein (<15MB). Hast du das .xz Archiv wirklich entpackt?")
+
+            shutil.copy(gadget_src, os.path.join(lib_dir, "libfrida-gadget.so"))
+
+            config_path = os.path.join(lib_dir, "libfrida-gadget.config.so")
+            app_pkg = self.cfg.config.get("APP_PACKAGE", "org.nativescript.LibreLinkUp")
+
+            config_json = {
+                "interaction": {
+                    "type": "script",
+                    "path": f"/data/data/{app_pkg}/lib/libfrida-script.so",
+                    "on_change": "ignore"
+                }
+            }
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config_json, f, indent=4)
+
+            script_path = os.path.join(lib_dir, "libfrida-script.so")
+            js_payload = """
+console.log("[*] Frida Gadget: Early-Instrumentation erfolgreich gebootet!");
+
+Java.perform(function() {
+    console.log("[*] Frida Gadget: Suche nach Firebase/GMS Killswitches...");
+
+    try {
+        var AndroidUtilsLight = Java.use("com.google.android.gms.common.util.AndroidUtilsLight");
+        AndroidUtilsLight.getPackageCertificateHashBytes.implementation = function(context, pkg) {
+            console.log("[!] RASP-Check abgefangen für: " + pkg);
+            var fakeHash = [1, 2, 3, 4, 5]; 
+            return Java.array('byte', fakeHash);
+        };
+    } catch (e) {
+        console.log("[-] Klasse AndroidUtilsLight nicht gefunden: " + e);
+    }
+});
+            """
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(js_payload)
+
+            self.log("[+] Frida Gadget, Config und JS-Payload in den Workspace injiziert.")
+            return True
+
+        except Exception as e:
+            self.log(f"[!] Schwerer Fehler bei Frida-Injection: {e}")
+            return False
+
+    def _apply_lspatch(self):
+        if not self.cfg.config.get("INJECT_LSPATCH", False):
+            self.log("[*] LSPatch Injection deaktiviert. Überspringe...")
+            return True
+
+        self.log("[*] Bereite LSPatch (Non-Root Xposed) vor...")
+
+        tools_dir = os.path.join(self.cfg.config.get("BASE_DIR", ""), "tools")
+
+        import glob
+        lspatch_jars = glob.glob(os.path.join(tools_dir, "jar-*.jar")) + glob.glob(
+            os.path.join(tools_dir, "lspatch*.jar"))
+        module_apks = glob.glob(os.path.join(tools_dir, "TrustMeAlready*.apk"))
+
+        if not lspatch_jars or not module_apks:
+            self.log("[!] lspatch.jar (jar-*.jar) oder TrustMeAlready*.apk fehlt im Ordner 'tools'!")
+            return False
+
+        lspatch_jar = lspatch_jars[0]
+        module_apk = module_apks[0]
+
+        dest_dir = self.cfg.paths["DEST_DIR"]
+        base_apk = os.path.join(dest_dir, "base.apk")
+
+        if not os.path.exists(base_apk):
+            self.log(f"[!] Originale base.apk nicht in {dest_dir} gefunden. (Build fehlgeschlagen?)")
+            return False
+
+        cmd = f'java -jar "{lspatch_jar}" "{base_apk}" -m "{module_apk}" -o "{dest_dir}"'
+
+        self.log(f"[*] Starte LSPatch Injection: {cmd}")
+        if not self._run_cmd_step({"cmd": cmd, "cwd": "{BASE_DIR}"}):
+            self.log("[!] Fehler beim Ausführen von LSPatch.")
+            return False
+
+        patched_file = None
+        for f in os.listdir(dest_dir):
+            if "-lspatched" in f and f.endswith(".apk"):
+                patched_file = f
+                break
+
+        if patched_file:
+            patched_path = os.path.join(dest_dir, patched_file)
+
+            try:
+                os.remove(base_apk)
+                os.rename(patched_path, base_apk)
+            except Exception as e:
+                self.log(f"[!] Dateisystem-Fehler beim Umbenennen der LSPatch APK: {e}")
+                return False
+
+            self.log("[+] LSPatch erfolgreich angewendet.")
+
+            # --- Zipalign nach LSPatch zwingend wiederholen! ---
+            native_strategy = self.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign")
+            if native_strategy == "zipalign":
+                self.log("[*] Stelle Speicher-Alignment nach LSPatch-Eingriff wieder her...")
+                cmd_zip = 'zipalign -p -f 4 "base.apk" "aligned_base.apk"'
+                if self._run_cmd_step({"cmd": cmd_zip, "cwd": "{DEST_DIR}"}):
+                    cmd_move = 'move /Y "aligned_base.apk" "base.apk"' if os.name == 'nt' else 'mv -f "aligned_base.apk" "base.apk"'
+                    self._run_cmd_step({"cmd": cmd_move, "cwd": "{DEST_DIR}"})
+                    self.log("[+] Zipalign erfolgreich abgeschlossen.")
+
+            return True
+        else:
+            self.log("[!] Konnte die gepatchte APK von LSPatch nicht finden.")
+            return False
+
+
+    def _run_manifest_and_build_strategy(self):
+        strategy_name = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
+
+        if strategy_name == "aapt2":
+            strategy = Aapt2Strategy()
+        elif strategy_name == "apkeditor":
+            strategy = ApkEditorStrategy()
+        else:
+            strategy = SmaliOnlyStrategy()
+
+        self.log(f"\n[*] Lade Manifest-Strategie: {strategy.__class__.__name__}")
+
+        if not strategy.pre_process(self): return False
+        if not strategy.patch_manifest(self): return False
+
+        # --- HERMES OOM FIX ---
+        yml_path = os.path.join(self.cfg.paths["DEST_DIR"], self.get_unpacked_dir_name(), "apktool.yml")
+        if os.path.exists(yml_path):
+            with open(yml_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            do_not_compress_idx = -1
+            for i, line in enumerate(lines):
+                if line.strip().startswith("doNotCompress:"):
+                    do_not_compress_idx = i
+                    break
+
+            extensions_to_add = ["bundle", "jsbundle", "hbc"]
+
+            if do_not_compress_idx != -1:
+                if "null" in lines[do_not_compress_idx] or "[]" in lines[do_not_compress_idx]:
+                    lines[do_not_compress_idx] = "doNotCompress:\n"
+                existing_exts = "".join(lines[do_not_compress_idx:])
+                for ext in extensions_to_add:
+                    if f"- {ext}" not in existing_exts and f"- '{ext}'" not in existing_exts:
+                        lines.insert(do_not_compress_idx + 1, f"- {ext}\n")
+            else:
+                lines.append("\ndoNotCompress:\n")
+                for ext in extensions_to_add:
+                    lines.append(f"- {ext}\n")
+
+            with open(yml_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            self.log("[+] Hermes-Fix: Kompression für React Native Bundles deaktiviert.")
+
+        if not strategy.build(self): return False
+
+        # --- FORCE INJECT NATIVE LIBS (Nur für APKEditor + Frida relevant) ---
+        if self.cfg.config.get("INJECT_FRIDA", False) and strategy_name == "apkeditor":
+            folder_name = self.get_unpacked_dir_name()
+            lib_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name, "lib")
+            if os.path.exists(lib_dir):
+                self.log("[*] Injektiere Frida-Bibliotheken physisch unkomprimiert in die APK...")
+                cmd_inject = f'jar u0f "base.apk" -C "{folder_name}" lib'
+                if not self._run_cmd_step({"cmd": cmd_inject, "cwd": "{DEST_DIR}"}):
+                    self.log("[!] Fehler beim Injizieren der Bibliotheken via jar.")
+                    return False
+
+        # --- Zipalign ausführen (Page-Alignment für Android 14) ---
+        native_strategy = self.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign")
+        if native_strategy == "zipalign":
+            self.log("[*] Optimiere Speicher-Alignment für Android 14 (Zipalign -p 4)...")
+            cmd_zip = 'zipalign -p -f 4 "base.apk" "aligned_base.apk"'
+            if not self._run_cmd_step({"cmd": cmd_zip, "cwd": "{DEST_DIR}"}): return False
+
+            cmd_move = 'move /Y "aligned_base.apk" "base.apk"' if os.name == 'nt' else 'mv -f "aligned_base.apk" "base.apk"'
+            if not self._run_cmd_step({"cmd": cmd_move, "cwd": "{DEST_DIR}"}): return False
+            self.log("[+] Zipalign erfolgreich abgeschlossen.")
+
+        return True
+
     def _run_cmd_step(self, step):
         cmd_template = step.get("cmd", "")
         cwd_template = step.get("cwd", "{BASE_DIR}")
@@ -511,7 +705,7 @@ class PipelineEngine:
         extra_vars = {}
         if "{SIGNED_APKS}" in cmd_template:
             dest = self.cfg.paths["DEST_DIR"]
-            apks = [f for f in os.listdir(dest) if f.endswith("-aligned-debugSigned.apk")]
+            apks = [f for f in os.listdir(dest) if f.endswith("-debugSigned.apk")]
             if not apks:
                 self.log("[!] Keine signierten APKs gefunden.")
                 return False
@@ -532,23 +726,20 @@ class PipelineEngine:
 
             log_file = os.path.join(self.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
 
-            with open(log_file, "w", encoding="utf-8") as out_f:
-                process = subprocess.Popen(cmd, shell=True, cwd=cwd,
-                                           stdout=out_f, stderr=subprocess.STDOUT,
-                                           stdin=subprocess.DEVNULL,
-                                           startupinfo=startupinfo)
+            process = subprocess.Popen(cmd, shell=True, cwd=cwd,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL,
+                                       text=True, bufsize=1, errors="replace",
+                                       startupinfo=startupinfo)
 
-                with open(log_file, "r", encoding="utf-8") as in_f:
-                    while process.poll() is None:
-                        line = in_f.readline()
-                        if line:
-                            self.log(line.strip())
-                        else:
-                            time.sleep(0.05)
+            with open(log_file, "w", encoding="utf-8", errors="replace") as out_f:
+                for line in process.stdout:
+                    out_f.write(line)
+                    clean_line = line.strip()
+                    if clean_line:
+                        self.log(clean_line)
 
-                    for line in in_f.readlines():
-                        if line.strip(): self.log(line.strip())
-
+            process.wait()
             return process.returncode == 0
         except Exception as e:
             self.log(f"[!] Systemfehler: {e}")
@@ -623,39 +814,3 @@ class PipelineEngine:
         for k, v in vars_dict.items():
             text = text.replace(f"{{{k}}}", str(v))
         return text
-
-    def _run_manifest_and_build_strategy(self):
-        strategy_name = self.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
-
-        if strategy_name == "aapt2":
-            strategy = Aapt2Strategy()
-        elif strategy_name == "apkeditor":
-            strategy = ApkEditorStrategy()
-        else:
-            strategy = SmaliOnlyStrategy()
-
-        self.log(f"\n[*] Lade Manifest-Strategie: {strategy.__class__.__name__}")
-
-        if not strategy.pre_process(self): return False
-        if not strategy.patch_manifest(self): return False
-
-        # --- HERMES OOM FIX: Kompression für JS-Bundles deaktivieren ---
-        yml_path = os.path.join(self.cfg.paths["DEST_DIR"], self.get_unpacked_dir_name(), "apktool.yml")
-        if os.path.exists(yml_path):
-            with open(yml_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            # Prüfen ob doNotCompress existiert und Erweiterungen hinzufügen
-            if "doNotCompress:" in content:
-                for ext in ["bundle", "hbc"]:
-                    if f"- {ext}" not in content:
-                        content = content.replace("doNotCompress:\n", f"doNotCompress:\n- {ext}\n")
-
-                with open(yml_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                self.log("[+] Hermes-Fix: Kompression für JS-Bundles in apktool.yml deaktiviert.")
-        # ---------------------------------------------------------------
-
-        if not strategy.build(self): return False
-
-        return True

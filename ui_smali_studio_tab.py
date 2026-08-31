@@ -26,6 +26,11 @@ class SmaliStudioTab(ttk.Frame):
         UIUtils.apply_panedwindow_style()
         UIUtils.setup_global_shortcuts(self.winfo_toplevel())
 
+    @property
+    def smali_patches(self):
+        """Leitet Zugriffe von außen direkt an die State-Liste im Controller weiter."""
+        return self.controller.smali_patches
+
     def get_unpacked_dir_name(self):
         strategy = self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
         return "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
@@ -139,7 +144,6 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_callstack.heading("#0", text="Methode")
         self.tree_callstack.heading("File", text="Pfad")
 
-        # Scrollbar Call Graph (FIX)
         scroll_cg = ttk.Scrollbar(f_callgraph, orient="vertical", command=self.tree_callstack.yview)
         self.tree_callstack.configure(yscrollcommand=scroll_cg.set)
         scroll_cg.pack(side="right", fill="y")
@@ -149,12 +153,10 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_callstack.bind("<<TreeviewOpen>>", lambda e: self.controller.cg_controller.handle_node_expand(
             self.tree_callstack.focus()))
 
-        # WICHTIG: Tkinter priorisiert Tags nach Reihenfolge der Registrierung.
-        # Die Filter-Tags (match_exact) müssen nach den Standard-Tags kommen!
         self.tree_callstack.tag_configure("system_api", foreground="gray")
-        self.tree_callstack.tag_configure("dimmed", foreground="#555555")  # Dunkelgrau
-        self.tree_callstack.tag_configure("match_parent", foreground="#D7BA7D")  # Gelblich (Pfad)
-        self.tree_callstack.tag_configure("match_exact", foreground="#00FF00", background="#1a4d1a")  # Neon Grün
+        self.tree_callstack.tag_configure("dimmed", foreground="#555555")
+        self.tree_callstack.tag_configure("match_parent", foreground="#D7BA7D")
+        self.tree_callstack.tag_configure("match_exact", foreground="#00FF00", background="#1a4d1a")
 
         self.left_nb.add(f_callgraph, text="Call Graph")
 

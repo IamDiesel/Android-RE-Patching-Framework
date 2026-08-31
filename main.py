@@ -20,6 +20,17 @@ def bootstrap_environment():
         os.path.join(sys.prefix, "Scripts")  # Pfad für globale Python-Installationen
     ]
 
+    # NEU: Zipalign aus den Build-Tools dynamisch hinzufügen
+    build_tools_base = os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk\build-tools")
+    if os.path.exists(build_tools_base):
+        # Alle installierten Versionen auflisten und die höchste nehmen
+        versions = os.listdir(build_tools_base)
+        if versions:
+            latest_version = sorted(versions)[-1]
+            zipalign_path = os.path.join(build_tools_base, latest_version)
+            paths_to_add.append(zipalign_path)
+
+
     current_path = os.environ.get("PATH", "")
     new_paths = []
 

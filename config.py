@@ -10,6 +10,9 @@ DEFAULT_CONFIG = {
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
     "MANIFEST_STRATEGY": "apkeditor",
+    "NATIVE_LIB_STRATEGY": "zipalign",
+    "INJECT_FRIDA": False,
+    "INJECT_LSPATCH": False,
     "PIPELINES": {
         "PREPARE_WORKSPACE": [
             {"name": "Merge Split APKs", "type": "merge_splits"},
@@ -27,18 +30,26 @@ DEFAULT_CONFIG = {
             {"name": "Move repacked APK", "type": "cmd",
              "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"",
              "cwd": "{BASE_DIR}"},
-            {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-aligned-debugSigned*.apk\" 2>nul",
+            {"name": "Zipalign (Page Alignment für .so)", "type": "cmd",
+             "cmd": "zipalign -p -f 4 \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}_aligned.apk\"",
              "cwd": "{DEST_DIR}"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
+            {"name": "Overwrite with Aligned APK", "type": "cmd",
+             "cmd": "move /Y \"{SPLIT_NAME}_aligned.apk\" \"{SPLIT_NAME}.apk\"",
+             "cwd": "{DEST_DIR}"},
+            {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-debugSigned*.apk\" 2>nul",
+             "cwd": "{DEST_DIR}"},
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
              "cwd": "{DEST_DIR}"}
         ],
         "BUILD_NATIVE": [
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
+            {"name": "Inject Frida Gadget", "type": "inject_frida"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
-            {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-aligned-debugSigned*.apk\" 2>nul",
+            {"name": "Apply LSPatch", "type": "apply_lspatch"},
+            {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-debugSigned*.apk\" 2>nul",
              "cwd": "{DEST_DIR}"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --allowResign",
+            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
              "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
@@ -72,11 +83,14 @@ class ConfigManager:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     self.config = json.load(f)
 
-                # Fallback: Falls die neue Pipeline in einer bestehenden Config fehlt
                 if "PIPELINES" not in self.config:
                     self.config["PIPELINES"] = {}
                 if "PREPARE_WORKSPACE" not in self.config["PIPELINES"]:
                     self.config["PIPELINES"]["PREPARE_WORKSPACE"] = DEFAULT_CONFIG["PIPELINES"]["PREPARE_WORKSPACE"]
+                # Update existierende Pipeline um neue Schritte falls sie fehlen
+                current_native_steps = [s.get("name") for s in self.config["PIPELINES"].get("BUILD_NATIVE", [])]
+                if "Inject Frida Gadget" not in current_native_steps or "Apply LSPatch" not in current_native_steps:
+                    self.config["PIPELINES"]["BUILD_NATIVE"] = DEFAULT_CONFIG["PIPELINES"]["BUILD_NATIVE"]
             except Exception:
                 self.config = DEFAULT_CONFIG.copy()
         else:

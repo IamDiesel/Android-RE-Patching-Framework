@@ -44,7 +44,6 @@ class WorkspaceTab(ttk.Frame):
         self.top_paned = ttk.PanedWindow(self.main_paned, orient=tk.HORIZONTAL)
         self.main_paned.add(self.top_paned, weight=3)
 
-        # WICHTIG: tk.Frame (nicht ttk) für abdockbare Bereiche!
         f_left_side = tk.Frame(self.top_paned)
         self.top_paned.add(f_left_side, weight=1)
         self.build_dock_header(f_left_side, "⚙️ Steuerung & Metadaten", f_left_side, self.top_paned, 1)
@@ -64,7 +63,6 @@ class WorkspaceTab(ttk.Frame):
         self.load_current_workspace_meta()
 
     def build_dock_header(self, parent, title, widget_to_dock, target_paned, weight):
-        """Erzeugt einen Header mit Abdock-Button für jedes Panel."""
         f_header = ttk.Frame(parent, style="Secondary.TFrame")
         f_header.pack(side="top", fill="x")
 
@@ -76,9 +74,7 @@ class WorkspaceTab(ttk.Frame):
         btn.config(command=lambda: self.toggle_dock(parent, title, widget_to_dock, target_paned, weight, btn))
 
     def toggle_dock(self, container_frame, title, inner_widget, target_paned, weight, btn):
-        """Logik für das native Abdocken und Andocken (Löst das Grau-Fenster-Problem)."""
         if hasattr(container_frame, "_is_undocked") and container_frame._is_undocked:
-            # Andocken
             try:
                 container_frame.tk.call('wm', 'forget', container_frame._w)
             except:
@@ -87,7 +83,6 @@ class WorkspaceTab(ttk.Frame):
             target_paned.add(container_frame, weight=weight)
             container_frame._is_undocked = False
         else:
-            # Abdocken
             target_paned.forget(container_frame)
             try:
                 container_frame.tk.call('wm', 'manage', container_frame._w)
@@ -98,7 +93,6 @@ class WorkspaceTab(ttk.Frame):
                 def on_close():
                     self.toggle_dock(container_frame, title, inner_widget, target_paned, weight, btn)
 
-                # Bindet das 'X' oben rechts am neuen Fenster an unsere on_close Logik
                 cb_name = container_frame.register(on_close)
                 container_frame.tk.call('wm', 'protocol', container_frame._w, 'WM_DELETE_WINDOW', cb_name)
 
@@ -146,19 +140,6 @@ class WorkspaceTab(ttk.Frame):
 
         self.console.bind("<Button-3>", show_menu)
 
-
-
-    def build_dock_header(self, parent, title, widget_to_dock, target_paned, weight):
-        """Erzeugt einen Header mit Abdock-Button für jedes Panel."""
-        header = ttk.Frame(parent)
-        header.pack(side="top", fill="x", pady=2)
-        ttk.Label(header, text=title, font=("Segoe UI", 10, "bold")).pack(side="left", padx=5)
-        btn = ttk.Button(header, text="⧉ Abdocken", width=12)
-        btn.pack(side="right", padx=5)
-        btn.config(command=lambda: self.toggle_dock(parent, title, widget_to_dock, target_paned, weight, btn))
-        return header
-
-
     def renew_id(self):
         if messagebox.askyesno("Neue ID",
                                "Möchtest du eine neue Patch-ID generieren?\nAktuelle ungespeicherte UI-Einträge werden zurückgesetzt."):
@@ -197,6 +178,34 @@ class WorkspaceTab(ttk.Frame):
         self.combo_strat.set(self.app.cfg.config.get("MANIFEST_STRATEGY", "apkeditor"))
         self.combo_strat.bind("<<ComboboxSelected>>", self.on_strategy_changed)
 
+        f_native = ttk.Frame(f_actions)
+        f_native.pack(fill="x", padx=10, pady=2)
+        ttk.Label(f_native, text="Memory Alignment:").pack(side="left", padx=2)
+        self.combo_native_lib = ttk.Combobox(f_native, values=["zipalign", "extractNativeLibs"], state="readonly",
+                                             width=16)
+        self.combo_native_lib.pack(side="left", padx=5)
+        self.combo_native_lib.set(self.app.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign"))
+        self.combo_native_lib.bind("<<ComboboxSelected>>", self.on_native_lib_changed)
+
+        f_inject = ttk.Frame(f_actions)
+        f_inject.pack(fill="x", padx=10, pady=2)
+
+        self.var_frida = tk.BooleanVar(value=self.app.cfg.config.get("INJECT_FRIDA", False))
+        chk_frida = ttk.Checkbutton(f_inject, text="Frida Gadget", variable=self.var_frida,
+                                    command=self.on_frida_toggled)
+        chk_frida.pack(side="left", padx=2)
+
+        btn_frida_info = ttk.Button(f_inject, text="[?]", width=3, command=self.show_frida_tooltip)
+        btn_frida_info.pack(side="left", padx=(0, 10))
+
+        self.var_lspatch = tk.BooleanVar(value=self.app.cfg.config.get("INJECT_LSPATCH", False))
+        chk_lspatch = ttk.Checkbutton(f_inject, text="LSPatch (Xposed)", variable=self.var_lspatch,
+                                      command=self.on_lspatch_toggled)
+        chk_lspatch.pack(side="left", padx=2)
+
+        btn_lspatch_info = ttk.Button(f_inject, text="[?]", width=3, command=self.show_lspatch_tooltip)
+        btn_lspatch_info.pack(side="left", padx=5)
+
         self.btn_build = ttk.Button(f_actions, text="▶ BUILD_NATIVE ausführen", command=self.run_build)
         self.btn_build.pack(fill="x", padx=10, pady=5)
 
@@ -211,6 +220,55 @@ class WorkspaceTab(ttk.Frame):
         self.btn_trace_start.pack(side="left", fill="x", expand=True, padx=(0, 2))
         self.btn_trace_stop = ttk.Button(f_trace, text="🛑 Trace Stop", command=self.stop_trace, state="disabled")
         self.btn_trace_stop.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+    def on_native_lib_changed(self, event):
+        new_strat = self.combo_native_lib.get()
+        self.app.cfg.config["NATIVE_LIB_STRATEGY"] = new_strat
+        self.app.cfg.save()
+        self.app.log(f"[*] Native Libs Strategie global auf '{new_strat}' geändert.")
+
+    def on_frida_toggled(self):
+        self.app.cfg.config["INJECT_FRIDA"] = self.var_frida.get()
+        self.app.cfg.save()
+        state = "aktiviert" if self.var_frida.get() else "deaktiviert"
+        self.app.log(f"[*] Frida-Injection für nächsten Build {state}.")
+
+    def show_frida_tooltip(self):
+        msg = (
+            "Frida Early-Instrumentation (Non-Root RASP Bypass):\n\n"
+            "1. Lade 'frida-gadget-...-android-arm64.so' herunter, benenne es in 'libfrida-gadget.so' um "
+            "und lege es im Ordner 'tools' ab.\n"
+            "2. Aktiviere diese Checkbox.\n"
+            "3. Das Framework erstellt automatisch die Config und das Skript (script.js) in der APK.\n"
+            "4. WICHTIG: Füge in der Startklasse der App (oft MainApplication.smali) folgenden Code ein, "
+            "um das Gadget beim Start zu laden:\n\n"
+            ".method static constructor <clinit>()V\n"
+            "    .locals 1\n"
+            "    const-string v0, \"frida-gadget\"\n"
+            "    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n"
+            "    return-void\n"
+            ".end method\n"
+        )
+        messagebox.showinfo("Frida Injection Info", msg)
+
+    def on_lspatch_toggled(self):
+        self.app.cfg.config["INJECT_LSPATCH"] = self.var_lspatch.get()
+        self.app.cfg.save()
+        state = "aktiviert" if self.var_lspatch.get() else "deaktiviert"
+        self.app.log(f"[*] LSPatch-Injection für nächsten Build {state}.")
+
+    def show_lspatch_tooltip(self):
+        msg = (
+            "LSPatch (Non-Root Xposed Bypass):\n\n"
+            "1. Lege das 'jar-...-release.jar' Tool und ein Xposed-Modul (z.B. 'TrustMeAlready...apk') "
+            "in den 'tools' Ordner deines Frameworks.\n"
+            "2. Aktiviere diese Checkbox.\n"
+            "3. Setze die Manifest-Strategie im besten Fall auf 'smali_only' (Sicherer Build für LSPatch).\n"
+            "4. Die Pipeline packt die App komplett, schleust sie durch LSPatch und signiert das Ergebnis neu.\n\n"
+            "Vorteil: Das Xposed-Modul umgeht Checks (wie SSL Pinning) im RAM, ohne dass Androids SELinux-System "
+            "die App wie bei Frida sofort blockiert."
+        )
+        messagebox.showinfo("LSPatch Info", msg)
 
     def build_documentation_box(self, parent):
         f_docs = ttk.LabelFrame(parent, text="Beobachtungen & Analyse-Ergebnis")
@@ -227,7 +285,6 @@ class WorkspaceTab(ttk.Frame):
         self.txt_obs.pack(fill="both", expand=True, padx=5, pady=5)
 
         ttk.Button(f_docs, text="💾 Session permanent sichern", command=self.save_result).pack(fill="x", padx=5, pady=2)
-
 
     def on_strategy_changed(self, event):
         new_strat = self.combo_strat.get()
@@ -369,7 +426,7 @@ class WorkspaceTab(ttk.Frame):
                 dest_dir = self.app.cfg.paths.get("DEST_DIR", "")
                 if os.path.exists(dest_dir) and hasattr(self.app, 'current_archive_path'):
                     for f in os.listdir(dest_dir):
-                        if f.endswith("-aligned-debugSigned.apk"):
+                        if f.endswith("-debugSigned.apk"):
                             shutil.copy(os.path.join(dest_dir, f), self.app.current_archive_path)
 
         threading.Thread(target=task, daemon=True).start()
@@ -399,8 +456,6 @@ class WorkspaceTab(ttk.Frame):
         self.app.history.add_record(record)
         messagebox.showinfo("Historie", f"Session {self.app.current_id} erfolgreich gesichert!")
 
-
-# --- BATCH FAVORITEN MANAGER DIALOG ---
 
 class FavoritePatchesDialog(tk.Toplevel):
     def __init__(self, parent, ws):
@@ -491,13 +546,10 @@ class FavoritePatchesDialog(tk.Toplevel):
         self.txt_edit = tk.Text(f_edit, bg="#1E1E1E", fg="#D4D4D4", font=("Consolas", 10))
         self.txt_edit.pack(fill="both", expand=True)
 
-        # Highlighting Bindings
         self.txt_orig.bind("<KeyRelease>", self._on_text_change)
         self.txt_edit.bind("<KeyRelease>", self._on_text_change)
 
         self.populate_list()
-
-    # --- SYNTAX HIGHLIGHTING & DIFF ENGINE ---
 
     def _on_text_change(self, event=None):
         if self._debounce_timer:
@@ -560,8 +612,6 @@ class FavoritePatchesDialog(tk.Toplevel):
             if m and not m.group(1).startswith('.'):
                 txt_widget.tag_add("s_inst", f"{tk_line}.{m.start(1)}", f"{tk_line}.{m.end(1)}")
 
-    # --- UI LOGIK ---
-
     def populate_list(self):
         for i in self.tree_favs.get_children():
             self.tree_favs.delete(i)
@@ -596,17 +646,17 @@ class FavoritePatchesDialog(tk.Toplevel):
         patches = self.get_active_patches(fav)
 
         p = patches[self.current_sub_patch_idx]
-        self.ent_name.delete(0, tk.END);
+        self.ent_name.delete(0, tk.END)
         self.ent_name.insert(0, fav.get("name", ""))
-        self.ent_file.delete(0, tk.END);
+        self.ent_file.delete(0, tk.END)
         self.ent_file.insert(0, p.get("file", ""))
-        self.txt_orig.delete("1.0", tk.END);
+        self.txt_orig.delete("1.0", tk.END)
         self.txt_orig.insert("1.0", p.get("orig", ""))
-        self.txt_edit.delete("1.0", tk.END);
+        self.txt_edit.delete("1.0", tk.END)
         self.txt_edit.insert("1.0", p.get("edit", ""))
 
         self.lbl_sub_patch.config(text=f"Sub-Patch {self.current_sub_patch_idx + 1} / {len(patches)}")
-        self._refresh_visuals()  # Löst Diff & Highlighting aus!
+        self._refresh_visuals()
 
     def save_current(self):
         sel = self.tree_favs.selection()
@@ -629,8 +679,8 @@ class FavoritePatchesDialog(tk.Toplevel):
                 "edit": self.txt_edit.get("1.0", tk.END).strip()
             }
             fav["patches"] = [new_patch]
-            fav.pop("file", None);
-            fav.pop("orig", None);
+            fav.pop("file", None)
+            fav.pop("orig", None)
             fav.pop("edit", None)
 
         self.save_favs()
@@ -649,6 +699,29 @@ class FavoritePatchesDialog(tk.Toplevel):
             self.txt_orig.delete("1.0", tk.END)
             self.txt_edit.delete("1.0", tk.END)
 
+    def _normalize_path(self, p):
+        """Bereinigt den Pfad unabhängig von Betriebssystem und Apktool/APKEditor Output."""
+        p = p.replace("\\", "/")
+        parts = p.split("/")
+        if not parts: return p
+        if parts[0] == "smali" and len(parts) > 1 and parts[1].startswith("classes"):
+            return "/".join(parts[2:])
+        elif parts[0].startswith("smali_classes"):
+            return "/".join(parts[1:])
+        elif parts[0] == "smali":
+            return "/".join(parts[1:])
+        return p
+
+    def _clean_smali_for_match(self, text):
+        """Entfernt alle .line Anweisungen, Kommentare und leere Zeilen für einen strukturellen Match."""
+        lines = text.split("\n")
+        cleaned = []
+        for l in lines:
+            l = l.strip()
+            if not l or l.startswith(".line ") or l.startswith("#"): continue
+            cleaned.append(l)
+        return "\n".join(cleaned)
+
     def start_batch_fav(self):
         sel = self.tree_favs.selection()
         if not sel: return
@@ -664,22 +737,67 @@ class FavoritePatchesDialog(tk.Toplevel):
 
         for index, current_patch in enumerate(patches_to_apply):
             file_path = current_patch.get("file", "")
-            orig_code = current_patch.get("orig", "").replace("\r\n", "\n")
+            orig_code = current_patch.get("orig", "").replace("\r\n", "\n").strip()
+
+            target_norm = self._normalize_path(file_path)
 
             found_content = None
+            found_path = None
+
+            # 1. Pfad im RAM-Cache suchen
             for path, content in studio.search_engine.ram_cache:
-                if path == file_path:
+                if self._normalize_path(path) == target_norm:
                     found_content = content.replace("\r\n", "\n")
+                    found_path = path
                     break
 
-            if found_content and orig_code in found_content:
-                is_dup = any(
-                    p["file"] == file_path and p["orig"] == current_patch["orig"] for p in studio.smali_patches)
-                if not is_dup:
-                    studio.smali_patches.append(current_patch.copy())
-                    studio.app.log(f"[+] Sub-Patch {index + 1} ({file_path}) erfolgreich.")
+            success = False
+            if found_content:
+                # 2. Exakter Match
+                if orig_code in found_content:
+                    is_dup = any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches)
+                    if not is_dup:
+                        cp = current_patch.copy()
+                        cp["file"] = found_path
+                        cp["orig"] = orig_code
+                        studio.smali_patches.append(cp)
+                        studio.app.log(f"[+] Sub-Patch {index + 1} ({found_path}) exakt angewendet.")
+                    else:
+                        studio.app.log(f"[*] Sub-Patch {index + 1} ({found_path}) ist bereits aktiv.")
                     success_count += 1
-            else:
+                    success = True
+                else:
+                    # 3. Struktureller Match (Ignoriert .line, Whitespace und Kommentare)
+                    c_orig = self._clean_smali_for_match(orig_code)
+
+                    # Extrahiere die Methodensignatur, um den tatsächlichen Block im RAM zu finden
+                    m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
+                    if m:
+                        sig = m.group(1).strip()
+                        actual_method_pattern = re.compile(r'^' + re.escape(sig) + r'.*?^\.end method',
+                                                           re.MULTILINE | re.DOTALL)
+                        actual_match = actual_method_pattern.search(found_content)
+                        if actual_match:
+                            actual_code = actual_match.group(0)
+                            c_actual = self._clean_smali_for_match(actual_code)
+
+                            # Vergleiche die bereinigten Blöcke
+                            if c_orig == c_actual:
+                                is_dup = any(
+                                    p["file"] == found_path and p["orig"] == actual_code for p in studio.smali_patches)
+                                if not is_dup:
+                                    cp = current_patch.copy()
+                                    cp["file"] = found_path
+                                    cp["orig"] = actual_code  # Speichere exakt den Code, der auch im File steht!
+                                    studio.smali_patches.append(cp)
+                                    studio.app.log(
+                                        f"[+] Sub-Patch {index + 1} ({found_path}) strukturell angewendet (ignoriert .line).")
+                                else:
+                                    studio.app.log(f"[*] Sub-Patch {index + 1} ({found_path}) ist bereits aktiv.")
+                                success_count += 1
+                                success = True
+
+            if not success:
                 failed_patches.append((index, current_patch))
 
         if success_count > 0:
@@ -711,26 +829,67 @@ class FavoritePatchesDialog(tk.Toplevel):
 
         current_patch = patches_to_apply[self.current_sub_patch_idx]
         file_path = current_patch.get("file", "")
-        orig_code = current_patch.get("orig", "").replace("\r\n", "\n")
+        orig_code = current_patch.get("orig", "").replace("\r\n", "\n").strip()
+
+        target_norm = self._normalize_path(file_path)
 
         found_content = None
+        found_path = None
+
+        # 1. Pfad im RAM-Cache suchen
         for path, content in studio.search_engine.ram_cache:
-            if path == file_path:
+            if self._normalize_path(path) == target_norm:
                 found_content = content.replace("\r\n", "\n")
+                found_path = path
                 break
 
-        if found_content and orig_code in found_content:
-            is_dup = any(p["file"] == file_path and p["orig"] == current_patch["orig"] for p in studio.smali_patches)
-            if not is_dup:
-                studio.smali_patches.append(current_patch.copy())
-                studio.app.log(f"[+] Sub-Patch {self.current_sub_patch_idx + 1} erfolgreich.")
-                studio.refresh_smali_tree()
-                messagebox.showinfo("Erfolg",
-                                    "Dieser einzelne Sub-Patch wurde erfolgreich zur Patch-Liste hinzugefügt!",
-                                    parent=self)
+        success = False
+        if found_content:
+            # 2. Exakter Match
+            if orig_code in found_content:
+                is_dup = any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches)
+                if not is_dup:
+                    cp = current_patch.copy()
+                    cp["file"] = found_path
+                    cp["orig"] = orig_code
+                    studio.smali_patches.append(cp)
+                    studio.app.log(f"[+] Sub-Patch {self.current_sub_patch_idx + 1} exakt angewendet.")
+                    studio.refresh_smali_tree()
+                    messagebox.showinfo("Erfolg", "Patch erfolgreich zur Liste hinzugefügt!", parent=self)
+                else:
+                    messagebox.showinfo("Info", "Patch ist bereits aktiv.", parent=self)
+                success = True
             else:
-                messagebox.showinfo("Info", "Dieser einzelne Sub-Patch ist bereits in der Patch-Liste aktiv.",
-                                    parent=self)
-        else:
+                # 3. Struktureller Match
+                c_orig = self._clean_smali_for_match(orig_code)
+                m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
+                if m:
+                    sig = m.group(1).strip()
+                    actual_method_pattern = re.compile(r'^' + re.escape(sig) + r'.*?^\.end method',
+                                                       re.MULTILINE | re.DOTALL)
+                    actual_match = actual_method_pattern.search(found_content)
+                    if actual_match:
+                        actual_code = actual_match.group(0)
+                        c_actual = self._clean_smali_for_match(actual_code)
+
+                        if c_orig == c_actual:
+                            is_dup = any(
+                                p["file"] == found_path and p["orig"] == actual_code for p in studio.smali_patches)
+                            if not is_dup:
+                                cp = current_patch.copy()
+                                cp["file"] = found_path
+                                cp["orig"] = actual_code
+                                studio.smali_patches.append(cp)
+                                studio.app.log(
+                                    f"[+] Sub-Patch {self.current_sub_patch_idx + 1} strukturell angewendet (ignoriert .line).")
+                                studio.refresh_smali_tree()
+                                messagebox.showinfo("Erfolg",
+                                                    "Patch erfolgreich zur Liste hinzugefügt (.line ignoriert)!",
+                                                    parent=self)
+                            else:
+                                messagebox.showinfo("Info", "Patch ist bereits aktiv.", parent=self)
+                            success = True
+
+        if not success:
             FuzzyMatchDialog(self, studio.app, studio, current_patch,
                              title_suffix=f" (Patch {self.current_sub_patch_idx + 1}/{len(patches_to_apply)})")
