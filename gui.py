@@ -34,6 +34,12 @@ class KippyReFrameworkApp(tk.Tk):
         self.create_widgets()
         self.generate_new_id()
 
+        # Vollbild / Maximiertes Fenster beim Start:
+        if os.name == 'nt':
+            self.state('zoomed')  # Für Windows (Maximiert mit Fensterleiste)
+        else:
+            self.attributes('-zoomed', True)  # Für Linux/macOS
+
     def create_widgets(self):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)

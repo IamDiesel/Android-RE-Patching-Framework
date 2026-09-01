@@ -16,6 +16,7 @@ uber-apk-signer*.jar
 source/
 destination/
 archives/
+tools/
 
 # Device Logs
 trace.txt

@@ -494,64 +494,133 @@ class PipelineEngine:
             self.log("[*] Frida Injection deaktiviert. Überspringe...")
             return True
 
-        self.log("[*] Bereite Frida Early-Instrumentation vor...")
+        self.log("[*] Bereite Frida Injection (v17+ via frida-compile) vor...")
 
         try:
+            import subprocess
+            import tempfile
+            import shutil
+            import os
+            import json
+            from frida_manager import FridaManager
+
             folder_name = self.get_unpacked_dir_name()
             lib_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name, "lib", "arm64-v8a")
             os.makedirs(lib_dir, exist_ok=True)
 
+            # 1. Frida Gadget kopieren
             gadget_src = os.path.join(self.cfg.config.get("BASE_DIR", ""), "tools", "libfrida-gadget.so")
             if not os.path.exists(gadget_src):
-                self.log("[!] libfrida-gadget.so fehlt! Bitte in 'tools/' ablegen.")
+                self.log("[!] libfrida-gadget.so (v17+) fehlt in 'tools/'!")
                 return False
-
-            if os.path.isdir(gadget_src):
-                self.log("[!] FEHLER: libfrida-gadget.so ist ein Ordner! Bitte die .xz Datei entpacken.")
-                return False
-
-            if os.path.getsize(gadget_src) < 15 * 1024 * 1024:
-                self.log(
-                    "[!] WARNUNG: libfrida-gadget.so ist sehr klein (<15MB). Hast du das .xz Archiv wirklich entpackt?")
-
             shutil.copy(gadget_src, os.path.join(lib_dir, "libfrida-gadget.so"))
 
-            config_path = os.path.join(lib_dir, "libfrida-gadget.config.so")
-            app_pkg = self.cfg.config.get("APP_PACKAGE", "org.nativescript.LibreLinkUp")
+            # 2. Node.js Projekt initiieren
+            # HIER NEU: "_2" am Ende erzwingt einen völlig sauberen Neubau!
+            frida_proj_dir = os.path.join(tempfile.gettempdir(), "re_frida_project_2")
 
-            config_json = {
+            if os.path.exists(frida_proj_dir) and not os.path.exists(os.path.join(frida_proj_dir, ".latest_success")):
+                self.log("[*] Bereinige fehlerhaften Node.js Workspace...")
+                shutil.rmtree(frida_proj_dir, ignore_errors=True)
+
+            os.makedirs(frida_proj_dir, exist_ok=True)
+
+            pkg_json_path = os.path.join(frida_proj_dir, "package.json")
+            npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
+            npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
+
+            if not os.path.exists(pkg_json_path):
+                self.log(f"[*] Initialisiere stabilen Workspace in: {frida_proj_dir} ...")
+
+                pkg_data = {
+                    "name": "re_frida_agent",
+                    "private": True,
+                    "dependencies": {
+                        "frida-java-bridge": "latest"
+                    },
+                    "devDependencies": {
+                        "frida-compile": "latest",
+                        "@types/frida-gum": "latest"
+                    }
+                }
+                with open(pkg_json_path, "w", encoding="utf-8") as f:
+                    json.dump(pkg_data, f, indent=4)
+
+                # --- NEU: TSCONFIG GENERIERUNG HIER EINGEFÜGT ---
+                tsconfig_path = os.path.join(frida_proj_dir, "tsconfig.json")
+                tsconfig_data = {
+                    "compilerOptions": {
+                        "target": "es2020",
+                        "lib": ["es2020", "dom"],
+                        "strict": False,  # Der Fix: Erlaubt normales JavaScript ohne strenge Typen!
+                        "moduleResolution": "node",
+                        "types": ["frida-gum"]
+                    }
+                }
+                with open(tsconfig_path, "w", encoding="utf-8") as f:
+                    json.dump(tsconfig_data, f, indent=4)
+                # ------------------------------------------------
+
+                self.log("[*] Führe 'npm install' aus (das dauert kurz)...")
+                proc_npm = subprocess.Popen([npm_cmd, "install"], cwd=frida_proj_dir,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                for line in proc_npm.stdout:
+                    if line.strip(): self.log(f"[NPM] {line.strip()}")
+                proc_npm.wait()
+
+                with open(os.path.join(frida_proj_dir, ".latest_success"), "w") as f:
+                    f.write("ok")
+
+            # 3. Code aus dem Manager holen und als index.ts (TypeScript!) speichern
+            fm = FridaManager(self.cfg.config.get("BASE_DIR", ""))
+            js_code = fm.get_active_code()
+            if not js_code:
+                self.log("[!] Kein aktives Frida-Skript im Manager gefunden!")
+                return False
+
+            raw_script_path = os.path.join(frida_proj_dir, "index.ts")
+            with open(raw_script_path, "w", encoding="utf-8") as f:
+                f.write(js_code)
+
+            # 4. Kompilieren mit frida-compile (latest)
+            self.log("[*] Kompiliere Agent mit frida-compile (latest)...")
+            compiled_out_path = os.path.join(frida_proj_dir, "agent_compiled.js")
+
+            compile_cmd = f"{npx_cmd} --yes frida-compile index.ts -o agent_compiled.js -c"
+
+            proc_compile = subprocess.Popen(compile_cmd, cwd=frida_proj_dir, shell=True,
+                                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc_compile.stdout:
+                if line.strip(): self.log(f"[frida-compile] {line.strip()}")
+            proc_compile.wait()
+
+            if proc_compile.returncode != 0:
+                self.log("[!] Kompilierung fehlgeschlagen! Siehe Fehlermeldung oben.")
+                return False
+
+            # 5. Aufräumen von alten Skripten
+            for ext in ["libfrida-gadget.script.so", "libfrida-script.so"]:
+                f_path = os.path.join(lib_dir, ext)
+                if os.path.exists(f_path):
+                    os.remove(f_path)
+
+            # 6. Explizite Listen-Config für Frida 17 generieren (Zwingt die App in den Freeze)
+            config_path = os.path.join(lib_dir, "libfrida-gadget.config.so")
+            listen_config = {
                 "interaction": {
-                    "type": "script",
-                    "path": f"/data/data/{app_pkg}/lib/libfrida-script.so",
-                    "on_change": "ignore"
+                    "type": "listen",
+                    "address": "127.0.0.1",
+                    "port": 27042,
+                    "on_load": "wait"  # WICHTIG: Friert die App ein, bevor der RASP lädt!
                 }
             }
             with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(config_json, f, indent=4)
+                json.dump(listen_config, f, indent=4)
 
-            script_path = os.path.join(lib_dir, "libfrida-script.so")
-            js_payload = """
-console.log("[*] Frida Gadget: Early-Instrumentation erfolgreich gebootet!");
+            # 7. Wir merken uns den Pfad zum kompilierten JS für den USB-Attach
+            self.cfg.paths["COMPILED_FRIDA_SCRIPT"] = compiled_out_path
 
-Java.perform(function() {
-    console.log("[*] Frida Gadget: Suche nach Firebase/GMS Killswitches...");
-
-    try {
-        var AndroidUtilsLight = Java.use("com.google.android.gms.common.util.AndroidUtilsLight");
-        AndroidUtilsLight.getPackageCertificateHashBytes.implementation = function(context, pkg) {
-            console.log("[!] RASP-Check abgefangen für: " + pkg);
-            var fakeHash = [1, 2, 3, 4, 5]; 
-            return Java.array('byte', fakeHash);
-        };
-    } catch (e) {
-        console.log("[-] Klasse AndroidUtilsLight nicht gefunden: " + e);
-    }
-});
-            """
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(js_payload)
-
-            self.log("[+] Frida Gadget, Config und JS-Payload in den Workspace injiziert.")
+            self.log("[+] Frida 17 Gadget mit expliziter Listen-Config injiziert!")
             return True
 
         except Exception as e:
@@ -814,3 +883,54 @@ Java.perform(function() {
         for k, v in vars_dict.items():
             text = text.replace(f"{{{k}}}", str(v))
         return text
+
+    def attach_frida_usb(self):
+        script_path = self.cfg.paths.get("COMPILED_FRIDA_SCRIPT", "")
+        # Fallback, falls das Tool neu gestartet wurde:
+        if not script_path:
+            import tempfile
+            script_path = os.path.join(tempfile.gettempdir(), "re_frida_project_2", "agent_compiled.js")
+
+        if not os.path.exists(script_path):
+            self.log("[!] Kompiliertes Frida-Skript nicht gefunden. Bitte baue die App zuerst neu.")
+            return False
+
+        self.log("\n[*] Verbinde mit Frida Gadget über USB...")
+        try:
+            import frida
+
+            with open(script_path, "r", encoding="utf-8") as f:
+                source = f.read()
+
+            device = frida.get_usb_device(timeout=5)
+            self.log("[*] USB Gerät gefunden. Suche Gadget...")
+
+            # GC FIX: In self speichern, damit Python die Verbindung nicht killt!
+            self.frida_session = device.attach("Gadget")
+            self.frida_script = self.frida_session.create_script(source)
+
+            # Leite alle console.logs() direkt in die Python-GUI um!
+            def on_message(message, data):
+                if message['type'] == 'send':
+                    self.log(f"[Frida] {message['payload']}")
+                elif message['type'] == 'error':
+                    self.log(f"[Frida ERROR] {message['stack']}")
+                else:
+                    self.log(f"[Frida] {message}")
+
+            self.frida_script.on('message', on_message)
+            self.frida_script.load()
+
+            self.log("[+] Skript erfolgreich in den RAM injiziert! App wird fortgesetzt (Resume)...")
+            device.resume("Gadget")
+            return True
+
+        except ImportError:
+            self.log("[!] Python-Modul 'frida' fehlt! Öffne ein Terminal und tippe: pip install frida-tools")
+            return False
+        except frida.ProcessNotFoundError:
+            self.log("[!] Gadget nicht gefunden! Läuft die App auf dem Handy und ist eingefroren?")
+            return False
+        except Exception as e:
+            self.log(f"[!] Fehler beim Verbinden mit Frida: {e}")
+            return False

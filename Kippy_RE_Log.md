@@ -1695,3 +1695,180 @@ App crasht direkt beim Start
 App crasht direkt beim Start
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260902-000221)
+* **App:** org.nativescript.LibreLinkUp (v1.0.0)
+* **Name:** org.nativescript.LibreLinkUp
+* **Testergebnis:** WORKING_PARTIAL
+
+  * **Smali Patch 1** in Datei: `smali\com\app\MainApplication.smali`
+  ```smali
+.method static constructor <clinit>()V
+    .locals 2
+
+    # --- FRIDA GADGET INJECTION START ---
+    const-string v0, "frida-gadget"
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+    :try_start_sleep
+    const-wide/16 v0, 0x7d0
+    invoke-static {v0, v1}, Ljava/lang/Thread;->sleep(J)V
+    :try_end_sleep
+    .catch Ljava/lang/Exception; {:try_start_sleep .. :try_end_sleep} :catch_sleep
+    :catch_sleep    
+    # --- FRIDA GADGET INJECTION END ---
+
+    const/16 v0, 0x5f
+
+    new-array v0, v0, [B
+
+    fill-array-data v0, :array_0
+
+    sput-object v0, Lcom/app/MainApplication;->$$a:[B
+
+    const/16 v0, 0x27
+
+    sput v0, Lcom/app/MainApplication;->$$b:I
+
+    const/4 v0, 0x0
+
+    sput v0, Lcom/app/MainApplication;->ArtificialStackFrames:I
+
+    const/4 v0, 0x1
+
+    sput v0, Lcom/app/MainApplication;->coroutineCreation:I
+
+    invoke-static {}, Lcom/app/MainApplication;->CoroutineDebuggingKt()V
+
+    new-instance v0, Lcom/app/MainApplication$Companion;
+
+    const/4 v1, 0x0
+
+    invoke-direct {v0, v1}, Lcom/app/MainApplication$Companion;-><init>(Lkotlin/jvm/internal/DefaultConstructorMarker;)V
+
+    sput-object v0, Lcom/app/MainApplication;->Companion:Lcom/app/MainApplication$Companion;
+
+    return-void
+
+    nop
+
+    :array_0
+    .array-data 1
+        0x24t
+        -0x3dt
+        0x1et
+        -0x61t
+        -0x3t
+        -0x5t
+        -0x3t
+        0x9t
+        -0x5t
+        -0x17t
+        0xct
+        -0x3t
+        -0x10t
+        -0x8t
+        -0x2t
+        -0xbt
+        0x1t
+        -0xdt
+        0x6t
+        -0x2bt
+        0x27t
+        -0x16t
+        0x7t
+        -0xdt
+        0x2ct
+        -0x3t
+        -0x10t
+        -0x8t
+        -0x2t
+        -0xbt
+        0x1t
+        -0xdt
+        0x6t
+        -0x1et
+        0x1ct
+        -0x18t
+        -0x3t
+        0x3t
+        -0x2at
+        0x27t
+        -0x16t
+        0x7t
+        -0xdt
+        0x9t
+        0x7t
+        -0x2t
+        -0x8t
+        0x1t
+        -0x6t
+        -0x10t
+        0x0t
+        -0xet
+        -0x27t
+        0x2at
+        -0x12t
+        -0x9t
+        0xet
+        -0x10t
+        0x1t
+        -0x6t
+        0x7t
+        -0x2t
+        -0x8t
+        0x1t
+        -0x6t
+        -0x10t
+        0x0t
+        -0xet
+        -0x28t
+        0x28t
+        0x1t
+        -0xct
+        -0xft
+        -0x8t
+        0xct
+        0x2t
+        0x27t
+        -0x2t
+        -0x8t
+        0x1t
+        -0x6t
+        -0x10t
+        0x0t
+        -0xet
+        -0x26t
+        0x1ct
+        -0x8t
+        0xet
+        -0x13t
+        -0x5t
+        -0x3t
+        0x0t
+        -0xct
+        -0x21t
+        0x24t
+    .end array-data
+.end method
+  ```
+
+**Beobachtung:**
+Partial Load Success for LibreLinkUp:
+09-02 00:04:38.256 ... I RemoteConfig: init() {android.attachments.maxCount=32, ...
+09-02 00:04:38.453 ... D AppStartup: [init] sqlcipher-init: 118, signal-store: 58, logging: 35...
+
+=== PIPELINE FLASH ERFOLGREICH ===
+
+[*] Verbinde mit Frida Gadget über USB...
+[*] USB Gerät gefunden. Suche Gadget...
+[Frida] [*] Native RASP Hunter & PHANTOM-BLOCKER gestartet...
+[Frida] [+] Phantom-Spoofer scharfgestellt. Bereit für alles!
+[+] Skript erfolgreich in den RAM injiziert! App wird fortgesetzt (Resume)...
+[Frida] [🔥 LOAD-BLOCKER] RASP Lade-Versuch blockiert!
+[Frida] [🔥 LOAD-BLOCKER] Harmlose Phantom-Bibliothek geladen!
+[Frida] [🔥 DLSYM] Gebe Universal-Dummy für 'Java_o_MediaBrowserCompatMediaBrowserImplBase6_stackFrames' zurück!
+[Frida] [🔥 JNI-SPOOFER] Native RASP-Prüfung aus Java neutralisiert!
+[Frida] [🔥 DLSYM] Gebe Universal-Dummy für 'Java_o_onResult_read' zurück!
+[Frida] [🔥 JNI-SPOOFER] Native RASP-Prüfung aus Java neutralisiert!
+
+---

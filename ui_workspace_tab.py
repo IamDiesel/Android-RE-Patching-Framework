@@ -7,9 +7,11 @@ from tkinter import ttk, messagebox, simpledialog
 import threading
 import re
 import difflib
+import subprocess
 
 from ui_smali_studio_tab import SmaliStudioTab
 from fuzzy_matcher import FuzzyMatchDialog
+from ui_launcher_logger import LauncherLoggerTab
 
 
 class WorkspaceTab(ttk.Frame):
@@ -42,7 +44,7 @@ class WorkspaceTab(ttk.Frame):
         self.main_paned.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.top_paned = ttk.PanedWindow(self.main_paned, orient=tk.HORIZONTAL)
-        self.main_paned.add(self.top_paned, weight=3)
+        self.main_paned.add(self.top_paned, weight=2)
 
         f_left_side = tk.Frame(self.top_paned)
         self.top_paned.add(f_left_side, weight=1)
@@ -56,8 +58,8 @@ class WorkspaceTab(ttk.Frame):
         self.build_editor(f_right_side)
 
         f_console_side = tk.Frame(self.main_paned)
-        self.main_paned.add(f_console_side, weight=1)
-        self.build_dock_header(f_console_side, "🖥️ Konsole", f_console_side, self.main_paned, 1)
+        self.main_paned.add(f_console_side, weight=2)
+        self.build_dock_header(f_console_side, "🖥️ Konsole & Live-Logging", f_console_side, self.main_paned, 2)
         self.build_console(f_console_side)
 
         self.load_current_workspace_meta()
@@ -129,16 +131,25 @@ class WorkspaceTab(ttk.Frame):
         self.add_patch_row()
 
     def build_console(self, parent):
-        self.console = tk.Text(parent, height=12, bg="black", fg="lightgreen")
+        self.console_notebook = ttk.Notebook(parent)
+        self.console_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+        f_main_console = ttk.Frame(self.console_notebook)
+        self.console_notebook.add(f_main_console, text="🖥️ Main Console")
+
+        self.console = tk.Text(f_main_console, height=12, bg="black", fg="lightgreen")
         self.console.pack(side="bottom", fill="both", expand=True, padx=5, pady=5)
 
-        self.console_menu = tk.Menu(parent, tearoff=0)
+        self.console_menu = tk.Menu(f_main_console, tearoff=0)
         self.console_menu.add_command(label="Konsole leeren", command=lambda: self.console.delete("1.0", tk.END))
 
         def show_menu(e):
             self.console_menu.post(e.x_root, e.y_root)
 
         self.console.bind("<Button-3>", show_menu)
+
+        self.launcher_logger_tab = LauncherLoggerTab(self.console_notebook, self)
+        self.console_notebook.add(self.launcher_logger_tab, text="🚀 App Start & Live-Log")
 
     def renew_id(self):
         if messagebox.askyesno("Neue ID",
@@ -195,6 +206,9 @@ class WorkspaceTab(ttk.Frame):
                                     command=self.on_frida_toggled)
         chk_frida.pack(side="left", padx=2)
 
+        btn_frida_mgr = ttk.Button(f_inject, text="🦊 Skripte", command=self.open_frida_manager)
+        btn_frida_mgr.pack(side="left", padx=(0, 10))
+
         btn_frida_info = ttk.Button(f_inject, text="[?]", width=3, command=self.show_frida_tooltip)
         btn_frida_info.pack(side="left", padx=(0, 10))
 
@@ -214,12 +228,84 @@ class WorkspaceTab(ttk.Frame):
 
         ttk.Separator(f_actions, orient="horizontal").pack(fill="x", pady=5)
 
+        # Zeile 1: Live Tools
         f_trace = ttk.Frame(f_actions)
         f_trace.pack(fill="x", padx=10, pady=2)
-        self.btn_trace_start = ttk.Button(f_trace, text="⏱ Trace Start", command=self.start_trace)
-        self.btn_trace_start.pack(side="left", fill="x", expand=True, padx=(0, 2))
-        self.btn_trace_stop = ttk.Button(f_trace, text="🛑 Trace Stop", command=self.stop_trace, state="disabled")
-        self.btn_trace_stop.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        self.btn_launcher_logger = ttk.Button(f_trace, text="🚀 App Launcher & Logger",
+                                              command=self.open_launcher_logger)
+        self.btn_launcher_logger.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
+        self.btn_frida_attach = ttk.Button(f_trace, text="🦊 Frida Zünden", command=self.attach_frida)
+        self.btn_frida_attach.pack(side="left", fill="x", expand=True, padx=(2, 0))
+
+        # Zeile 2: RASP Tools
+        f_rasp = ttk.Frame(f_actions)
+        f_rasp.pack(fill="x", padx=10, pady=(2, 5))
+
+        self.btn_push_clean = ttk.Button(f_rasp, text="📥 Push Clean APK (RASP Spoofer)", command=self.push_clean_apk)
+        self.btn_push_clean.pack(fill="x", expand=True)
+
+    # Pusht die originale APK aufs Gerät ---
+    def open_launcher_logger(self):
+        self.console_notebook.select(self.launcher_logger_tab)
+
+        # --- NEUE FUNKTION: Pusht die originale APK aufs Gerät ---
+    def push_clean_apk(self):
+        def task():
+            self.app.log("\n=== RASP SPOOFER: ORIGINAL APK PUSH ===")
+            source_dir = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
+            adb = self.app.cfg.paths.get("ADB", "adb")
+
+            # FIX: Wir dürfen NIEMALS die merged_base.apk nehmen, da ihr Hash abweicht!
+            # Wir nehmen exakt den originalen base-Split aus dem Play Store.
+            clean_apk = os.path.join(source_dir, "base.apk")
+
+            if not os.path.exists(clean_apk):
+                self.app.log("[!] FEHLER: Originale base.apk im Source-Ordner nicht gefunden!")
+                return
+
+            self.app.log(f"[*] Nutze saubere APK: {os.path.basename(clean_apk)}")
+
+            cmds = [
+                f'"{adb}" push "{clean_apk}" /data/local/tmp/clean_base.apk',
+                f'"{adb}" shell "chmod 777 /data/local/tmp/clean_base.apk"'
+            ]
+
+            success = True
+            for cmd in cmds:
+                self.app.log(f"> {cmd}")
+                try:
+                    startupinfo = None
+                    if os.name == 'nt':
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True, startupinfo=startupinfo)
+                    if res.stdout: self.app.log(res.stdout.strip())
+                    if res.stderr: self.app.log(res.stderr.strip())
+
+                    if res.returncode != 0:
+                        self.app.log(f"[!] Befehl fehlgeschlagen mit Code {res.returncode}")
+                        success = False
+                        break
+
+                except Exception as e:
+                    self.app.log(f"[!] CMD Fehler: {e}")
+                    success = False
+                    break
+
+            if success:
+                self.app.log("[+] Originale base.apk erfolgreich als Clean APK platziert!")
+                self.app.after(0, lambda: messagebox.showinfo("Erfolg",
+                                                              "Die originale APK wurde erfolgreich auf dem Gerät platziert."))
+            else:
+                self.app.log("[!] Fehler beim Pushen der Clean APK.")
+                self.app.after(0, lambda: messagebox.showerror("Fehler",
+                                                               "Fehler beim Pushen der APK. Siehe Konsole für Details."))
+
+        threading.Thread(target=task, daemon=True).start()
+
 
     def on_native_lib_changed(self, event):
         new_strat = self.combo_native_lib.get()
@@ -232,6 +318,11 @@ class WorkspaceTab(ttk.Frame):
         self.app.cfg.save()
         state = "aktiviert" if self.var_frida.get() else "deaktiviert"
         self.app.log(f"[*] Frida-Injection für nächsten Build {state}.")
+
+    def attach_frida(self):
+        def task():
+            self.app.engine.attach_frida_usb()
+        threading.Thread(target=task, daemon=True).start()
 
     def show_frida_tooltip(self):
         msg = (
@@ -398,6 +489,18 @@ class WorkspaceTab(ttk.Frame):
             self.ent_version.insert(0, record.get("app_version", ""))
         self.app.notebook.select(self)
 
+    def open_frida_manager(self):
+        from frida_manager import FridaManager
+        from ui_frida_manager import FridaManagerDialog
+
+        base_dir = self.app.cfg.config.get("BASE_DIR", "")
+        fm = FridaManager(base_dir)
+
+        def on_script_changed():
+            self.app.log("[*] Aktives Frida-Skript wurde geändert.")
+
+        FridaManagerDialog(self, fm, on_script_changed)
+
     def run_build(self):
         if self.app.check_lock(): return
 
@@ -430,17 +533,6 @@ class WorkspaceTab(ttk.Frame):
                             shutil.copy(os.path.join(dest_dir, f), self.app.current_archive_path)
 
         threading.Thread(target=task, daemon=True).start()
-
-    def start_trace(self):
-        messagebox.showinfo("Trace", "Bitte starte die App auf dem Gerät und klicke OK.")
-        if self.app.engine.run_pipeline("TRACE_START"):
-            self.btn_trace_start.config(state="disabled")
-            self.btn_trace_stop.config(state="normal")
-
-    def stop_trace(self):
-        self.app.engine.run_pipeline("TRACE_STOP")
-        self.btn_trace_start.config(state="normal")
-        self.btn_trace_stop.config(state="disabled")
 
     def save_result(self):
         record = {
@@ -700,7 +792,6 @@ class FavoritePatchesDialog(tk.Toplevel):
             self.txt_edit.delete("1.0", tk.END)
 
     def _normalize_path(self, p):
-        """Bereinigt den Pfad unabhängig von Betriebssystem und Apktool/APKEditor Output."""
         p = p.replace("\\", "/")
         parts = p.split("/")
         if not parts: return p
@@ -713,7 +804,6 @@ class FavoritePatchesDialog(tk.Toplevel):
         return p
 
     def _clean_smali_for_match(self, text):
-        """Entfernt alle .line Anweisungen, Kommentare und leere Zeilen für einen strukturellen Match."""
         lines = text.split("\n")
         cleaned = []
         for l in lines:
@@ -744,7 +834,6 @@ class FavoritePatchesDialog(tk.Toplevel):
             found_content = None
             found_path = None
 
-            # 1. Pfad im RAM-Cache suchen
             for path, content in studio.search_engine.ram_cache:
                 if self._normalize_path(path) == target_norm:
                     found_content = content.replace("\r\n", "\n")
@@ -753,7 +842,6 @@ class FavoritePatchesDialog(tk.Toplevel):
 
             success = False
             if found_content:
-                # 2. Exakter Match
                 if orig_code in found_content:
                     is_dup = any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches)
                     if not is_dup:
@@ -767,10 +855,7 @@ class FavoritePatchesDialog(tk.Toplevel):
                     success_count += 1
                     success = True
                 else:
-                    # 3. Struktureller Match (Ignoriert .line, Whitespace und Kommentare)
                     c_orig = self._clean_smali_for_match(orig_code)
-
-                    # Extrahiere die Methodensignatur, um den tatsächlichen Block im RAM zu finden
                     m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
                     if m:
                         sig = m.group(1).strip()
@@ -781,14 +866,13 @@ class FavoritePatchesDialog(tk.Toplevel):
                             actual_code = actual_match.group(0)
                             c_actual = self._clean_smali_for_match(actual_code)
 
-                            # Vergleiche die bereinigten Blöcke
                             if c_orig == c_actual:
                                 is_dup = any(
                                     p["file"] == found_path and p["orig"] == actual_code for p in studio.smali_patches)
                                 if not is_dup:
                                     cp = current_patch.copy()
                                     cp["file"] = found_path
-                                    cp["orig"] = actual_code  # Speichere exakt den Code, der auch im File steht!
+                                    cp["orig"] = actual_code
                                     studio.smali_patches.append(cp)
                                     studio.app.log(
                                         f"[+] Sub-Patch {index + 1} ({found_path}) strukturell angewendet (ignoriert .line).")
@@ -836,7 +920,6 @@ class FavoritePatchesDialog(tk.Toplevel):
         found_content = None
         found_path = None
 
-        # 1. Pfad im RAM-Cache suchen
         for path, content in studio.search_engine.ram_cache:
             if self._normalize_path(path) == target_norm:
                 found_content = content.replace("\r\n", "\n")
@@ -845,7 +928,6 @@ class FavoritePatchesDialog(tk.Toplevel):
 
         success = False
         if found_content:
-            # 2. Exakter Match
             if orig_code in found_content:
                 is_dup = any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches)
                 if not is_dup:
@@ -860,7 +942,6 @@ class FavoritePatchesDialog(tk.Toplevel):
                     messagebox.showinfo("Info", "Patch ist bereits aktiv.", parent=self)
                 success = True
             else:
-                # 3. Struktureller Match
                 c_orig = self._clean_smali_for_match(orig_code)
                 m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
                 if m:

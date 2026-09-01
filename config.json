@@ -5,8 +5,8 @@
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
     "MANIFEST_STRATEGY": "apkeditor",
-    "NATIVE_LIB_STRATEGY": "extractNativeLibs",
-    "INJECT_FRIDA": true,
+    "NATIVE_LIB_STRATEGY": "zipalign",
+    "INJECT_FRIDA": false,
     "INJECT_LSPATCH": false,
     "PIPELINES": {
         "PREPARE_WORKSPACE": [
@@ -81,6 +81,10 @@
             {
                 "name": "Apply Smali Patches",
                 "type": "smart_patch"
+            },
+            {
+                "name": "Inject Custom Libs",
+                "type": "inject_custom_libs"
             },
             {
                 "name": "Inject Frida Gadget",
