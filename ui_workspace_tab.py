@@ -3,7 +3,7 @@ import shutil
 import datetime
 import json
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
+from tkinter import ttk, messagebox, simpledialog, filedialog
 import threading
 import re
 import difflib
@@ -19,6 +19,7 @@ class WorkspaceTab(ttk.Frame):
         super().__init__(parent)
         self.app = app
         self.patch_rows = []
+        self.lib_rows = []
         self.smali_studio = None
         self.create_widgets()
 
@@ -109,26 +110,82 @@ class WorkspaceTab(ttk.Frame):
         patch_book.pack(side="top", fill="both", expand=True, padx=5, pady=5)
 
         tab_hex = ttk.Frame(patch_book)
-
+        tab_libs = ttk.Frame(patch_book)
         self.smali_studio = SmaliStudioTab(patch_book, self.app)
 
         patch_book.add(tab_hex, text="Hex Patcher (Flutter / C++)")
+        patch_book.add(tab_libs, text="Native Lib Replacer")
         patch_book.add(self.smali_studio, text="Smali Studio (Java / Kotlin)")
 
+        # --- HEX PATCHER UI ---
         ttk.Button(tab_hex, text="+ Add Hex Patch", command=self.add_patch_row).pack(anchor="w", padx=5, pady=5)
-
         canvas = tk.Canvas(tab_hex, borderwidth=0, highlightthickness=0)
         scrollbar = ttk.Scrollbar(tab_hex, orient="vertical", command=canvas.yview)
         self.p_container = ttk.Frame(canvas)
-
         self.p_container.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=self.p_container, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-
         self.add_patch_row()
+
+        # --- NATIVE LIB REPLACER UI ---
+        ttk.Button(tab_libs, text="+ Add Lib Replacement", command=self.add_lib_row).pack(anchor="w", padx=5, pady=5)
+        canvas_libs = tk.Canvas(tab_libs, borderwidth=0, highlightthickness=0)
+        scrollbar_libs = ttk.Scrollbar(tab_libs, orient="vertical", command=canvas_libs.yview)
+        self.l_container = ttk.Frame(canvas_libs)
+        self.l_container.bind("<Configure>", lambda e: canvas_libs.configure(scrollregion=canvas_libs.bbox("all")))
+        canvas_libs.create_window((0, 0), window=self.l_container, anchor="nw")
+        canvas_libs.configure(yscrollcommand=scrollbar_libs.set)
+        scrollbar_libs.pack(side="right", fill="y")
+        canvas_libs.pack(side="left", fill="both", expand=True)
+
+    # --- LIB REPLACER LOGIK ---
+    def add_lib_row(self):
+        row_frame = ttk.Frame(self.l_container)
+        row_frame.pack(fill="x", pady=2, anchor="w")
+
+        ttk.Label(row_frame, text="Ziel-Lib in APK (z.B. libdb0c.so):").pack(side="left", padx=2)
+        ent_target = ttk.Entry(row_frame, width=25)
+        ent_target.pack(side="left", padx=2)
+
+        ttk.Label(row_frame, text="Ersatz-Datei (Lokaler Pfad):").pack(side="left", padx=(10, 2))
+        ent_source = ttk.Entry(row_frame, width=45)
+        ent_source.pack(side="left", padx=2)
+
+        # Übergebe BEIDE Felder an die browse_lib Funktion
+        btn_browse = ttk.Button(row_frame, text="📁", width=3, command=lambda: self.browse_lib(ent_target, ent_source))
+        btn_browse.pack(side="left", padx=2)
+
+        btn_del = ttk.Button(row_frame, text="X", width=3, command=lambda: self.remove_lib_row(row_frame))
+        btn_del.pack(side="left", padx=10)
+
+        self.lib_rows.append({
+            "frame": row_frame, "target": ent_target, "source": ent_source
+        })
+
+    def browse_lib(self, entry_target, entry_source):
+        # Tools Ordner als Standard-Directory
+        tools_dir = os.path.join(self.app.cfg.config.get("BASE_DIR", ""), "tools")
+        init_dir = tools_dir if os.path.exists(tools_dir) else None
+
+        path = filedialog.askopenfilename(initialdir=init_dir, title="Lokale Ersatz-Bibliothek (.so) auswählen",
+                                          filetypes=[("Shared Objects", "*.so"), ("All Files", "*.*")])
+        if path:
+            entry_source.delete(0, tk.END)
+            entry_source.insert(0, path)
+
+            # Auto-Fill Ziel-Lib
+            filename = os.path.basename(path)
+            entry_target.delete(0, tk.END)
+            entry_target.insert(0, filename)
+
+    def remove_lib_row(self, row_frame):
+        for row in list(self.lib_rows):
+            if row["frame"] == row_frame:
+                row_frame.destroy()
+                self.lib_rows.remove(row)
+                break
 
     def build_console(self, parent):
         self.console_notebook = ttk.Notebook(parent)
@@ -228,7 +285,6 @@ class WorkspaceTab(ttk.Frame):
 
         ttk.Separator(f_actions, orient="horizontal").pack(fill="x", pady=5)
 
-        # Zeile 1: Live Tools
         f_trace = ttk.Frame(f_actions)
         f_trace.pack(fill="x", padx=10, pady=2)
 
@@ -239,26 +295,20 @@ class WorkspaceTab(ttk.Frame):
         self.btn_frida_attach = ttk.Button(f_trace, text="🦊 Frida Zünden", command=self.attach_frida)
         self.btn_frida_attach.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
-        # Zeile 2: RASP Tools
         f_rasp = ttk.Frame(f_actions)
         f_rasp.pack(fill="x", padx=10, pady=(2, 5))
 
         self.btn_push_clean = ttk.Button(f_rasp, text="📥 Push Clean APK (RASP Spoofer)", command=self.push_clean_apk)
         self.btn_push_clean.pack(fill="x", expand=True)
 
-    # Pusht die originale APK aufs Gerät ---
     def open_launcher_logger(self):
         self.console_notebook.select(self.launcher_logger_tab)
 
-        # --- NEUE FUNKTION: Pusht die originale APK aufs Gerät ---
     def push_clean_apk(self):
         def task():
             self.app.log("\n=== RASP SPOOFER: ORIGINAL APK PUSH ===")
             source_dir = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
             adb = self.app.cfg.paths.get("ADB", "adb")
-
-            # FIX: Wir dürfen NIEMALS die merged_base.apk nehmen, da ihr Hash abweicht!
-            # Wir nehmen exakt den originalen base-Split aus dem Play Store.
             clean_apk = os.path.join(source_dir, "base.apk")
 
             if not os.path.exists(clean_apk):
@@ -289,7 +339,6 @@ class WorkspaceTab(ttk.Frame):
                         self.app.log(f"[!] Befehl fehlgeschlagen mit Code {res.returncode}")
                         success = False
                         break
-
                 except Exception as e:
                     self.app.log(f"[!] CMD Fehler: {e}")
                     success = False
@@ -306,7 +355,6 @@ class WorkspaceTab(ttk.Frame):
 
         threading.Thread(target=task, daemon=True).start()
 
-
     def on_native_lib_changed(self, event):
         new_strat = self.combo_native_lib.get()
         self.app.cfg.config["NATIVE_LIB_STRATEGY"] = new_strat
@@ -322,6 +370,7 @@ class WorkspaceTab(ttk.Frame):
     def attach_frida(self):
         def task():
             self.app.engine.attach_frida_usb()
+
         threading.Thread(target=task, daemon=True).start()
 
     def show_frida_tooltip(self):
@@ -400,9 +449,9 @@ class WorkspaceTab(ttk.Frame):
             except:
                 pass
 
-        active_patches = self.smali_studio.smali_patches if self.smali_studio else []
+        active_patches = self.get_all_patches()
         if not active_patches:
-            return messagebox.showwarning("Leer", "Es gibt aktuell keine geladenen Smali Patches zum Sichern.")
+            return messagebox.showwarning("Leer", "Es gibt aktuell keine aktiven Patches zum Sichern.")
 
         new_fav = {
             "name": name,
@@ -414,7 +463,8 @@ class WorkspaceTab(ttk.Frame):
         favs.append(new_fav)
         with open(fav_file, "w", encoding="utf-8") as f:
             json.dump(favs, f, indent=4)
-        messagebox.showinfo("Gesichert", f"Favorit '{name}' mit {len(active_patches)} Patches erfolgreich hinterlegt!")
+        messagebox.showinfo("Gesichert",
+                            f"Favorit '{name}' mit {len(active_patches)} Patches (Hex/Lib/Smali) erfolgreich hinterlegt!")
 
     def add_patch_row(self):
         row_frame = ttk.Frame(self.p_container)
@@ -459,12 +509,17 @@ class WorkspaceTab(ttk.Frame):
         hex_data = [{"type": "hex", "ram": p["ram"].get(), "base": p["base"].get(), "orig": p["orig"].get(),
                      "patch": p["patch"].get(), "file": "libflutter.so"} for p in self.patch_rows if
                     p["ram"].get().strip()]
+
+        lib_data = [{"type": "lib_replace", "target": p["target"].get().strip(), "source": p["source"].get().strip()}
+                    for p in self.lib_rows if p["target"].get().strip() and p["source"].get().strip()]
+
         smali_data = self.smali_studio.smali_patches if self.smali_studio else []
-        return hex_data + smali_data
+        return hex_data + lib_data + smali_data
 
     def load_patches_from_record(self, record, append=False):
         if not append:
             for p in list(self.patch_rows): self.remove_patch_row(p["frame"])
+            for p in list(self.lib_rows): self.remove_lib_row(p["frame"])
             if self.smali_studio: self.smali_studio.smali_patches.clear()
 
         for pt in record.get("patches", record.get("smali_patches", [])):
@@ -474,11 +529,18 @@ class WorkspaceTab(ttk.Frame):
                     is_dup = any(
                         ex["file"] == pt["file"] and ex["orig"] == pt["orig"] for ex in self.smali_studio.smali_patches)
                     if not is_dup: self.smali_studio.smali_patches.append(pt)
+
+            elif pt.get("type") == "lib_replace":
+                self.add_lib_row()
+                last_row = self.lib_rows[-1]
+                last_row["target"].insert(0, pt.get("target", ""))
+                last_row["source"].insert(0, pt.get("source", ""))
+
             else:
                 self.add_patch_row()
                 last_row = self.patch_rows[-1]
                 last_row["ram"].insert(0, pt.get("ram", ""))
-                last_row["base"].delete(0, tk.END);
+                last_row["base"].delete(0, tk.END)
                 last_row["base"].insert(0, pt.get("base", "00100000"))
                 last_row["orig"].insert(0, pt.get("orig", ""))
                 last_row["patch"].insert(0, pt.get("patch", ""))
@@ -619,7 +681,7 @@ class FavoritePatchesDialog(tk.Toplevel):
         self.btn_prev = ttk.Button(f_nav, text="◀", width=3, command=self.prev_sub_patch)
         self.btn_prev.pack(side="right", padx=5)
 
-        ttk.Label(f_right, text="Ziel-Datei (relativ):").pack(anchor="w", padx=5, pady=(5, 2))
+        ttk.Label(f_right, text="Ziel-Datei / Attribut:").pack(anchor="w", padx=5, pady=(5, 2))
         self.ent_file = ttk.Entry(f_right)
         self.ent_file.pack(fill="x", padx=5)
 
@@ -628,13 +690,13 @@ class FavoritePatchesDialog(tk.Toplevel):
 
         f_orig = ttk.Frame(split_code)
         split_code.add(f_orig, weight=1)
-        ttk.Label(f_orig, text="Original Code-Block:").pack(anchor="w")
+        ttk.Label(f_orig, text="Original / Source Pfad:").pack(anchor="w")
         self.txt_orig = tk.Text(f_orig, bg="#1E1E1E", fg="#D4D4D4", font=("Consolas", 10))
         self.txt_orig.pack(fill="both", expand=True)
 
         f_edit = ttk.Frame(split_code)
         split_code.add(f_edit, weight=1)
-        ttk.Label(f_edit, text="Edit Code-Block:").pack(anchor="w")
+        ttk.Label(f_edit, text="Editierter Code:").pack(anchor="w")
         self.txt_edit = tk.Text(f_edit, bg="#1E1E1E", fg="#D4D4D4", font=("Consolas", 10))
         self.txt_edit.pack(fill="both", expand=True)
 
@@ -656,7 +718,6 @@ class FavoritePatchesDialog(tk.Toplevel):
     def _apply_diff(self, txt_left, txt_right):
         txt_left.tag_configure("diff_del", background="#4a1919")
         txt_right.tag_configure("diff_add", background="#1a3b1a")
-
         txt_left.tag_remove("diff_del", "1.0", tk.END)
         txt_right.tag_remove("diff_add", "1.0", tk.END)
 
@@ -685,30 +746,24 @@ class FavoritePatchesDialog(tk.Toplevel):
         text = txt_widget.get("1.0", tk.END)
         for line_idx, line in enumerate(text.split('\n')):
             tk_line = line_idx + 1
-
             c_match = re.search(r'#.*', line)
             if c_match:
                 txt_widget.tag_add("s_com", f"{tk_line}.{c_match.start()}", f"{tk_line}.{c_match.end()}")
                 line = line[:c_match.start()]
-
             for m in re.finditer(r'".*?"', line):
                 txt_widget.tag_add("s_str", f"{tk_line}.{m.start()}", f"{tk_line}.{m.end()}")
-
             for m in re.finditer(r'\b[vp]\d+\b', line):
                 txt_widget.tag_add("s_reg", f"{tk_line}.{m.start()}", f"{tk_line}.{m.end()}")
-
             for m in re.finditer(r'(\.[a-zA-Z0-9_-]+)', line):
                 txt_widget.tag_add("s_key", f"{tk_line}.{m.start()}", f"{tk_line}.{m.end()}")
-
             m = re.search(r'^\s*([a-zA-Z0-9_-]+)', line)
             if m and not m.group(1).startswith('.'):
                 txt_widget.tag_add("s_inst", f"{tk_line}.{m.start(1)}", f"{tk_line}.{m.end(1)}")
 
     def populate_list(self):
-        for i in self.tree_favs.get_children():
-            self.tree_favs.delete(i)
-        for idx, f in enumerate(self.favs):
-            self.tree_favs.insert("", "end", iid=str(idx), values=(f.get("name", "Unnamed"),))
+        for i in self.tree_favs.get_children(): self.tree_favs.delete(i)
+        for idx, f in enumerate(self.favs): self.tree_favs.insert("", "end", iid=str(idx),
+                                                                  values=(f.get("name", "Unnamed"),))
 
     def get_active_patches(self, fav):
         return fav.get("patches", [fav])
@@ -738,16 +793,30 @@ class FavoritePatchesDialog(tk.Toplevel):
         patches = self.get_active_patches(fav)
 
         p = patches[self.current_sub_patch_idx]
+        ptype = p.get("type", "smali")
+
         self.ent_name.delete(0, tk.END)
         self.ent_name.insert(0, fav.get("name", ""))
         self.ent_file.delete(0, tk.END)
-        self.ent_file.insert(0, p.get("file", ""))
         self.txt_orig.delete("1.0", tk.END)
-        self.txt_orig.insert("1.0", p.get("orig", ""))
         self.txt_edit.delete("1.0", tk.END)
-        self.txt_edit.insert("1.0", p.get("edit", ""))
 
-        self.lbl_sub_patch.config(text=f"Sub-Patch {self.current_sub_patch_idx + 1} / {len(patches)}")
+        if ptype == "lib_replace":
+            self.ent_file.insert(0, p.get("target", ""))
+            self.txt_orig.insert("1.0",
+                                 f"LIB REPLACEMENT\n\nErsetzt in der APK: {p.get('target', '')}\nDurch lokale Datei: {p.get('source', '')}")
+            self.txt_edit.insert("1.0", p.get("source", ""))
+        elif ptype == "hex":
+            self.ent_file.insert(0, p.get("file", "libflutter.so"))
+            self.txt_orig.insert("1.0",
+                                 f"HEX PATCH\n\nRAM: {p.get('ram', '')}\nBase: {p.get('base', '')}\nOrig: {p.get('orig', '')}")
+            self.txt_edit.insert("1.0", p.get("patch", ""))
+        else:
+            self.ent_file.insert(0, p.get("file", ""))
+            self.txt_orig.insert("1.0", p.get("orig", ""))
+            self.txt_edit.insert("1.0", p.get("edit", ""))
+
+        self.lbl_sub_patch.config(text=f"Sub-Patch {self.current_sub_patch_idx + 1} / {len(patches)} ({ptype})")
         self._refresh_visuals()
 
     def save_current(self):
@@ -760,19 +829,22 @@ class FavoritePatchesDialog(tk.Toplevel):
         patches = fav.get("patches", None)
 
         if patches is not None:
-            patches[self.current_sub_patch_idx]["file"] = self.ent_file.get()
-            patches[self.current_sub_patch_idx]["orig"] = self.txt_orig.get("1.0", tk.END).strip()
-            patches[self.current_sub_patch_idx]["edit"] = self.txt_edit.get("1.0", tk.END).strip()
+            ptype = patches[self.current_sub_patch_idx].get("type", "smali")
+            if ptype == "lib_replace":
+                patches[self.current_sub_patch_idx]["target"] = self.ent_file.get().strip()
+                patches[self.current_sub_patch_idx]["source"] = self.txt_edit.get("1.0", tk.END).strip()
+            elif ptype == "hex":
+                patches[self.current_sub_patch_idx]["patch"] = self.txt_edit.get("1.0", tk.END).strip()
+            else:
+                patches[self.current_sub_patch_idx]["file"] = self.ent_file.get().strip()
+                patches[self.current_sub_patch_idx]["orig"] = self.txt_orig.get("1.0", tk.END).strip()
+                patches[self.current_sub_patch_idx]["edit"] = self.txt_edit.get("1.0", tk.END).strip()
         else:
-            new_patch = {
-                "type": "smali",
-                "file": self.ent_file.get(),
-                "orig": self.txt_orig.get("1.0", tk.END).strip(),
-                "edit": self.txt_edit.get("1.0", tk.END).strip()
-            }
+            new_patch = {"type": "smali", "file": self.ent_file.get(), "orig": self.txt_orig.get("1.0", tk.END).strip(),
+                         "edit": self.txt_edit.get("1.0", tk.END).strip()}
             fav["patches"] = [new_patch]
-            fav.pop("file", None)
-            fav.pop("orig", None)
+            fav.pop("file", None);
+            fav.pop("orig", None);
             fav.pop("edit", None)
 
         self.save_favs()
@@ -786,9 +858,9 @@ class FavoritePatchesDialog(tk.Toplevel):
             del self.favs[int(sel[0])]
             self.save_favs()
             self.populate_list()
-            self.ent_name.delete(0, tk.END)
+            self.ent_name.delete(0, tk.END);
             self.ent_file.delete(0, tk.END)
-            self.txt_orig.delete("1.0", tk.END)
+            self.txt_orig.delete("1.0", tk.END);
             self.txt_edit.delete("1.0", tk.END)
 
     def _normalize_path(self, p):
@@ -817,159 +889,173 @@ class FavoritePatchesDialog(tk.Toplevel):
         if not sel: return
         fav = self.favs[int(sel[0])]
         patches_to_apply = self.get_active_patches(fav)
-
         studio = self.ws.smali_studio
-        if not studio: return
-        if not studio._ensure_index_loaded(): return
+        if not studio or not studio._ensure_index_loaded(): return
 
         success_count = 0
         failed_patches = []
 
         for index, current_patch in enumerate(patches_to_apply):
+            ptype = current_patch.get("type", "smali")
+
+            if ptype == "lib_replace":
+                self.ws.add_lib_row()
+                last_row = self.ws.lib_rows[-1]
+                last_row["target"].delete(0, tk.END)
+                last_row["target"].insert(0, current_patch.get("target", ""))
+                last_row["source"].delete(0, tk.END)
+                last_row["source"].insert(0, current_patch.get("source", ""))
+                success_count += 1
+                continue
+
+            elif ptype == "hex":
+                self.ws.add_patch_row()
+                last_row = self.ws.patch_rows[-1]
+                last_row["ram"].delete(0, tk.END)
+                last_row["ram"].insert(0, current_patch.get("ram", ""))
+                last_row["base"].delete(0, tk.END)
+                last_row["base"].insert(0, current_patch.get("base", "00100000"))
+                last_row["orig"].delete(0, tk.END)
+                last_row["orig"].insert(0, current_patch.get("orig", ""))
+                last_row["patch"].delete(0, tk.END)
+                last_row["patch"].insert(0, current_patch.get("patch", ""))
+                success_count += 1
+                continue
+
+            # Standard Smali Logic
             file_path = current_patch.get("file", "")
             orig_code = current_patch.get("orig", "").replace("\r\n", "\n").strip()
-
             target_norm = self._normalize_path(file_path)
 
-            found_content = None
-            found_path = None
-
+            found_content, found_path = None, None
             for path, content in studio.search_engine.ram_cache:
                 if self._normalize_path(path) == target_norm:
-                    found_content = content.replace("\r\n", "\n")
-                    found_path = path
+                    found_content = content.replace("\r\n", "\n");
+                    found_path = path;
                     break
 
             success = False
             if found_content:
                 if orig_code in found_content:
-                    is_dup = any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches)
-                    if not is_dup:
-                        cp = current_patch.copy()
-                        cp["file"] = found_path
+                    if not any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches):
+                        cp = current_patch.copy();
+                        cp["file"] = found_path;
                         cp["orig"] = orig_code
                         studio.smali_patches.append(cp)
                         studio.app.log(f"[+] Sub-Patch {index + 1} ({found_path}) exakt angewendet.")
-                    else:
-                        studio.app.log(f"[*] Sub-Patch {index + 1} ({found_path}) ist bereits aktiv.")
-                    success_count += 1
+                    success_count += 1;
                     success = True
                 else:
                     c_orig = self._clean_smali_for_match(orig_code)
                     m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
                     if m:
                         sig = m.group(1).strip()
-                        actual_method_pattern = re.compile(r'^' + re.escape(sig) + r'.*?^\.end method',
-                                                           re.MULTILINE | re.DOTALL)
-                        actual_match = actual_method_pattern.search(found_content)
+                        actual_match = re.search(r'^' + re.escape(sig) + r'.*?^\.end method', found_content,
+                                                 re.MULTILINE | re.DOTALL)
                         if actual_match:
                             actual_code = actual_match.group(0)
-                            c_actual = self._clean_smali_for_match(actual_code)
-
-                            if c_orig == c_actual:
-                                is_dup = any(
-                                    p["file"] == found_path and p["orig"] == actual_code for p in studio.smali_patches)
-                                if not is_dup:
-                                    cp = current_patch.copy()
-                                    cp["file"] = found_path
+                            if c_orig == self._clean_smali_for_match(actual_code):
+                                if not any(p["file"] == found_path and p["orig"] == actual_code for p in
+                                           studio.smali_patches):
+                                    cp = current_patch.copy();
+                                    cp["file"] = found_path;
                                     cp["orig"] = actual_code
                                     studio.smali_patches.append(cp)
-                                    studio.app.log(
-                                        f"[+] Sub-Patch {index + 1} ({found_path}) strukturell angewendet (ignoriert .line).")
-                                else:
-                                    studio.app.log(f"[*] Sub-Patch {index + 1} ({found_path}) ist bereits aktiv.")
-                                success_count += 1
+                                    studio.app.log(f"[+] Sub-Patch {index + 1} ({found_path}) strukturell angewendet.")
+                                success_count += 1;
                                 success = True
 
-            if not success:
-                failed_patches.append((index, current_patch))
+            if not success: failed_patches.append((index, current_patch))
 
-        if success_count > 0:
-            studio.refresh_smali_tree()
-
+        if success_count > 0: studio.refresh_smali_tree()
         if not failed_patches:
             messagebox.showinfo("Batch Abgeschlossen", f"Alle {success_count} Patches erfolgreich angewendet!",
                                 parent=self)
         else:
-            msg = f"{success_count} Patches angewendet.\nEs gab {len(failed_patches)} Konflikte.\nÖffne Lösungsfenster für jeden Konflikt..."
-            messagebox.showwarning("Batch Konflikte", msg, parent=self)
-
+            messagebox.showwarning("Batch Konflikte",
+                                   f"{success_count} Patches angewendet.\n{len(failed_patches)} Konflikte.",
+                                   parent=self)
             for offset, (idx, fp) in enumerate(failed_patches):
                 fuzzer = FuzzyMatchDialog(self, studio.app, studio, fp,
                                           title_suffix=f" (Patch {idx + 1}/{len(patches_to_apply)})")
-                x = 50 + (offset * 30)
-                y = 50 + (offset * 30)
-                fuzzer.geometry(f"1300x750+{x}+{y}")
+                fuzzer.geometry(f"1300x750+{50 + offset * 30}+{50 + offset * 30}")
 
     def start_single_fav(self):
         sel = self.tree_favs.selection()
         if not sel: return
         fav = self.favs[int(sel[0])]
         patches_to_apply = self.get_active_patches(fav)
-
         studio = self.ws.smali_studio
-        if not studio: return
-        if not studio._ensure_index_loaded(): return
+        if not studio or not studio._ensure_index_loaded(): return
 
         current_patch = patches_to_apply[self.current_sub_patch_idx]
-        file_path = current_patch.get("file", "")
+        ptype = current_patch.get("type", "smali")
+
+        if ptype == "lib_replace":
+            self.ws.add_lib_row()
+            last_row = self.ws.lib_rows[-1]
+            last_row["target"].delete(0, tk.END)
+            last_row["target"].insert(0, current_patch.get("target", ""))
+            last_row["source"].delete(0, tk.END)
+            last_row["source"].insert(0, current_patch.get("source", ""))
+            messagebox.showinfo("Erfolg", "Lib-Replacement erfolgreich geladen!", parent=self)
+            return
+
+        elif ptype == "hex":
+            self.ws.add_patch_row()
+            last_row = self.ws.patch_rows[-1]
+            last_row["ram"].delete(0, tk.END)
+            last_row["ram"].insert(0, current_patch.get("ram", ""))
+            last_row["base"].delete(0, tk.END)
+            last_row["base"].insert(0, current_patch.get("base", "00100000"))
+            last_row["orig"].delete(0, tk.END)
+            last_row["orig"].insert(0, current_patch.get("orig", ""))
+            last_row["patch"].delete(0, tk.END)
+            last_row["patch"].insert(0, current_patch.get("patch", ""))
+            messagebox.showinfo("Erfolg", "Hex-Patch erfolgreich geladen!", parent=self)
+            return
+
+        # Standard Smali Logic
+        target_norm = self._normalize_path(current_patch.get("file", ""))
         orig_code = current_patch.get("orig", "").replace("\r\n", "\n").strip()
 
-        target_norm = self._normalize_path(file_path)
-
-        found_content = None
-        found_path = None
-
+        found_content, found_path = None, None
         for path, content in studio.search_engine.ram_cache:
             if self._normalize_path(path) == target_norm:
-                found_content = content.replace("\r\n", "\n")
-                found_path = path
+                found_content = content.replace("\r\n", "\n");
+                found_path = path;
                 break
 
         success = False
         if found_content:
             if orig_code in found_content:
-                is_dup = any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches)
-                if not is_dup:
-                    cp = current_patch.copy()
-                    cp["file"] = found_path
+                if not any(p["file"] == found_path and p["orig"] == orig_code for p in studio.smali_patches):
+                    cp = current_patch.copy();
+                    cp["file"] = found_path;
                     cp["orig"] = orig_code
                     studio.smali_patches.append(cp)
                     studio.app.log(f"[+] Sub-Patch {self.current_sub_patch_idx + 1} exakt angewendet.")
                     studio.refresh_smali_tree()
-                    messagebox.showinfo("Erfolg", "Patch erfolgreich zur Liste hinzugefügt!", parent=self)
-                else:
-                    messagebox.showinfo("Info", "Patch ist bereits aktiv.", parent=self)
+                    messagebox.showinfo("Erfolg", "Patch erfolgreich hinzugefügt!", parent=self)
                 success = True
             else:
                 c_orig = self._clean_smali_for_match(orig_code)
                 m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
                 if m:
-                    sig = m.group(1).strip()
-                    actual_method_pattern = re.compile(r'^' + re.escape(sig) + r'.*?^\.end method',
-                                                       re.MULTILINE | re.DOTALL)
-                    actual_match = actual_method_pattern.search(found_content)
-                    if actual_match:
-                        actual_code = actual_match.group(0)
-                        c_actual = self._clean_smali_for_match(actual_code)
-
-                        if c_orig == c_actual:
-                            is_dup = any(
-                                p["file"] == found_path and p["orig"] == actual_code for p in studio.smali_patches)
-                            if not is_dup:
-                                cp = current_patch.copy()
-                                cp["file"] = found_path
-                                cp["orig"] = actual_code
-                                studio.smali_patches.append(cp)
-                                studio.app.log(
-                                    f"[+] Sub-Patch {self.current_sub_patch_idx + 1} strukturell angewendet (ignoriert .line).")
-                                studio.refresh_smali_tree()
-                                messagebox.showinfo("Erfolg",
-                                                    "Patch erfolgreich zur Liste hinzugefügt (.line ignoriert)!",
-                                                    parent=self)
-                            else:
-                                messagebox.showinfo("Info", "Patch ist bereits aktiv.", parent=self)
-                            success = True
+                    actual_match = re.search(r'^' + re.escape(m.group(1).strip()) + r'.*?^\.end method', found_content,
+                                             re.MULTILINE | re.DOTALL)
+                    if actual_match and c_orig == self._clean_smali_for_match(actual_match.group(0)):
+                        if not any(p["file"] == found_path and p["orig"] == actual_match.group(0) for p in
+                                   studio.smali_patches):
+                            cp = current_patch.copy();
+                            cp["file"] = found_path;
+                            cp["orig"] = actual_match.group(0)
+                            studio.smali_patches.append(cp)
+                            studio.app.log(f"[+] Sub-Patch {self.current_sub_patch_idx + 1} strukturell angewendet.")
+                            studio.refresh_smali_tree()
+                            messagebox.showinfo("Erfolg", "Patch erfolgreich hinzugefügt (.line ignoriert)!",
+                                                parent=self)
+                        success = True
 
         if not success:
             FuzzyMatchDialog(self, studio.app, studio, current_patch,

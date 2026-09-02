@@ -48,6 +48,8 @@ class HistoryManager:
             if pt.get("type") == "smali":
                 md += f"\n  * **Smali Patch {i + 1}** in Datei: `{pt.get('file')}`\n"
                 md += f"  ```smali\n{pt.get('edit', '')}\n  ```\n"
+            elif pt.get("type") == "lib_replace":
+                md += f"  * **Lib Replacement:** Ziel: `{pt.get('target')}` | Quelle: `{pt.get('source')}`\n"
             else:
                 file_name = pt.get("file", "libflutter.so")
                 md += f"  * **Hex Patch {i + 1}:** Datei: `{file_name}` | RAM: `0x{pt.get('ram', '?')}` | Hex: `{pt.get('patch', '?')}`\n"

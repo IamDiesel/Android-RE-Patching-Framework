@@ -38,18 +38,21 @@ DEFAULT_CONFIG = {
              "cwd": "{DEST_DIR}"},
             {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-debugSigned*.apk\" 2>nul",
              "cwd": "{DEST_DIR}"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
+            {"name": "Sign all APKs", "type": "cmd",
+             "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
              "cwd": "{DEST_DIR}"}
         ],
         "BUILD_NATIVE": [
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
+            {"name": "Inject Custom Libs", "type": "inject_custom_libs"},
             {"name": "Inject Frida Gadget", "type": "inject_frida"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
             {"name": "Apply LSPatch", "type": "apply_lspatch"},
             {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-debugSigned*.apk\" 2>nul",
              "cwd": "{DEST_DIR}"},
-            {"name": "Sign all APKs", "type": "cmd", "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
+            {"name": "Sign all APKs", "type": "cmd",
+             "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
              "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
@@ -87,9 +90,9 @@ class ConfigManager:
                     self.config["PIPELINES"] = {}
                 if "PREPARE_WORKSPACE" not in self.config["PIPELINES"]:
                     self.config["PIPELINES"]["PREPARE_WORKSPACE"] = DEFAULT_CONFIG["PIPELINES"]["PREPARE_WORKSPACE"]
-                # Update existierende Pipeline um neue Schritte falls sie fehlen
+
                 current_native_steps = [s.get("name") for s in self.config["PIPELINES"].get("BUILD_NATIVE", [])]
-                if "Inject Frida Gadget" not in current_native_steps or "Apply LSPatch" not in current_native_steps:
+                if "Inject Frida Gadget" not in current_native_steps or "Apply LSPatch" not in current_native_steps or "Inject Custom Libs" not in current_native_steps:
                     self.config["PIPELINES"]["BUILD_NATIVE"] = DEFAULT_CONFIG["PIPELINES"]["BUILD_NATIVE"]
             except Exception:
                 self.config = DEFAULT_CONFIG.copy()

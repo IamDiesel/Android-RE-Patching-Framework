@@ -104,6 +104,8 @@ class PipelineEngine:
                 success = self._apply_hex_patches()
             elif step_type == "smart_patch":
                 success = self._apply_smart_patches()
+            elif step_type == "inject_custom_libs":  # <--- DAS HIER HAT GEFEHLT
+                success = self._inject_custom_libs()
             elif step_type == "merge_splits":
                 success = self._merge_splits()
             elif step_type == "decompile":
@@ -121,10 +123,66 @@ class PipelineEngine:
 
             if not success:
                 self.log(f"\n[!] FEHLER: Pipeline bei Schritt '{step_name}' abgebrochen.")
+                from tkinter import messagebox
                 messagebox.showerror("Pipeline Fehler", f"Der Schritt '{step_name}' ist fehlgeschlagen.")
                 return False
 
         self.log(f"\n=== PIPELINE {pipeline_name} ERFOLGREICH ===")
+        return True
+
+    def _inject_custom_libs(self):
+        """Ersetzt native Bibliotheken in der APK basierend auf den UI-Patches."""
+        import os, shutil
+        lib_patches = [p for p in self.get_patches() if p.get("type") == "lib_replace"]
+
+        if not lib_patches:
+            self.log("[*] Keine Custom-Libs zum Austauschen konfiguriert. Überspringe.")
+            return True
+
+        folder_name = self.get_unpacked_dir_name()
+        apk_lib_dir = os.path.join(self.cfg.paths["DEST_DIR"], folder_name, "lib")
+
+        if not os.path.exists(apk_lib_dir):
+            self.log("[*] Entpackte APK hat keinen 'lib' Ordner. Überspringe Lib-Austausch.")
+            return True
+
+        self.log(f"[*] Führe {len(lib_patches)} Lib-Ersatz-Regeln aus...")
+        replaced_count = 0
+
+        for patch in lib_patches:
+            target_name = patch.get("target", "").strip()
+            source_path = patch.get("source", "").strip()
+
+            if not target_name or not source_path:
+                continue
+
+            if not os.path.exists(source_path):
+                self.log(f"[!] FEHLER: Die lokale Ersatz-Lib existiert nicht: {source_path}")
+                return False
+
+            # Gehe durch alle Architektur-Ordner in der APK (z.B. arm64-v8a, armeabi-v7a)
+            found_in_apk = False
+            for arch in os.listdir(apk_lib_dir):
+                arch_path = os.path.join(apk_lib_dir, arch)
+                if os.path.isdir(arch_path):
+                    target_lib_path = os.path.join(arch_path, target_name)
+
+                    # Nur überschreiben, wenn die Ziel-Lib auch wirklich in der Architektur existiert
+                    if os.path.exists(target_lib_path):
+                        try:
+                            shutil.copy2(source_path, target_lib_path)
+                            self.log(
+                                f"[+] '{target_name}' in Architektur '{arch}' erfolgreich durch Custom-Lib überschrieben!")
+                            replaced_count += 1
+                            found_in_apk = True
+                        except Exception as e:
+                            self.log(f"[!] Fehler beim Austauschen von '{target_name}': {e}")
+                            return False
+
+            if not found_in_apk:
+                self.log(f"[-] WARNUNG: Ziel-Lib '{target_name}' wurde in keiner Architektur der APK gefunden!")
+
+        self.log(f"[+] Insgesamt {replaced_count} Lib(s) erfolgreich ausgetauscht.")
         return True
 
     def _get_dir_size_mb(self, path):

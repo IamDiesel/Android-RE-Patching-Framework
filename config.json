@@ -4,7 +4,7 @@
     "APP_PACKAGE": "org.nativescript.LibreLinkUp",
     "SIGNER_JAR": "uber-apk-signer-1.3.0.jar",
     "APKEDITOR_JAR": "APKEditor-1.4.9.jar",
-    "MANIFEST_STRATEGY": "apkeditor",
+    "MANIFEST_STRATEGY": "aapt2",
     "NATIVE_LIB_STRATEGY": "zipalign",
     "INJECT_FRIDA": false,
     "INJECT_LSPATCH": false,
