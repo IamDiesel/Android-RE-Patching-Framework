@@ -1,113 +1,216 @@
-# Android RE Patching Framework (Case Study) 🔧
 
-A Python-based automation framework designed to massively accelerate the iterative reverse engineering workflow on Android.
+# Android RE Patching Framework - Technical Documentation
 
-This tool automates the tedious cycle of unpacking, binary hex patching, Smali code modification, repackaging, signing, ADB flashing, and logcat tracing. It bridges the gap between static analysis and dynamic instrumentation, handling everything from statically linked SSL certificate checks (BoringSSL) in Flutter-based (Dart AOT) apps to complex Java/Kotlin modifications (Smali) using a built-in IDE.
+A Python-based automation utility designed for Android reverse engineering workflows.
 
-⚠️ **Disclaimer:**  
-*This project is for educational and security research purposes only. No copyrighted APK files, libraries, or proprietary binaries are provided or distributed in this repository. Users must supply their own legally obtained binaries. The tools provided are intended solely to automate the local testing workflow for security analysis.*
+This application automates the sequential execution of unpacking, binary hex patching, Smali modification, repackaging, cryptographic signing, ADB sideloading, and logcat tracing. It facilitates the local integration of static code analysis and dynamic instrumentation for applications, including native Java/Kotlin builds and Dart AOT-compiled (Flutter) applications.
 
-<img width="1917" height="966" alt="image" src="https://github.com/user-attachments/assets/5ad8332b-5768-4885-a229-46d2aca488db" />
-<img width="1095" height="666" alt="image" src="https://github.com/user-attachments/assets/be5ab47e-edf7-4402-9203-1d743b1b9f58" />
-<img width="1919" height="1147" alt="image" src="https://github.com/user-attachments/assets/358e343a-73a8-4f2e-8e1b-4cecaf21e29f" />
-<img width="1911" height="421" alt="image" src="https://github.com/user-attachments/assets/08fb1c88-b546-4240-adc0-f4a6ecc05086" />
+⚠️ **Disclaimer:**
 
+*This project is provided strictly for educational purposes and security research. The repository does not distribute copyrighted APK files or proprietary binaries. Users must supply legally obtained binaries. The tools are intended exclusively for local testing environments during security analysis*.
 
 ---
 
-## 🛠️ System Requirements & Setup
+## 1. Software Architecture & Design Patterns
 
-1. **Python 3.x** (with `tkinter` support).
-2. **Android SDK Platform-Tools:** `adb` must be available in the system PATH.
-3. **Java Development Kit (JDK):** Required for repackaging (`jar`, `apktool`) and signing.
-4. **Apktool & APKEditor:** Required for unpacking and rebuilding APKs (AXML/ARSC manipulation).
-5. **Uber-APK-Signer:** Download the latest version of [patrickfav/uber-apk-signer](https://github.com/patrickfav/uber-apk-signer) and place it in the root directory.
-6. **mitmproxy:** Required for the API Inspector (`pip install mitmproxy`).
+The application is written in Python and utilizes `tkinter` for its graphical user interface. To prevent the main thread from blocking during file I/O or computationally intensive operations, the architecture implements the Model-View-Controller (MVC) paradigm alongside an event-driven Service-Oriented Architecture (SOA).
 
-### Directory Structure
+* **Strict MVC Implementation:** The graphical user interfaces (Views) are decoupled from business logic. All data processing and subprocess executions are delegated to specific controllers (e.g., `WorkspaceController`, `FuzzyMatchController`) and stateless service classes.
 
-The framework automatically creates the required workspace upon the first launch:
+
+* **EventBus (Pub/Sub):** Cross-module communication is handled via a centralized event bus (`EventBus`). Background threads, such as those reading the ADB logcat output or calculating code diffs, publish events that UI components subscribe to, preventing hard dependencies and Tkinter threading conflicts.
+
+
+* **Pipeline Engine (Command Pattern):** The build and modification sequence is executed based on an iterable JSON configuration (`config.json`) rather than imperative hardcoding. The `PipelineEngine` instantiates classes implementing the `PipelineStep` interface (e.g., `DecompileStep`, `InjectFridaStep`) for each configured operation.
+
+### 1.1 Directory Structure & Core Files
+
+The framework is organized into a modular directory structure, separating state management, business logic, background services, and graphical interfaces. The workspace and data directories are dynamically generated during the initial execution.
 
 ```text
-├── AutoPatcher.py          # Main framework script
-├── uber-apk-signer.jar     # Third-party tool (Not included in repo!)
-├── APKEditor.jar           # Third-party tool for manifest strategies
-├── source/                 # Place original APK files here
-├── destination/            # Output directory for patched & signed APKs
-├── archives/               # Version archive of all builds & traces
-├── snippets.json           # Smali code injection templates
-├── favorite_patches.json   # Saved batch patches (e.g., SSL pinning bypasses)
-├── RE_History.json         # Machine-readable patch history
-└── Kippy_RE_Log.md         # Human-readable reverse engineering logbook
+├── main.py                     # Entry point and environment bootstrapper (dependency injection, PATH resolution)[cite: 51]
+├── gui.py                      # Main Tkinter application class and tab initialization[cite: 52]
+├── requirements.txt            # Python dependencies (mitmproxy, lief, frida-tools)[cite: 50]
+├── .gitignore                  # Exclusion rules for caches, APKs, and local workspaces[cite: 55]
+│
+├── core/                       # Application core and business logic
+│   ├── application/            # Global state and communication
+│   │   ├── event_bus.py        # Central Pub/Sub event dispatcher[cite: 39]
+│   │   └── session_state.py    # Singleton holding active patches and UI states[cite: 38]
+│   ├── domain/                 # Domain models and custom exceptions
+│   │   └── exceptions.py       # E.g., PatchConflictException for structural mismatch[cite: 40]
+│   ├── infrastructure/         # Low-level system interactions
+│   │   ├── command_runner.py   # Wrapper for blocking/background subprocess executions[cite: 41]
+│   │   ├── config_manager.py   # JSON configuration and absolute path resolution[cite: 42]
+│   │   └── tool_manager.py     # Automated downloader and PATH injector for third-party binaries[cite: 43]
+│   ├── pipeline/               # Build process orchestration
+│   │   ├── engine.py           # Command pattern executor reading from config.json[cite: 44]
+│   │   ├── step_interface.py   # Abstract base class for all pipeline steps[cite: 45]
+│   │   └── steps/              # Specific build implementations (e.g., DecompileStep, SmartPatchStep)[cite: 44]
+│   ├── fuzzing_engine.py       # Opcode normalization and difflib-based heuristic search[cite: 49]
+│   └── data_extractor.py       # Regex, JSONPath, and offset parser for the API Inspector[cite: 48]
+│
+├── services/                   # Stateless background services
+│   ├── adb_network_service.py  # ADB proxy routing and certificate pushing[cite: 27]
+│   ├── api_db_service.py       # SQLite database operations for intercepted HTTP traffic[cite: 28]
+│   ├── callgraph_service.py    # Method node and edge mapping for Smali references[cite: 23]
+│   ├── logcat_service.py       # Asynchronous ADB logcat trace capturing[cite: 36]
+│   ├── proxy_service.py        # mitmdump subprocess management[cite: 30]
+│   ├── smali_search_service.py # Threaded RAM caching and text indexing[cite: 33]
+│   ├── smali_parser.py         # Regex parsing for methods, fields, and instructions[cite: 32]
+│   └── patch_service.py        # Evaluation logic for hex, smali, and library replacements[cite: 37]
+│
+├── ui/                         # Graphical User Interface (MVC Implementation)
+│   ├── controllers/            # Logic handlers receiving UI events
+│   │   ├── workspace_controller.py      # Pipeline and session execution logic[cite: 60]
+│   │   ├── fuzzy_match_controller.py    # Asynchronous fuzzing and diffing operations[cite: 59]
+│   │   └── favorite_patches_controller.py # Batch patch orchestration[cite: 57]
+│   ├── dialogs/                # Popup windows ("Dumb Views")
+│   │   ├── favorite_patches_dialog.py   # UI for batch patch execution and management[cite: 57]
+│   │   └── fuzzy_matcher_dialog.py      # UI for resolving patch conflicts via diffing[cite: 59]
+│   ├── tabs/                   # Main notebook sections ("Dumb Views")
+│   │   ├── workspace_tab.py    # Build controls, patch staging, and manifest strategies[cite: 57]
+│   │   ├── smali_studio_tab.py # IDE layout integrating the editor, outline, and graphs[cite: 15]
+│   │   └── api_inspector_tab.py# DAST interface displaying intercepted database traffic[cite: 10]
+│   └── widgets/                # Reusable UI components
+│       └── smali_editor_widget.py # Custom Tkinter Text widget with lazy-highlighting[cite: 17]
+│
+├── data/                       # Persistent JSON data and databases (auto-generated)[cite: 42]
+│   ├── snippets.json           # Smali code injection templates[cite: 34]
+│   ├── favorite_patches.json   # Stored hex and smali patches for cross-version application[cite: 60]
+│   ├── RE_History.json         # Structured JSON array documenting build runs and results[cite: 26]
+│   ├── Kippy_RE_Log.md         # Formatted markdown output of the patching history[cite: 26]
+│   └── api_traffic.db          # SQLite storage for mitmproxy captures[cite: 28]
+│
+├── tools/                      # External dependencies (auto-downloaded by ToolManager)[cite: 43]
+│   ├── APKEditor.jar           # AXML compilation and manifest manipulation[cite: 42]
+│   ├── uber-apk-signer.jar     # v1/v2/v3 cryptographic signing utility[cite: 42]
+│   ├── platform-tools/         # Directory containing the ADB binary (Windows)[cite: 43]
+│   └── libfrida-gadget.so      # Frida native dynamic instrumentation payload[cite: 43]
+│
+├── source/                     # Original target APK files[cite: 42]
+├── destination/                # Output directory for patched, aligned, and signed APKs[cite: 42]
+└── archives/                   # Auto-generated backup directories containing build artifacts and trace logs[cite: 42]
 
 ```
 
 ---
 
-## 📱 App Manager & Workspace Extraction
+## 2. Core Algorithms & Data Processing
 
-No need to manually pull APKs anymore. The built-in **App Manager** allows you to:
+### 2.1 Fuzzing Engine & Heuristic Matching
 
-* **Extract Directly from Device:** Automatically list all third-party apps installed on the connected device and extract the base and split APKs (`adb pull`) with a single click.
-* **Architecture Detection:** The framework automatically detects the target architecture (e.g., ARM64, x86_64) and configures the workspace accordingly.
-* **Auto-Merge Split APKs:** Merges extracted Split-APKs into a single Universal APK for easier decompilation and manipulation.
+To maintain the applicability of Smali patches across different application versions, the software utilizes a two-stage heuristic search algorithm when static offsets fail.
 
----
+* **Opcode Normalization:** Prior to code comparison, volatile metadata is stripped using regular expressions. This includes removing `.line` directives, comments (`#`), and normalizing Dalvik registers (e.g., converting `v0` or `p1` to a generic `REG` token) to focus solely on the structural logic of the opcodes.
 
-## 🔬 Module 1: Smali Studio & Advanced Static Analysis
 
-A full-fledged IDE built directly into the framework to analyze and modify Java/Kotlin code at the Smali level without needing external editors.
+* **Search Phases:**
+1. **Fast Search:** The engine initially searches strictly within the defined target file based on the method signature.
 
-### Features
 
-* **High-Performance RAM Indexer:** Decompiles the APK and builds an in-memory index of all `.smali` files, enabling lightning-fast global searches across thousands of files.
-* **Call Graph & XREF Engine:** Instantly resolve incoming and outgoing cross-references (XREFs). Track which methods call your target, and what your target calls.
-* **Data Flow Graph:** Automatically tracks read (`sget`/`iget`) and write (`sput`/`iput`) operations for variables and fields.
-* **Outline View:** Extracts and categorizes class methods, fields, and System APIs for quick navigation.
-* **Code Injection & Struct Manager:** Right-click inside the editor to inject predefined snippets (e.g., Try-Catch blocks, Android Intents, Logcat debugging) from `snippets.json`. You can also generate entirely new custom `.smali` classes (like BroadcastReceivers) and inject them into the app.
-* **Syntax Highlighting:** Live regex-based syntax highlighting for Smali instructions, registers, strings, and comments.
+2. **Sequence Matching:** If an exact signature is not found, the algorithm utilizes `difflib.SequenceMatcher` to evaluate the similarity of normalized code blocks, applying a defined threshold (e.g., ratio `>0.85`).
 
----
 
-## ⭐ Module 2: Patch Favorites & Fuzzy Matching
+3. **Deep Search (Pre-Filtered):** In cases involving file renaming or obfuscation, the engine executes a global RAM cache search. To optimize processing, it pre-filters the cache by extracting string literals (length > 3) from the original patch and excluding files that lack these strings, before executing the CPU-intensive `difflib` calculations on the remaining set.
 
-When an app updates, hardcoded offsets and exact code blocks change. The framework solves this with an intelligent patch management system.
 
-* **Batch Patching:** Save complex, multi-file modifications (like complete OkHttp/TrustManager SSL Pinning bypasses) into `favorite_patches.json`. Apply the entire batch to a new app with a single click.
-* **Fuzzy Matching Engine:** If a saved patch doesn't exactly match the decompiled code of a new app version, the built-in Fuzzy Matcher intervenes. It uses method signature resolution and code diffing to locate the new insertion point and opens an interactive side-by-side diff editor to resolve the conflict.
 
----
 
-## 🏗️ Module 3: Automated Build & Patching Pipeline
 
-A manual cycle of patching, repacking, signing, and flashing disrupts the analytical flow. This module reduces the cycle to seconds.
+### 2.2 Text Rendering & Threading (Smali Studio)
 
-* **Dynamic Manifest Strategies:** Choose between `Smali_Only` (fastest), `APKEditor` (native AXML compilation), and `AAPT2` (strict). The pipeline automatically removes Split-APK restrictions and injects a custom `Network Security Config` (NSC) to allow user-level MitM certificates.
-* **Multi-Target Patching:** Apply Smali modifications alongside Hex patches for compiled shared libraries (e.g., `libflutter.so`).
-* **Auto-Signing & Flashing:** Seamless integration of `uber-apk-signer` to resign modified APKs, followed by direct deployment to the test device via ADB (`adb install-multiple`).
-* **Integrated Tracing:** Start and stop targeted `logcat` traces based on the process ID (PID) of the target app directly from the GUI.
-* **Systematic Test Documentation:** All test runs, patches, and observations are versioned and stored in structured Markdown reports (`Kippy_RE_Log.md`) and JSON history.
+Decompiled Smali files can be excessively large, necessitating specific rendering techniques to prevent UI freezing:
+
+* **Viewport Lazy-Highlighting:** The regex-based syntax highlighting engine evaluates only the currently visible viewport rather than the entire text buffer. This is achieved by mapping the Tkinter screen coordinates (`@0,0` to the widget height) and debouncing the execution via `after()` events bound to scroll actions.
+
+
+* **Asynchronous Diffing:** For side-by-side code comparisons in the conflict resolution dialogs, the `SequenceMatcher.get_opcodes()` calculation is dispatched to a background daemon thread. Upon completion, the main thread safely applies the text tags (`diff_add`, `diff_del`).
+
+
 
 ---
 
-## 🌐 Module 4: API Inspector (DAST & MITM Proxy)
+## 3. System Requirements & Bootstrapping
 
-The framework includes a fully integrated Dynamic Application Security Testing (DAST) suite powered by `mitmproxy` to intercept and manipulate API traffic on the fly.
+The execution of the framework requires the following dependencies:
 
-### 1️⃣ Setup & Commissioning (The VPN Trick for Flutter)
+1. **Python 3.x** (with `tkinter` support).
 
-Since Flutter/Dart applications typically ignore global HTTP proxy settings, this tool utilizes a local VPN routing trick:
 
-1. **Start Proxy & Establish USB Tunnel:** Start the proxy and click **🔌 Route USB** to execute `adb reverse tcp:8080 tcp:8080`.
-2. **Push Certificate:** Click **📱 Push Cert** to copy the CA certificate to the device for installation.
-3. **Configure SuperProxy:** Use an app like **SuperProxy** on Android (HTTP, `127.0.0.1:8080`) to tunnel the traffic, bypassing framework-level proxy ignores.
+2. **mitmproxy:** Required for the DAST API inspector module (`pip install mitmproxy`).
 
-### 2️⃣ Traffic Monitoring & Data Extraction
 
-* **Custom Columns Engine (⚙️ Spalten-Logik):** Dynamically extract hidden data from Request/Response bodies or headers using **JSON Paths**, **Regex**, or **Byte Offsets** and display them as dedicated columns.
-* **Column Display Manager (👁️ Ansicht):** Hide, show, and reorder columns on the fly. Save setups as application-specific `.json` profiles.
+3. **Android SDK Platform-Tools:** The `adb` binary is necessary for device communication.
 
-### 3️⃣ Traffic Manipulation
 
-* **Intercept Rules (On-the-fly Manipulation):** Define dynamic manipulation rules based on URL matching to automatically replace Request or Response payloads before they reach the app/server.
-* **Database Editing & Export:** Modify intercepted packets directly in the GUI and save them to the local SQLite database (`api_traffic.db`). Export selected packets for external analysis.
+4. **Java Development Kit (JDK):** Required for executing `.jar`-based utilities like Apktool and APK-Signer.
+
+
+
+**Automated Bootstrapping:**
+Upon execution (`main.py`), the application initiates a `bootstrap_environment()` routine. It dynamically resolves or downloads missing third-party binaries (e.g., Apktool, APKEditor, uber-apk-signer, and libfrida-gadget.so). The absolute paths to these executables are injected into the runtime `os.environ["PATH"]`, enabling the Python subprocesses to invoke them directly without requiring system-wide environment variable configurations.
+
+---
+
+## 4. Module Specifications
+
+### 4.1 App Manager
+
+A UI frontend integrating ADB commands to extract APK files from a connected Android device.
+
+* Executes `adb shell pm list packages -3` to retrieve third-party applications.
+
+
+* Retrieves base and split APKs using `adb shell pm path` followed by `adb pull`.
+
+
+* Detects the target CPU architecture (e.g., `arm64_v8a`, `x86_64`) based on the extracted split APK filenames and configures the workspace accordingly.
+
+
+
+### 4.2 Smali Studio (Static Analyzer)
+
+An integrated text editor specialized for Smali code manipulation.
+
+* **RAM Indexer:** Loads decompiled `.smali` files into system memory using a `concurrent.futures.ThreadPoolExecutor` and caches the state via `pickle` serialization to accelerate file I/O operations across sessions.
+
+
+* **XREF & Callgraph Engine:** Parses method invocations (matching regex `invoke-.*`) to construct a hierarchical call graph. It differentiates between application methods and System APIs (e.g., `Ljava/`, `Landroid/`).
+
+
+* **Data Flow Analysis:** Extracts variable read operations (`iget`/`sget`) and write operations (`iput`/`sput`) from smali blocks to map data flow.
+
+
+* **Code Struct Injection:** Permits the insertion of predefined Smali templates from `snippets.json` or the programmatic creation of entirely new `.smali` class files (e.g., Android BroadcastReceivers) into the workspace.
+
+
+
+### 4.3 Patch Management & Build Pipeline
+
+Coordinates source code modifications and native binary replacements.
+
+* **Favorites Manager (`favorite_patches.json`):** Stores structured JSON definitions for multiple patch types, including Smali edits, hexadecimal byte replacements for native `.so` libraries (e.g., `libflutter.so`), and entire native library replacements. These are applied consecutively via a batch processing loop.
+
+
+* **Manifest Strategies:** Allows the user to select the compilation engine (`Apktool` or `APKEditor`) to circumvent AXML parsing errors during the build phase.
+
+
+* **Pipeline Modifications:** Automates the injection of Frida Gadget `.so` files, applies LSPatch Xposed modules, modifies the Network Security Config (NSC) to accept user-level certificates, signs the resulting APK, and executes `adb install`.
+
+
+
+### 4.4 API Inspector (DAST / MITM Proxy)
+
+Integrates `mitmdump` as a subprocess to monitor and manipulate HTTP/S traffic.
+
+* **Traffic Routing:** Executes `adb reverse tcp:8080 tcp:8080` or manipulates `adb shell settings put global http_proxy` to route application traffic through the host machine's proxy instance.
+
+
+* **Rule-based Interception:** Users can define URL-matching rules to dynamically alter request or response payloads before they reach the client or server.
+
+
+* **Custom Data Extraction:** Features a parsing engine that isolates specific values from recorded traffic. It utilizes JSONPath expressions, Regex capturing groups, or byte offset specifications (converting extracted bytes to string, hex, or int arrays) to populate dynamic columns in the UI.
+
+
+* **Persistence:** Intercepted packets are serialized into a local SQLite database (`api_traffic.db`) to enable post-execution analysis and modification.

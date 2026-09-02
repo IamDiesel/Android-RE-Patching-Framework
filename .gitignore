@@ -17,6 +17,7 @@ source/
 destination/
 archives/
 tools/
+doc/
 
 # Device Logs
 trace.txt

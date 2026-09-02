@@ -2,19 +2,26 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 import datetime
+import threading
 
-from config import ConfigManager
-from pipeline_engine import PipelineEngine
-from history import HistoryManager
-from cg_manager import CallGraphManager
+from core.infrastructure.config_manager import ConfigManager
+from core.pipeline.engine import PipelineEngine
+from services.history_service import HistoryManager
+from services.callgraph_service import CallGraphManager
 
-from api_inspector import APIInspectorTab
-from app_manager import AppManagerTab
-from ui_workspace_tab import WorkspaceTab
-from ui_history_tab import HistoryTab
-from ui_settings_tab import SettingsTab
+# In gui.py ganz oben:
+from ui.tabs.api_inspector_tab import APIInspectorTab
+from ui.tabs.app_manager_tab import AppManagerTab
+from ui.tabs.workspace_tab import WorkspaceTab
+from ui.tabs.history_tab import HistoryTab
+from ui.tabs.settings_tab import SettingsTab
 
-class KippyReFrameworkApp(tk.Tk):
+# Core Module
+from core.application.event_bus import EventBus
+from core.infrastructure.tool_manager import ToolManager
+
+
+class ReFrameworkApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Kippy RE-Framework V8 - DAST & Proxy Suite")
@@ -24,7 +31,12 @@ class KippyReFrameworkApp(tk.Tk):
         self.cfg = ConfigManager()
         self.history = HistoryManager(self.cfg)
         self.cg = CallGraphManager()
-        self.engine = PipelineEngine(self.cfg, self.log, self.get_patch_data, self.get_current_archive_path)
+
+        # GUI abonniert den Event-Bus für globale Log-Nachrichten
+        EventBus.subscribe("LOG_INFO", self.log)
+
+        # Engine Initialisierung (ohne UI Callback Parameter)
+        self.engine = PipelineEngine(self.cfg, self.get_current_archive_path)
 
         # Global Session State
         self.is_unpacking = False
@@ -34,24 +46,28 @@ class KippyReFrameworkApp(tk.Tk):
         self.create_widgets()
         self.generate_new_id()
 
-        # Vollbild / Maximiertes Fenster beim Start:
         if os.name == 'nt':
-            self.state('zoomed')  # Für Windows (Maximiert mit Fensterleiste)
+            self.state('zoomed')
         else:
-            self.attributes('-zoomed', True)  # Für Linux/macOS
+            self.attributes('-zoomed', True)
+
+        # Tools asynchron im Hintergrund prüfen/laden und in PATH injizieren
+        base_dir = self.cfg.config.get("BASE_DIR", os.getcwd())
+        threading.Thread(target=lambda: ToolManager.setup_tools(base_dir), daemon=True).start()
 
     def create_widgets(self):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Initialize Sub-Tabs (KEIN eigenständiges Smali Studio mehr hier!)
-        self.app_manager_tab = AppManagerTab(self.notebook, self.cfg.paths.get("SOURCE_DIR", "source"), self.log, self.handle_app_imported)
+        # Tabs initialisieren
+        self.app_manager_tab = AppManagerTab(self.notebook, self.cfg.paths.get("SOURCE_DIR", "source"),
+                                             self.handle_app_imported)
         self.workspace_tab = WorkspaceTab(self.notebook, self)
-        self.api_tab = APIInspectorTab(self.notebook, self.cfg, self.log)
+        self.api_tab = APIInspectorTab(self.notebook, self.cfg)
         self.history_tab = HistoryTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
 
-        # Pack Notebook
+        # Tabs zum Notebook hinzufügen
         self.notebook.add(self.app_manager_tab, text="📱 App Manager")
         self.notebook.add(self.workspace_tab, text="🔧 Workspace")
         self.notebook.add(self.api_tab, text="🌐 API Inspector")
@@ -76,36 +92,28 @@ class KippyReFrameworkApp(tk.Tk):
         self.log(f"[+] Workspace für {pkg} konfiguriert. Du kannst nun loslegen.")
 
     def check_lock(self):
-        """Verhindert Operationen während die APK entpackt wird."""
         if self.is_unpacking:
-            messagebox.showwarning("Bitte warten", "Apktool entpackt gerade die App. Bitte warte, bis der Vorgang abgeschlossen ist.")
+            messagebox.showwarning("Bitte warten",
+                                   "Apktool entpackt gerade die App. Bitte warte, bis der Vorgang abgeschlossen ist.")
             return True
         return False
-
-    def get_patch_data(self):
-        """Orchestriert die Patch-Daten aus dem Workspace."""
-        return self.workspace_tab.get_all_patches()
 
     def get_current_archive_path(self):
         return self.current_archive_path
 
     def generate_new_id(self):
-        # 1. Neue ID basierend auf Zeit generieren
         self.current_id = f"PID-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
-        # 2. FEHLENDE LOGIK REKONSTRUIEREN: Archiv-Verzeichnis berechnen & anlegen
         if "ARCHIVE_DIR" in self.cfg.paths:
             self.current_archive_path = os.path.join(self.cfg.paths["ARCHIVE_DIR"], self.current_id)
             os.makedirs(self.current_archive_path, exist_ok=True)
         else:
             self.current_archive_path = ""
 
-        # 3. UI updaten
         if hasattr(self, 'workspace_tab'):
             self.workspace_tab.lbl_id.config(text=self.current_id)
 
     def log(self, msg):
-        """Globale Log-Funktion, leitet in den Workspace weiter (Thread-Safe)."""
         def _append():
             if hasattr(self, 'workspace_tab') and hasattr(self.workspace_tab, 'console'):
                 self.workspace_tab.console.insert("end", msg + "\n")
@@ -114,5 +122,5 @@ class KippyReFrameworkApp(tk.Tk):
         self.after(0, _append)
 
 if __name__ == "__main__":
-    app = KippyReFrameworkApp()
+    app = ReFrameworkApp()
     app.mainloop()

@@ -52,7 +52,7 @@ if __name__ == "__main__":
 
     # Der Import erfolgt erst hier, damit die GUI erst startet, 
     # wenn alle Abhängigkeiten (z.B. Drittanbieter-Bibliotheken) gesichert da sind.
-    from gui import KippyReFrameworkApp
+    from gui import ReFrameworkApp
 
-    app = KippyReFrameworkApp()
+    app = ReFrameworkApp()
     app.mainloop()
