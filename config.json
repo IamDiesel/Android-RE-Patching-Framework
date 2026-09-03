@@ -1,14 +1,14 @@
 {
-    "BASE_DIR": "C:\\Users\\Dogma\\PycharmProjects\\Android-RE-Patching-Framework",
-    "SPLIT_NAME": "com.datamars.kippynew",
-    "APP_PACKAGE": "com.datamars.kippynew",
+    "BASE_DIR": "C:\\Users\\Lenovo\\Documents\\GitHub\\Android RE Patching Framework",
+    "SPLIT_NAME": "org.nativescript.LibreLinkUp",
+    "APP_PACKAGE": "org.nativescript.LibreLinkUp",
     "SIGNER_JAR": "tools\\uber-apk-signer.jar",
     "APKEDITOR_JAR": "tools\\APKEditor.jar",
     "LSPATCH_JAR": "tools\\lspatch.jar",
     "TRUSTMEALREADY_APK": "tools\\TrustMeAlready.apk",
     "MANIFEST_STRATEGY": "aapt2",
     "NATIVE_LIB_STRATEGY": "zipalign",
-    "INJECT_FRIDA": false,
+    "INJECT_FRIDA": true,
     "INJECT_LSPATCH": false,
     "PIPELINES": {
         "PREPARE_WORKSPACE": [
@@ -131,7 +131,7 @@
             {
                 "name": "Start Logcat",
                 "type": "trace_start",
-                "cmd": "adb logcat --pid={PID}",
+                "cmd": "adb logcat --pid={PID} | grep -iE 'fatal|crash|debug|linker|frida|console|CryptoAudit'",
                 "cwd": "{BASE_DIR}"
             }
         ],

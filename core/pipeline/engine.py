@@ -94,24 +94,25 @@ class PipelineEngine:
 
     def attach_frida_usb(self) -> bool:
         """Bleibt in der Engine, da es asynchron per Button aus der UI (nicht Pipeline) aufgerufen wird."""
-        script_path = self.cfg.paths.get("COMPILED_FRIDA_SCRIPT", "")
-        if not script_path:
-            import tempfile
-            script_path = os.path.join(tempfile.gettempdir(), "re_frida_project_2", "agent_compiled.js")
-
-        if not os.path.exists(script_path):
-            self.log("[!] Kompiliertes Frida-Skript nicht gefunden. Bitte baue die App zuerst neu.")
-            return False
-
         self.log("\n[*] Verbinde mit Frida Gadget über USB...")
         try:
             import frida
-            with open(script_path, "r", encoding="utf-8") as f:
-                source = f.read()
+            from services.frida_service import FridaManager
+
+            # 1. Wir holen uns den ROHEN Quellcode direkt aus dem Editor (kein NPM/Compiler mehr!)
+            fm = FridaManager(self.cfg.config.get("BASE_DIR", ""))
+            source = fm.get_active_code()
+
+            if not source:
+                self.log("[!] Kein aktives Frida-Skript im Manager gefunden!")
+                return False
+
             device = frida.get_usb_device(timeout=5)
             self.log("[*] USB Gerät gefunden. Suche Gadget...")
 
             self.frida_session = device.attach("Gadget")
+
+            # 2. Wir injizieren den puren Quellcode direkt in die V8-Engine
             self.frida_script = self.frida_session.create_script(source)
 
             def on_message(message: Dict[str, Any], data: Any) -> None:
@@ -124,7 +125,7 @@ class PipelineEngine:
 
             self.frida_script.on('message', on_message)
             self.frida_script.load()
-            self.log("[+] Skript erfolgreich in den RAM injiziert! App wird fortgesetzt (Resume)...")
+            self.log("[+] Skript (RAW) erfolgreich in den RAM injiziert! App wird fortgesetzt (Resume)...")
             device.resume("Gadget")
             return True
         except Exception as e:

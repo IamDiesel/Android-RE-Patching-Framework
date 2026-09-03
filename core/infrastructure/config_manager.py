@@ -1,7 +1,6 @@
 import os
 import json
 
-# FIX: Gehe zwei Ebenen nach oben (von core/infrastructure ins Root-Verzeichnis)
 CURRENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 DEFAULT_CONFIG = {
@@ -64,7 +63,8 @@ DEFAULT_CONFIG = {
         ],
         "TRACE_START": [
             {"name": "Clear Logcat", "type": "cmd", "cmd": "adb logcat -c", "cwd": "{BASE_DIR}"},
-            {"name": "Start Logcat", "type": "trace_start", "cmd": "adb logcat --pid={PID}", "cwd": "{BASE_DIR}"}
+            # Aktualisierter Filter unterstützt den neuen Tag 'CryptoAudit'
+            {"name": "Start Logcat", "type": "trace_start", "cmd": "adb logcat --pid={PID} | grep -iE 'fatal|crash|debug|linker|frida|console|CryptoAudit'", "cwd": "{BASE_DIR}"}
         ],
         "TRACE_STOP": [
             {"name": "Stop Logcat", "type": "trace_stop"}
@@ -75,7 +75,6 @@ DEFAULT_CONFIG = {
 
 class ConfigManager:
     def __init__(self, config_file="config.json"):
-        # Der Config-Manager sucht die JSON-Datei weiterhin im Root-Verzeichnis
         self.config_file = os.path.join(CURRENT_DIR, config_file)
         self.config = {}
         self.paths = {}
@@ -89,6 +88,8 @@ class ConfigManager:
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     self.config = json.load(f)
+
+                self.config["BASE_DIR"] = CURRENT_DIR
 
                 if "PIPELINES" not in self.config:
                     self.config["PIPELINES"] = {}
@@ -127,7 +128,6 @@ class ConfigManager:
         if not os.path.exists(adb_full_path):
             adb_full_path = "adb"
 
-        # NEU: Data-Ordner definieren
         data_dir = os.path.join(b_dir, "data")
         os.makedirs(data_dir, exist_ok=True)
 
@@ -138,7 +138,6 @@ class ConfigManager:
             "ARCHIVE_DIR": os.path.join(b_dir, "archives"),
             "EXTRACT_DIR": os.path.join(b_dir, "source", app_pkg, split),
             "ADB": adb_full_path,
-            # NEU: Dateien in den Data-Ordner leiten
             "LOG_FILE": os.path.join(data_dir, "Kippy_RE_Log.md"),
             "JSON_HISTORY": os.path.join(data_dir, "RE_History.json"),
             "API_DB": os.path.join(data_dir, "api_traffic.db"),

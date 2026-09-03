@@ -27,7 +27,49 @@ def run_build_cmd(cmd_template: str, engine_context: Any) -> bool:
     cwd = engine_context.format_cmd("{DEST_DIR}")
     log_file = os.path.join(engine_context.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
     engine_context.log(f"> [{cwd}]\n> {cmd}")
-    return CommandRunner.run_live(cmd, cwd, engine_context.log, log_file)
+
+    # AAPT2 Daemon Fix: Wir lesen den Output asynchron und kappen die Verbindung bei Erfolg
+    process = CommandRunner.run_background(cmd, cwd)
+    success_flag = [False]
+
+    def log_reader() -> None:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        with open(log_file, "w", encoding="utf-8", errors="replace") as f_out:
+            if process.stdout:
+                for line in process.stdout:
+                    f_out.write(line)
+                    clean_line = line.strip()
+                    if clean_line:
+                        engine_context.log(clean_line)
+                        # Sobald Apktool oder APKEditor das Erfolgs-Keyword sendet, abbrechen!
+                        if "Built apk into:" in clean_line or "Saved to:" in clean_line:
+                            success_flag[0] = True
+                            time.sleep(0.5)  # Kurz warten, damit alles weggeschrieben wird
+                            try:
+                                process.terminate()  # Kappt die offene aapt2 Pipe
+                            except:
+                                pass
+                            break
+
+    reader_thread = threading.Thread(target=log_reader, daemon=True)
+    reader_thread.start()
+
+    while process.poll() is None:
+        time.sleep(0.5)
+        # Wenn der Thread wegen der Erfolgsmeldung beendet wurde, Prozess endgültig killen
+        if not reader_thread.is_alive():
+            try:
+                process.terminate()
+            except:
+                pass
+
+    reader_thread.join(timeout=1.0)
+
+    # War es Apktool oder APKEditor, vertrauen wir unserem Success-Flag, da wir den Prozess manuell beenden
+    if "apktool" in cmd or "APKEditor" in cmd:
+        return success_flag[0] or process.returncode == 0
+    else:
+        return process.returncode == 0
 
 
 def inject_nsc(engine_context: Any) -> bool:

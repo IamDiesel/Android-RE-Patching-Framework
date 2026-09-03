@@ -191,8 +191,10 @@ class APIInspectorTab(ttk.Frame):
         self.refresh_rules()
 
     def start_proxy(self):
-        addon_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')), "tools",
-                                  "mitm_addon.py")
+        # Nutzt den absoluten Pfad aus der Config und verweist auf das neue services-Verzeichnis
+        base_dir = self.cfg.config.get("BASE_DIR", "")
+        addon_path = os.path.join(base_dir, "services", "mitm_addon.py")
+
         try:
             self.proxy_service.start_proxy(addon_path)
             self.lbl_proxy_status.config(text="Proxy: 🟢 Läuft", foreground="green")

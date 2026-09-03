@@ -38,11 +38,13 @@ class FridaInjectStep(PipelineStep):
             npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
             npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
 
+            log_file = os.path.join(engine_context.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
+
             if not os.path.exists(pkg_json_path):
                 engine_context.log(f"[*] Initialisiere stabilen Workspace in: {frida_proj_dir} ...")
                 pkg_data = {
                     "name": "re_frida_agent", "private": True,
-                    "dependencies": {"frida-java-bridge": "latest"},
+                    "dependencies": {},
                     "devDependencies": {"frida-compile": "latest", "@types/frida-gum": "latest"}
                 }
                 with open(pkg_json_path, "w", encoding="utf-8") as f: json.dump(pkg_data, f, indent=4)
@@ -55,7 +57,8 @@ class FridaInjectStep(PipelineStep):
                     tsconfig_data, f, indent=4)
 
                 engine_context.log("[*] Führe 'npm install' aus (das dauert kurz)...")
-                CommandRunner.run_live(f"{npm_cmd} install", frida_proj_dir, lambda l: engine_context.log(f"[NPM] {l}"))
+                CommandRunner.run_live(f"{npm_cmd} install", frida_proj_dir, lambda l: engine_context.log(f"[NPM] {l}"),
+                                       log_file)
                 with open(os.path.join(frida_proj_dir, ".latest_success"), "w") as f: f.write("ok")
 
             fm = FridaManager(engine_context.cfg.config.get("BASE_DIR", ""))
@@ -64,32 +67,33 @@ class FridaInjectStep(PipelineStep):
                 engine_context.log("[!] Kein aktives Frida-Skript im Manager gefunden!")
                 return False
 
-            raw_script_path = os.path.join(frida_proj_dir, "index.ts")
+            raw_script_path = os.path.join(frida_proj_dir, "index.js")
             with open(raw_script_path, "w", encoding="utf-8") as f:
                 f.write(js_code)
 
             engine_context.log("[*] Kompiliere Agent mit frida-compile (latest)...")
             compiled_out_path = os.path.join(frida_proj_dir, "agent_compiled.js")
-            compile_cmd = f"{npx_cmd} --yes frida-compile index.ts -o agent_compiled.js -c"
+            compile_cmd = f"{npx_cmd} --yes frida-compile index.js -o agent_compiled.js -c"
 
             success = CommandRunner.run_live(compile_cmd, frida_proj_dir,
-                                             lambda l: engine_context.log(f"[frida-compile] {l}"))
+                                             lambda l: engine_context.log(f"[frida-compile] {l}"), log_file)
             if not success:
                 engine_context.log("[!] Kompilierung fehlgeschlagen! Siehe Fehlermeldung oben.")
                 return False
 
-            for ext in ["libfrida-gadget.script.so", "libfrida-script.so"]:
-                f_path = os.path.join(lib_dir, ext)
-                if os.path.exists(f_path): os.remove(f_path)
-
+            # Konfiguration für den Listen-Modus (Wartet auf USB-Verbindung der Python Engine)
             config_path = os.path.join(lib_dir, "libfrida-gadget.config.so")
             listen_config = {
-                "interaction": {"type": "listen", "address": "127.0.0.1", "port": 27042, "on_load": "wait"}}
+                "interaction": {
+                    "type": "listen",
+                    "on_load": "wait"
+                }
+            }
             with open(config_path, "w", encoding="utf-8") as f:
                 json.dump(listen_config, f, indent=4)
 
             engine_context.cfg.paths["COMPILED_FRIDA_SCRIPT"] = compiled_out_path
-            engine_context.log("[+] Frida 17 Gadget mit expliziter Listen-Config injiziert!")
+            engine_context.log("[+] Frida 17 Gadget im Listen-Modus (wait) injiziert!")
             return True
 
         except Exception as e:
@@ -125,7 +129,6 @@ class LSPatchInjectStep(PipelineStep):
         cmd = f'java -jar "{lspatch_jar}" "{base_apk}" -m "{module_apk}" -o "{dest_dir}"'
         engine_context.log(f"[*] Starte LSPatch Injection: {cmd}")
 
-        # Nutzen des Loggers direkt über _run_cmd_step equivalent in Step
         log_file = os.path.join(engine_context.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
         if not CommandRunner.run_live(engine_context.format_cmd(cmd), engine_context.format_cmd("{BASE_DIR}"),
                                       engine_context.log, log_file):
