@@ -7,8 +7,6 @@ from ui.dialogs.favorite_patches_dialog import FavoritePatchesDialog
 from core.application.event_bus import EventBus
 from core.domain.exceptions import PatchConflictException
 from core.application.session_state import SessionState
-
-# Der Controller übernimmt die gesamte Geschäftslogik
 from ui.controllers.workspace_controller import WorkspaceController
 
 
@@ -20,7 +18,6 @@ class WorkspaceTab(ttk.Frame):
         self.lib_rows = []
         self.smali_studio = None
 
-        # Controller instanziieren
         self.controller = WorkspaceController(self, app)
 
         self.create_widgets()
@@ -178,7 +175,8 @@ class WorkspaceTab(ttk.Frame):
         btn_del.pack(side="left", padx=5)
 
         self.patch_rows.append(
-            {"frame": row_frame, "file": ent_file, "ram": ent_ram, "base": ent_base, "orig": ent_orig, "patch": ent_patch}
+            {"frame": row_frame, "file": ent_file, "ram": ent_ram, "base": ent_base, "orig": ent_orig,
+             "patch": ent_patch}
         )
 
     def remove_patch_row(self, row_frame):
@@ -269,7 +267,8 @@ class WorkspaceTab(ttk.Frame):
         f_favs = ttk.LabelFrame(parent, text="⭐ Patch Verwaltung & Favoriten")
         f_favs.pack(side="top", fill="x", padx=5, pady=5)
 
-        ttk.Button(f_favs, text="Patch Favoriten Manager öffnen", command=self.open_favorites).pack(fill="x", padx=10, pady=5)
+        ttk.Button(f_favs, text="Patch Favoriten Manager öffnen", command=self.open_favorites).pack(fill="x", padx=10,
+                                                                                                    pady=5)
         ttk.Button(f_favs, text="Aktuellen Stand als Favorit sichern",
                    command=self.controller.save_current_as_favorite).pack(fill="x", padx=10, pady=2)
 
@@ -279,18 +278,22 @@ class WorkspaceTab(ttk.Frame):
         f_strat = ttk.Frame(f_actions)
         f_strat.pack(fill="x", padx=10, pady=2)
         ttk.Label(f_strat, text="Manifest-Strategie:").pack(side="left", padx=2)
-        self.combo_strat = ttk.Combobox(f_strat, values=["smali_only", "apkeditor", "aapt2"], state="readonly", width=12)
+        self.combo_strat = ttk.Combobox(f_strat, values=["smali_only", "apkeditor", "aapt2"], state="readonly",
+                                        width=12)
         self.combo_strat.pack(side="left", padx=5)
         self.combo_strat.set(self.app.cfg.config.get("MANIFEST_STRATEGY", "apkeditor"))
-        self.combo_strat.bind("<<ComboboxSelected>>", lambda e: self.controller.change_manifest_strategy(self.combo_strat.get()))
+        self.combo_strat.bind("<<ComboboxSelected>>",
+                              lambda e: self.controller.change_manifest_strategy(self.combo_strat.get()))
 
         f_native = ttk.Frame(f_actions)
         f_native.pack(fill="x", padx=10, pady=2)
         ttk.Label(f_native, text="Memory Alignment:").pack(side="left", padx=2)
-        self.combo_native_lib = ttk.Combobox(f_native, values=["zipalign", "extractNativeLibs"], state="readonly", width=16)
+        self.combo_native_lib = ttk.Combobox(f_native, values=["zipalign", "extractNativeLibs"], state="readonly",
+                                             width=16)
         self.combo_native_lib.pack(side="left", padx=5)
         self.combo_native_lib.set(self.app.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign"))
-        self.combo_native_lib.bind("<<ComboboxSelected>>", lambda e: self.controller.change_native_lib_strategy(self.combo_native_lib.get()))
+        self.combo_native_lib.bind("<<ComboboxSelected>>",
+                                   lambda e: self.controller.change_native_lib_strategy(self.combo_native_lib.get()))
 
         f_inject = ttk.Frame(f_actions)
         f_inject.pack(fill="x", padx=10, pady=2)
@@ -308,18 +311,37 @@ class WorkspaceTab(ttk.Frame):
                                       command=lambda: self.controller.toggle_lspatch(self.var_lspatch.get()))
         chk_lspatch.pack(side="left", padx=2)
 
-        self.btn_build = ttk.Button(f_actions, text="▶ BUILD_NATIVE ausführen", command=self.controller.run_build)
-        self.btn_build.pack(fill="x", padx=10, pady=5)
+        ttk.Separator(f_actions, orient="horizontal").pack(fill="x", pady=5)
 
-        self.btn_flash = ttk.Button(f_actions, text="📱 FLASH (Install auf Gerät)", command=self.controller.run_flash)
-        self.btn_flash.pack(fill="x", padx=10, pady=5)
+        # --- NEU: Deinstallations- und Kombi-Buttons ---
+        f_combo_build = ttk.Frame(f_actions)
+        f_combo_build.pack(fill="x", padx=10, pady=2)
+
+        self.var_uninstall = tk.BooleanVar(value=True)
+        ttk.Checkbutton(f_combo_build, text="Vorher deinstallieren", variable=self.var_uninstall).pack(side="left")
+
+        ttk.Button(f_combo_build, text="🗑 App Deinstallieren", command=self.controller.run_uninstall).pack(side="right")
+
+        self.btn_1click = ttk.Button(f_actions, text="🚀 1-Click: (Uninstall) -> Build -> Flash",
+                                     command=self.controller.run_full_chain)
+        self.btn_1click.pack(fill="x", padx=10, pady=5)
+
+        f_single_builds = ttk.Frame(f_actions)
+        f_single_builds.pack(fill="x", padx=10, pady=2)
+
+        self.btn_build = ttk.Button(f_single_builds, text="⚙️ Nur BUILD", command=self.controller.run_build)
+        self.btn_build.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
+        self.btn_flash = ttk.Button(f_single_builds, text="📱 Nur FLASH", command=self.controller.run_flash)
+        self.btn_flash.pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         ttk.Separator(f_actions, orient="horizontal").pack(fill="x", pady=5)
 
         f_trace = ttk.Frame(f_actions)
         f_trace.pack(fill="x", padx=10, pady=2)
 
-        self.btn_launcher_logger = ttk.Button(f_trace, text="🚀 App Launcher & Logger", command=self.open_launcher_logger)
+        self.btn_launcher_logger = ttk.Button(f_trace, text="🚀 App Launcher & Logger",
+                                              command=self.open_launcher_logger)
         self.btn_launcher_logger.pack(side="left", fill="x", expand=True, padx=(0, 2))
 
         self.btn_frida_attach = ttk.Button(f_trace, text="🦊 Frida Zünden", command=self.controller.attach_frida)
@@ -346,7 +368,8 @@ class WorkspaceTab(ttk.Frame):
         self.txt_obs = tk.Text(f_docs, height=6, font=("Segoe UI", 9))
         self.txt_obs.pack(fill="both", expand=True, padx=5, pady=5)
 
-        ttk.Button(f_docs, text="💾 Session permanent sichern", command=self._on_save_result).pack(fill="x", padx=5, pady=2)
+        ttk.Button(f_docs, text="💾 Session permanent sichern", command=self._on_save_result).pack(fill="x", padx=5,
+                                                                                                  pady=2)
 
     def _on_save_result(self):
         self.controller.save_session_result(

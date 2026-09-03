@@ -110,9 +110,18 @@ class SmaliStudioController:
         else:
             self.current_method_name = method_def
 
+        # Anzeige-Name für Label bauen
         disp_name = self.current_method_name.split('(')[
             0] if "(" in self.current_method_name else self.current_method_name
-        self.view.lbl_smali_file.config(text=f"{os.path.basename(self.current_smali_file)} -> {disp_name}")
+
+        # NEU: Kompletten Pfad aus Workspace Variablen für das Label generieren
+        pkg_name = self.app.cfg.config.get("APP_PACKAGE", "app")
+        unpacked_folder = self.view.get_unpacked_dir_name()
+        os_rel_path = self.current_smali_file.replace("/", "\\")
+        full_display_path = f"{pkg_name}\\{unpacked_folder}\\{os_rel_path}"
+
+        self.view.lbl_smali_file.config(text=f"{full_display_path}->{disp_name}")
+
         self.view.editor.load_code(block)
 
         if self.current_method_name != "<Klassen-Header & Felder>":
@@ -164,9 +173,12 @@ class SmaliStudioController:
 
     def _update_outline(self, lines):
         for i in self.view.tree_outline.get_children(): self.view.tree_outline.delete(i)
+        for i in self.view.tree_file.get_children(): self.view.tree_file.delete(i)
+
         items = SmaliStudioParser.parse_outline(lines, self.current_smali_file)
         for item in items:
             self.view.tree_outline.insert("", "end", values=(item["type"], item["display"]), tags=item["tags"])
+            self.view.tree_file.insert("", "end", values=(item["type"], item["display"]), tags=item["tags"])
 
     # --- XREF Delegation ---
     def find_incoming_xrefs(self):

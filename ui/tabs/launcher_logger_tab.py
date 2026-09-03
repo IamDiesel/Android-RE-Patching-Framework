@@ -5,8 +5,6 @@ import sys
 
 from core.infrastructure.command_runner import CommandRunner
 from core.application.event_bus import EventBus
-
-# NEU: Services importieren
 from services.profile_manager_service import ProfileManagerService
 from services.logcat_service import LogcatService
 
@@ -19,14 +17,14 @@ class LauncherLoggerTab(ttk.Frame):
         self.raw_logs = []
         self.search_pos = "1.0"
 
-        # NEU: Services initialisieren
         data_dir = os.path.join(self.app.cfg.config.get("BASE_DIR", ""), "data")
         config_file = os.path.join(data_dir, "logger_profiles.json")
         self.profile_mgr = ProfileManagerService(config_file)
         self.logcat_service = LogcatService()
 
-        # NEU: EventBus Subscription für Logs (Löst manuelles Threading im Tab ab)
+        # Abonnements für Android Logcat UND externe Python EventBus-Nachrichten (z.B. Frida via USB)
         EventBus.subscribe("LOGCAT_LINE", lambda line: self.after(0, self._append_log, line))
+        EventBus.subscribe("LOG_INFO", lambda msg: self.after(0, self._append_frida_log, msg))
 
         self.create_widgets()
         self.bind("<Destroy>", self.on_close)
@@ -94,17 +92,23 @@ class LauncherLoggerTab(ttk.Frame):
         ttk.Checkbutton(f_tools, text="Zeilenumbruch", variable=self.var_wrap, command=self.toggle_wrap).pack(
             side="left")
 
-        # --- Controls Row ---
+        # --- Controls Row (GETRENNTE BUTTONS) ---
         f_ctrl = ttk.Frame(f_top)
         f_ctrl.pack(fill="x", pady=5)
 
-        self.btn_start = ttk.Button(f_ctrl, text="▶ Logging & App Starten", command=self.start_capture)
-        self.btn_start.pack(side="left", padx=5)
+        self.btn_start_app = ttk.Button(f_ctrl, text="▶ App Starten", command=self.start_app_only)
+        self.btn_start_app.pack(side="left", padx=2)
+
+        self.btn_start_log = ttk.Button(f_ctrl, text="▶ Logcat Starten", command=self.start_logcat_only)
+        self.btn_start_log.pack(side="left", padx=2)
+
+        self.btn_start_combo = ttk.Button(f_ctrl, text="▶ Kombiniert (App + Log)", command=self.start_combined)
+        self.btn_start_combo.pack(side="left", padx=2)
 
         self.btn_stop = ttk.Button(f_ctrl, text="⏹ Stop Logging", command=self.stop_capture, state="disabled")
-        self.btn_stop.pack(side="left", padx=5)
+        self.btn_stop.pack(side="left", padx=10)
 
-        ttk.Separator(f_ctrl, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Separator(f_ctrl, orient="vertical").pack(side="left", fill="y", padx=5)
 
         ttk.Button(f_ctrl, text="🗑 Anzeige leeren", command=self.clear_console).pack(side="left", padx=5)
         ttk.Button(f_ctrl, text="📂 Archiv (PID) öffnen", command=self.open_archive).pack(side="right", padx=5)
@@ -119,15 +123,18 @@ class LauncherLoggerTab(ttk.Frame):
 
         self.console = tk.Text(f_console, bg="#1E1E1E", fg="#D4D4D4", font=("Consolas", 10), wrap="word")
 
+        # Tags für Farbmarkierungen definieren
+        self.console.tag_configure("search", background="white", foreground="black")
+        self.console.tag_configure("frida_log", foreground="#E5C07B", font=("Consolas", 10, "bold"))  # Warn-Gelb
+        self.console.tag_configure("error_log", foreground="#E06C75", font=("Consolas", 10, "bold"))  # Error-Rot
+
         scroll_y = ttk.Scrollbar(f_console, orient="vertical", command=self.console.yview)
         scroll_y.pack(side="right", fill="y")
-
         scroll_x = ttk.Scrollbar(f_console, orient="horizontal", command=self.console.xview)
         scroll_x.pack(side="bottom", fill="x")
 
         self.console.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
         self.console.pack(side="left", fill="both", expand=True)
-        self.console.tag_configure("search", background="yellow", foreground="black")
 
     def toggle_wrap(self):
         if self.var_wrap.get():
@@ -165,10 +172,12 @@ class LauncherLoggerTab(ttk.Frame):
         query = self.ent_filter.get().lower()
         self.console.delete("1.0", tk.END)
         if not query:
-            self.console.insert(tk.END, "".join(self.raw_logs))
+            for line in self.raw_logs:
+                self._insert_colored_line(line)
         else:
             filtered = [line for line in self.raw_logs if query in line.lower()]
-            self.console.insert(tk.END, "".join(filtered))
+            for line in filtered:
+                self._insert_colored_line(line)
         self.console.see(tk.END)
         self.do_search()
 
@@ -182,7 +191,41 @@ class LauncherLoggerTab(ttk.Frame):
             combobox["values"] = self.profile_mgr.profiles[group]
             combobox.set("")
 
-    def start_capture(self):
+    # === NEUE LOGIK FÜR PID-RESOLVING & START ===
+
+    def _resolve_pid(self, adb, base_dir):
+        """Führt asynchron adb shell pidof aus und holt die echte Prozess ID."""
+        pkg = self.app.cfg.config.get("APP_PACKAGE", "")
+        res = CommandRunner.run_blocking(f'"{adb}" shell pidof {pkg}', cwd=base_dir)
+        pid = res.stdout.strip()
+        return pid if res.returncode == 0 and pid.isdigit() else None
+
+    def start_app_only(self):
+        adb = self.app.cfg.paths.get("ADB", "adb")
+        base_dir = self.app.cfg.config.get("BASE_DIR", "")
+        intent_cmd = self._format_cmd(self.cb_intents.get().strip())
+        if not intent_cmd:
+            return messagebox.showerror("Fehler", "Intent Kommando darf nicht leer sein.")
+        self._launch_app(adb, intent_cmd, base_dir)
+
+    def start_logcat_only(self):
+        adb = self.app.cfg.paths.get("ADB", "adb")
+        base_dir = self.app.cfg.config.get("BASE_DIR", "")
+        logcat_cmd = self._format_cmd(self.cb_logcats.get().strip())
+
+        if not logcat_cmd:
+            return messagebox.showerror("Fehler", "Logcat Kommando darf nicht leer sein.")
+
+        if "{PID}" in logcat_cmd:
+            pid = self._resolve_pid(adb, base_dir)
+            if not pid:
+                return messagebox.showerror("Fehler",
+                                            "App läuft nicht! PID konnte nicht ermittelt werden.\nBitte starte zuerst die App (z.B. per Button oder am Handy).")
+            logcat_cmd = logcat_cmd.replace("{PID}", pid)
+
+        self._start_capture_internal(adb, logcat_cmd, base_dir)
+
+    def start_combined(self):
         adb = self.app.cfg.paths.get("ADB", "adb")
         base_dir = self.app.cfg.config.get("BASE_DIR", "")
         intent_cmd = self._format_cmd(self.cb_intents.get().strip())
@@ -191,24 +234,51 @@ class LauncherLoggerTab(ttk.Frame):
         if not intent_cmd or not logcat_cmd:
             return messagebox.showerror("Fehler", "Intent und Logcat Kommando dürfen nicht leer sein.")
 
+        # Alten Puffer auf Gerät leeren
         self.console.insert(tk.END, "[*] Leere alten Logcat-Puffer auf dem Gerät...\n")
         CommandRunner.run_blocking(f'"{adb}" logcat -c', cwd=base_dir)
+
+        # 1. Start App
+        self._launch_app(adb, intent_cmd, base_dir)
+
+        # 2. Polling-Schleife für Logcat falls {PID} verlangt wird
+        if "{PID}" in logcat_cmd:
+            self._delayed_pid_logcat_start(adb, logcat_cmd, base_dir, attempts=6)
+        else:
+            self._start_capture_internal(adb, logcat_cmd, base_dir, skip_clear=True)
+
+    def _delayed_pid_logcat_start(self, adb, logcat_cmd, base_dir, attempts):
+        if attempts <= 0:
+            self.console.insert(tk.END, "[!] Timeout: Konnte PID der App nach dem Start nicht ermitteln!\n",
+                                "error_log")
+            return
+
+        pid = self._resolve_pid(adb, base_dir)
+        if pid:
+            logcat_cmd = logcat_cmd.replace("{PID}", pid)
+            self._start_capture_internal(adb, logcat_cmd, base_dir, skip_clear=True)
+        else:
+            self.console.insert(tk.END, f"[*] Warte auf App-Prozess... (noch {attempts} Versuche)\n", "frida_log")
+            self.after(500, lambda: self._delayed_pid_logcat_start(adb, logcat_cmd, base_dir, attempts - 1))
+
+    def _start_capture_internal(self, adb, logcat_cmd, base_dir, skip_clear=False):
+        if not skip_clear:
+            self.console.insert(tk.END, "[*] Leere alten Logcat-Puffer auf dem Gerät...\n")
+            CommandRunner.run_blocking(f'"{adb}" logcat -c', cwd=base_dir)
 
         archive_dir = getattr(self.app, 'current_archive_path', self.app.cfg.paths.get("ARCHIVE_DIR", ""))
 
         try:
-            # NEU: Start des Logcats über den Service
             log_file_path = self.logcat_service.start_capture(adb, logcat_cmd, archive_dir)
             self.console.insert(tk.END, f"[*] Starte Logcat: \"{adb}\" shell \"{logcat_cmd}\"\n")
 
-            # App-Start Verzögerung
-            self.after(500, lambda: self._launch_app(adb, intent_cmd, base_dir))
-
-            self.btn_start.config(state="disabled")
+            self.btn_start_app.config(state="disabled")
+            self.btn_start_log.config(state="disabled")
+            self.btn_start_combo.config(state="disabled")
             self.btn_stop.config(state="normal")
-            self.lbl_status.config(text=f"🔴 Recording to: {log_file_path}", foreground="red")
+            self.lbl_status.config(text=f"🔴 Recording to: {os.path.basename(log_file_path)}", foreground="red")
         except Exception as e:
-            self.console.insert(tk.END, f"[!] Fehler beim Starten von Logcat: {e}\n")
+            self.console.insert(tk.END, f"[!] Fehler beim Starten von Logcat: {e}\n", "error_log")
 
     def _launch_app(self, adb, intent_cmd, base_dir):
         full_intent_cmd = f'"{adb}" shell {intent_cmd}'
@@ -217,21 +287,48 @@ class LauncherLoggerTab(ttk.Frame):
         try:
             CommandRunner.run_background(full_intent_cmd, cwd=base_dir)
         except Exception as e:
-            self.console.insert(tk.END, f"[!] Fehler beim App Start: {e}\n")
+            self.console.insert(tk.END, f"[!] Fehler beim App Start: {e}\n", "error_log")
+
+    # === LOG FORMATIERUNG & FARBEN ===
+
+    def _append_frida_log(self, msg):
+        """Wird ausgelöst, wenn EventBus "LOG_INFO" empfängt (z.B. Frida via USB Python-Bridge)"""
+        if msg.startswith("[Frida]") or msg.startswith("[Frida ERROR]"):
+            self.console.insert(tk.END, msg + "\n", "frida_log")
+            self.console.see(tk.END)
+        elif msg.startswith("[!]"):
+            self.console.insert(tk.END, msg + "\n", "error_log")
+            self.console.see(tk.END)
+
+    def _insert_colored_line(self, line):
+        """Hilfsfunktion zum Einsetzen nativer Logcat-Zeilen mit Farbe"""
+        tag = ""
+        line_lower = line.lower()
+        if "frida" in line_lower:
+            tag = "frida_log"
+        elif "fatal" in line_lower or "crash" in line_lower or " exception " in line_lower:
+            tag = "error_log"
+
+        if tag:
+            self.console.insert(tk.END, line, tag)
+        else:
+            self.console.insert(tk.END, line)
 
     def _append_log(self, line):
+        """Wird ausgelöst, wenn EventBus "LOGCAT_LINE" empfängt"""
         self.raw_logs.append(line)
         query = self.ent_filter.get().lower()
         if not query or query in line.lower():
-            self.console.insert(tk.END, line)
+            self._insert_colored_line(line)
+            # Auto-Scroll nur, wenn wir sowieso ganz unten sind
             if self.console.yview()[1] >= 0.98:
                 self.console.see(tk.END)
 
     def stop_capture(self):
-        # NEU: Stop über den Service
         self.logcat_service.stop_capture()
-
-        self.btn_start.config(state="normal")
+        self.btn_start_app.config(state="normal")
+        self.btn_start_log.config(state="normal")
+        self.btn_start_combo.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.lbl_status.config(text="Status: Gestoppt", foreground="gray")
         self.console.insert(tk.END, "\n[*] Logging gestoppt.\n")

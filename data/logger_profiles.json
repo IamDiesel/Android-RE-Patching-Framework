@@ -1,0 +1,19 @@
+{
+    "intents": [
+        "monkey -p {APP_PACKAGE} -c android.intent.category.LAUNCHER 1",
+        "am start -W -a android.intent.action.VIEW -d \"{APP_NAME}://\"",
+        "am start -W -a android.intent.action.VIEW -d \"{APP_NAME}://debug\"",
+        "am start -W -a android.intent.action.VIEW -d \"{APP_NAME}://dashboard\"",
+        "am start -W -a android.intent.action.VIEW -d \"{APP_NAME}://admin\"",
+        "am start -W -a android.intent.action.VIEW -d \"{APP_NAME}://login?bypass=true\""
+    ],
+    "logcats": [
+        "logcat | grep -iE '{APP_NAME}|fatal|crash|debug|linker|frida|console'",
+        "logcat --pid=$(pidof {APP_PACKAGE})",
+        "logcat *:E",
+        "logcat",
+        "logcat -b crash -d",
+        "shell \"logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|frida|console|Caused by|Exception|Error'\"",
+        "logcat | grep -iE '{APP_NAME}|LibreLinkUp|fatal|crash|debug|frida|console|Caused by|Exception|Error'"
+    ]
+}

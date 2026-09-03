@@ -6,6 +6,7 @@ import threading
 import subprocess
 from tkinter import messagebox, simpledialog
 
+from core.infrastructure.command_runner import CommandRunner
 from services.frida_service import FridaManager
 from ui.dialogs.frida_manager_dialog import FridaManagerDialog
 from services.favorite_service import FavoriteService
@@ -16,15 +17,96 @@ class WorkspaceController:
         self.view = view
         self.app = app
 
+    def _disable_build_buttons(self):
+        self.view.btn_build.config(state="disabled")
+        self.view.btn_flash.config(state="disabled")
+        self.view.btn_1click.config(state="disabled")
+
+    def _enable_build_buttons(self):
+        self.view.btn_build.config(state="normal")
+        self.view.btn_flash.config(state="normal")
+        self.view.btn_1click.config(state="normal")
+
+    def _copy_signed_apks_to_archive(self):
+        dest_dir = self.app.cfg.paths.get("DEST_DIR", "")
+        if os.path.exists(dest_dir) and hasattr(self.app, 'current_archive_path'):
+            for f in os.listdir(dest_dir):
+                if f.endswith("-debugSigned.apk"):
+                    shutil.copy(os.path.join(dest_dir, f), self.app.current_archive_path)
+
+    def run_uninstall(self, silent=False):
+        """Führt ADB Uninstall aus. Kann manuell über den Button oder silent in der Pipeline aufgerufen werden."""
+
+        def task():
+            if not silent and self.app.check_lock(): return
+            pkg = self.app.cfg.config.get("APP_PACKAGE", "")
+            adb = self.app.cfg.paths.get("ADB", "adb")
+            base_dir = self.app.cfg.config.get("BASE_DIR", "")
+
+            self.app.log(f"\n[*] Deinstalliere App: {pkg} ...")
+            res = CommandRunner.run_blocking(f'"{adb}" uninstall {pkg}', cwd=base_dir)
+
+            if res.returncode == 0 or "Success" in res.stdout:
+                self.app.log(f"[+] {pkg} erfolgreich deinstalliert.")
+                if not silent:
+                    self.app.after(0, lambda: messagebox.showinfo("Uninstall",
+                                                                  f"Die App '{pkg}' wurde erfolgreich vom Gerät entfernt."))
+            else:
+                self.app.log(f"[-] Deinstallation fehlgeschlagen oder App nicht installiert.")
+
+        if silent:
+            task()  # Läuft bereits im asynchronen Thread von run_full_chain
+        else:
+            threading.Thread(target=task, daemon=True).start()
+
+    def run_full_chain(self):
+        """1-Click Workflow: Uninstall -> Build -> Flash"""
+        if self.app.check_lock(): return
+        self.view.sync_ui_to_state()
+        self._disable_build_buttons()
+
+        def task():
+            self.app.is_unpacking = True  # Lock für andere Prozesse setzen
+
+            # 1. Uninstall (falls Checkbox aktiv)
+            if self.view.var_uninstall.get():
+                self.run_uninstall(silent=True)
+
+            # 2. Build
+            self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
+            build_success = self.app.engine.run_pipeline("BUILD_NATIVE")
+
+            # 3. Flash
+            if build_success:
+                self.app.log("\n=== PIPELINE START: FLASH ===")
+                flash_success = self.app.engine.run_pipeline("FLASH")
+                if flash_success:
+                    self._copy_signed_apks_to_archive()
+                    self.app.after(0, lambda: messagebox.showinfo("Erfolg",
+                                                                  "1-Click Pipeline erfolgreich abgeschlossen!\nDie gepatchte App ist jetzt auf dem Gerät installiert und startbereit."))
+                else:
+                    self.app.after(0, lambda: messagebox.showerror("Fehler",
+                                                                   "Build war erfolgreich, aber das Installieren (Flash) via ADB ist fehlgeschlagen."))
+            else:
+                self.app.after(0, lambda: messagebox.showerror("Fehler",
+                                                               "Build fehlgeschlagen. Die Pipeline wurde abgebrochen."))
+
+            self.app.is_unpacking = False
+            self.app.after(0, self._enable_build_buttons)
+
+        threading.Thread(target=task, daemon=True).start()
+
     def run_build(self):
         if self.app.check_lock(): return
         self.view.sync_ui_to_state()
-        self.view.btn_build.config(state="disabled")
+        self._disable_build_buttons()
         self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
 
         def task():
+            self.app.is_unpacking = True
             success = self.app.engine.run_pipeline("BUILD_NATIVE")
-            self.app.after(0, lambda: self.view.btn_build.config(state="normal"))
+            self.app.is_unpacking = False
+            self.app.after(0, self._enable_build_buttons)
             if success:
                 self.app.after(0, lambda: messagebox.showinfo("Build", "BUILD_NATIVE erfolgreich abgeschlossen!"))
 
@@ -32,18 +114,17 @@ class WorkspaceController:
 
     def run_flash(self):
         if self.app.check_lock(): return
-        self.view.btn_flash.config(state="disabled")
+        self._disable_build_buttons()
         self.app.log("\n=== PIPELINE START: FLASH ===")
 
         def task():
+            self.app.is_unpacking = True
             success = self.app.engine.run_pipeline("FLASH")
-            self.app.after(0, lambda: self.view.btn_flash.config(state="normal"))
+            self.app.is_unpacking = False
+            self.app.after(0, self._enable_build_buttons)
             if success:
-                dest_dir = self.app.cfg.paths.get("DEST_DIR", "")
-                if os.path.exists(dest_dir) and hasattr(self.app, 'current_archive_path'):
-                    for f in os.listdir(dest_dir):
-                        if f.endswith("-debugSigned.apk"):
-                            shutil.copy(os.path.join(dest_dir, f), self.app.current_archive_path)
+                self._copy_signed_apks_to_archive()
+                self.app.after(0, lambda: messagebox.showinfo("Flash", "FLASH erfolgreich abgeschlossen!"))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -101,48 +182,6 @@ class WorkspaceController:
         name = simpledialog.askstring("Favorit sichern", "Gib einen Namen für diesen Favoriten ein:")
         if not name: return
 
-        base_dir = self.app.cfg.config.get("BASE_DIR", "")
-        data_dir = os.path.join(base_dir, "data")
-        os.makedirs(data_dir, exist_ok=True)
-        fav_file = os.path.join(data_dir, "favorite_patches.json")
-
-        favs = []
-        if os.path.exists(fav_file):
-            try:
-                with open(fav_file, "r", encoding="utf-8") as f:
-                    favs = json.load(f)
-            except:
-                pass
-
-        active_patches = self.view.get_all_patches()
-        if not active_patches:
-            return messagebox.showwarning("Leer", "Es gibt aktuell keine aktiven Patches zum Sichern.")
-
-        new_fav = {
-            "name": name,
-            "comment": "Gesichert am " + datetime.datetime.now().strftime('%Y-%m-%d'),
-            "date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "patches": active_patches
-        }
-
-        favs.append(new_fav)
-        with open(fav_file, "w", encoding="utf-8") as f:
-            json.dump(favs, f, indent=4)
-        messagebox.showinfo("Gesichert", f"Favorit '{name}' mit {len(active_patches)} Patches erfolgreich hinterlegt!")
-
-    def open_frida_manager(self):
-        base_dir = self.app.cfg.config.get("BASE_DIR", "")
-        fm = FridaManager(base_dir)
-
-        def on_script_changed():
-            self.app.log("[*] Aktives Frida-Skript wurde geändert.")
-
-        FridaManagerDialog(self.view, fm, on_script_changed)
-
-    def save_current_as_favorite(self):
-        name = simpledialog.askstring("Favorit sichern", "Gib einen Namen für diesen Favoriten ein:")
-        if not name: return
-
         active_patches = self.view.get_all_patches()
         if not active_patches:
             return messagebox.showwarning("Leer", "Es gibt aktuell keine aktiven Patches zum Sichern.")
@@ -157,6 +196,15 @@ class WorkspaceController:
 
         fav_service.add_favorite(new_fav)
         messagebox.showinfo("Gesichert", f"Favorit '{name}' mit {len(active_patches)} Patches erfolgreich hinterlegt!")
+
+    def open_frida_manager(self):
+        base_dir = self.app.cfg.config.get("BASE_DIR", "")
+        fm = FridaManager(base_dir)
+
+        def on_script_changed():
+            self.app.log("[*] Aktives Frida-Skript wurde geändert.")
+
+        FridaManagerDialog(self.view, fm, on_script_changed)
 
     def attach_frida(self):
         def task():

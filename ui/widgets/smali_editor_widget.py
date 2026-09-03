@@ -24,12 +24,17 @@ class SmaliEditorWidget(ttk.Frame):
         self.btn_find_cg.pack(side="left", padx=10)
         f_orig.config(labelwidget=f_orig_header)
 
-        # Scrollbar anbinden (Notwendig für Viewport-Tracking)
-        self.scroll_orig = ttk.Scrollbar(f_orig, orient="vertical")
+        # Scrollbars anbinden (Horizontal & Vertikal)
+        self.scroll_y_orig = ttk.Scrollbar(f_orig, orient="vertical")
+        self.scroll_x_orig = ttk.Scrollbar(f_orig, orient="horizontal")
         self.txt_orig = tk.Text(f_orig, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
-                                insertbackground="white", yscrollcommand=self.scroll_orig.set)
-        self.scroll_orig.config(command=self.txt_orig.yview)
-        self.scroll_orig.pack(side="right", fill="y")
+                                insertbackground="white", yscrollcommand=self.scroll_y_orig.set,
+                                xscrollcommand=self.scroll_x_orig.set)
+        self.scroll_y_orig.config(command=self.txt_orig.yview)
+        self.scroll_x_orig.config(command=self.txt_orig.xview)
+
+        self.scroll_y_orig.pack(side="right", fill="y")
+        self.scroll_x_orig.pack(side="bottom", fill="x")
         self.txt_orig.pack(fill="both", expand=True, padx=2, pady=2)
         self.txt_orig.bind("<Key>", lambda e: "break")
 
@@ -48,11 +53,16 @@ class SmaliEditorWidget(ttk.Frame):
         f_edit = ttk.LabelFrame(paned, text="Editierter Code (Dein Patch)")
         paned.add(f_edit, weight=1)
 
-        self.scroll_edit = ttk.Scrollbar(f_edit, orient="vertical")
+        self.scroll_y_edit = ttk.Scrollbar(f_edit, orient="vertical")
+        self.scroll_x_edit = ttk.Scrollbar(f_edit, orient="horizontal")
         self.txt_edit = tk.Text(f_edit, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
-                                insertbackground="white", yscrollcommand=self.scroll_edit.set)
-        self.scroll_edit.config(command=self.txt_edit.yview)
-        self.scroll_edit.pack(side="right", fill="y")
+                                insertbackground="white", yscrollcommand=self.scroll_y_edit.set,
+                                xscrollcommand=self.scroll_x_edit.set)
+        self.scroll_y_edit.config(command=self.txt_edit.yview)
+        self.scroll_x_edit.config(command=self.txt_edit.xview)
+
+        self.scroll_y_edit.pack(side="right", fill="y")
+        self.scroll_x_edit.pack(side="bottom", fill="x")
         self.txt_edit.pack(fill="both", expand=True, padx=2, pady=2)
 
     def _bind_lazy_highlighting(self):
@@ -63,11 +73,12 @@ class SmaliEditorWidget(ttk.Frame):
             for event in events:
                 txt.bind(event, lambda e, t=txt: self._debounced_highlight(t), add="+")
 
-            # Hook the scrollbar commands to trigger highlighting when dragged
             if txt == self.txt_orig:
-                self.scroll_orig.config(command=lambda *args: self._on_scroll(self.txt_orig, self.scroll_orig, *args))
+                self.scroll_y_orig.config(
+                    command=lambda *args: self._on_scroll(self.txt_orig, self.scroll_y_orig, *args))
             else:
-                self.scroll_edit.config(command=lambda *args: self._on_scroll(self.txt_edit, self.scroll_edit, *args))
+                self.scroll_y_edit.config(
+                    command=lambda *args: self._on_scroll(self.txt_edit, self.scroll_y_edit, *args))
 
     def _on_scroll(self, txt_widget, scrollbar, *args):
         txt_widget.yview(*args)
@@ -123,7 +134,6 @@ class SmaliEditorWidget(ttk.Frame):
         except tk.TclError:
             return
 
-        # Puffer von 30 Zeilen oben und unten, damit flüssig gescrollt werden kann
         top_line = max(1, int(top_idx.split('.')[0]) - 30)
         bottom_line = int(bottom_idx.split('.')[0]) + 30
 
@@ -135,7 +145,6 @@ class SmaliEditorWidget(ttk.Frame):
         for tag in ["keyword", "instruction", "register", "string", "comment", "class"]:
             text_widget.tag_remove(tag, start_idx, end_idx)
 
-        # Highlighting mit dynamischem Viewport-Offset
         for match in re.finditer(r'(".*?")', content):
             text_widget.tag_add("string", f"{start_idx} + {match.start(1)} chars",
                                 f"{start_idx} + {match.end(1)} chars")

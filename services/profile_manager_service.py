@@ -18,7 +18,9 @@ class ProfileManagerService:
             ],
             "logcats": [
                 "logcat | grep -iE '{APP_NAME}|fatal|crash|debug|linker|frida|console'",
-                "logcat --pid=$(pidof {APP_PACKAGE})",
+                "logcat --pid={PID}",
+                "logcat --pid={PID} | grep -iE 'frida|ssl|crypto|keystore|network|http|intercept'",
+                "logcat --pid={PID} | grep -iE 'fatal|crash|exception|error'",
                 "logcat *:E",
                 "logcat"
             ]

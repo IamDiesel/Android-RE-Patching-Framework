@@ -8,7 +8,7 @@
     "TRUSTMEALREADY_APK": "tools\\TrustMeAlready.apk",
     "MANIFEST_STRATEGY": "aapt2",
     "NATIVE_LIB_STRATEGY": "zipalign",
-    "INJECT_FRIDA": true,
+    "INJECT_FRIDA": false,
     "INJECT_LSPATCH": false,
     "PIPELINES": {
         "PREPARE_WORKSPACE": [

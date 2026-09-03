@@ -130,7 +130,7 @@ class SmartPatchStep(PipelineStep):
                 engine_context.log(f"[!] Originaldatei nicht in Source gefunden: {actual_rel_file}")
                 return False
 
-            if os.path.exists(src_file):
+            if not os.path.exists(dst_file):
                 os.makedirs(os.path.dirname(dst_file), exist_ok=True)
                 shutil.copy2(src_file, dst_file)
 

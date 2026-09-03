@@ -10,16 +10,42 @@ from services.frida_service import FridaManager
 
 class FridaInjectStep(PipelineStep):
     def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
+        folder_name = engine_context.get_unpacked_dir_name()
+        lib_dir_base = os.path.join(engine_context.cfg.paths["DEST_DIR"], folder_name, "lib")
+
+        # --- NEU: Intelligentes Aufräumen, wenn der Haken deaktiviert ist ---
         if not engine_context.cfg.config.get("INJECT_FRIDA", False):
-            engine_context.log("[*] Frida Injection deaktiviert. Überspringe...")
+            engine_context.log("[*] Frida Injection deaktiviert. Prüfe auf alte Artefakte...")
+            cleaned = False
+
+            # Gehe durch alle Architektur-Ordner im entpackten Workspace und lösche Frida-Dateien
+            if os.path.exists(lib_dir_base):
+                for arch in os.listdir(lib_dir_base):
+                    arch_path = os.path.join(lib_dir_base, arch)
+                    if os.path.isdir(arch_path):
+                        for f in ["libfrida-gadget.so", "libfrida-gadget.config.so", "libfrida-gadget.script.so",
+                                  "libfrida-script.so"]:
+                            f_path = os.path.join(arch_path, f)
+                            if os.path.exists(f_path):
+                                try:
+                                    os.remove(f_path)
+                                    cleaned = True
+                                except Exception:
+                                    pass
+
+            if cleaned:
+                engine_context.log("[-] Alte Frida-Dateien wurden restlos aus dem Build-Ordner entfernt.")
+            else:
+                engine_context.log("[*] Build-Ordner ist bereits sauber. Überspringe...")
+
             return True
 
+        # --- Reguläre Frida Injection (Wenn Haken aktiv) ---
         engine_context.log("[*] Bereite Frida Injection (v17+ via frida-compile) vor...")
 
         try:
             import tempfile
-            folder_name = engine_context.get_unpacked_dir_name()
-            lib_dir = os.path.join(engine_context.cfg.paths["DEST_DIR"], folder_name, "lib", "arm64-v8a")
+            lib_dir = os.path.join(lib_dir_base, "arm64-v8a")
             os.makedirs(lib_dir, exist_ok=True)
 
             gadget_src = os.path.join(engine_context.cfg.config.get("BASE_DIR", ""), "tools", "libfrida-gadget.so")
