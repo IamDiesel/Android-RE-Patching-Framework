@@ -72,7 +72,7 @@ def run_build_cmd(cmd_template: str, engine_context: Any) -> bool:
         return process.returncode == 0
 
 
-def inject_nsc(engine_context: Any) -> bool:
+def apply_manifest_patches(engine_context: Any) -> bool:
     folder_name = engine_context.get_unpacked_dir_name()
     dest_dir = os.path.join(engine_context.cfg.paths["DEST_DIR"], folder_name)
     manifest_path = os.path.join(dest_dir, "AndroidManifest.xml")
@@ -80,18 +80,6 @@ def inject_nsc(engine_context: Any) -> bool:
     if not os.path.exists(manifest_path):
         engine_context.log("[!] AndroidManifest.xml nicht gefunden. Überspringe Manifest-Patches.")
         return False
-
-    engine_context.log("[*] Injiziere Network Security Config für Mitmproxy (User-Certs)...")
-
-    nsc_content = '''<?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
-    <base-config cleartextTrafficPermitted="true">
-        <trust-anchors>
-            <certificates src="system" />
-            <certificates src="user" />
-        </trust-anchors>
-    </base-config>
-</network-security-config>'''
 
     try:
         with open(manifest_path, "r", encoding="utf-8") as f:
@@ -101,39 +89,64 @@ def inject_nsc(engine_context: Any) -> bool:
         engine_context.log("[!] Manifest-Patches übersprungen. Bitte entpacke die App neu (ohne '-r' Flag).")
         return True
 
-    match = re.search(r'android:networkSecurityConfig="@xml/([^"]+)"', manifest_data)
-    strategy_name = engine_context.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
-    xml_dir = None
-
-    if strategy_name == "apkeditor":
-        res_root = os.path.join(dest_dir, "resources")
-        for root, dirs, files in os.walk(res_root):
-            if os.path.basename(root) == "xml" and os.path.basename(os.path.dirname(root)) == "res":
-                xml_dir = root
-                break
-        if not xml_dir:
-            xml_dir = os.path.join(res_root, "package_1", "res", "xml")
-    else:
-        xml_dir = os.path.join(dest_dir, "res", "xml")
-
-    os.makedirs(xml_dir, exist_ok=True)
     manifest_changed = False
+    strategy_name = engine_context.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
 
-    if match:
-        existing_nsc_name = match.group(1)
-        existing_nsc_path = os.path.join(xml_dir, f"{existing_nsc_name}.xml")
-        with open(existing_nsc_path, "w", encoding="utf-8") as f:
-            f.write(nsc_content)
-        engine_context.log(f"[+] Existierende NSC '{existing_nsc_name}.xml' mit User-Cert-Trust überschrieben!")
-    else:
-        nsc_path = os.path.join(xml_dir, "kippy_nsc.xml")
-        with open(nsc_path, "w", encoding="utf-8") as f:
-            f.write(nsc_content)
-        manifest_data = manifest_data.replace("<application ",
-                                              '<application android:networkSecurityConfig="@xml/kippy_nsc" ')
-        engine_context.log("[+] Manifest erfolgreich gepatcht (kippy_nsc hinzugefügt)!")
-        manifest_changed = True
+    # --- 1. NSC Patch (Mitmproxy) ---
+    if engine_context.cfg.config.get("INJECT_NSC", True):
+        engine_context.log("[*] Injiziere Network Security Config für Mitmproxy (User-Certs)...")
+        nsc_content = '''<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>'''
 
+        match = re.search(r'android:networkSecurityConfig="@xml/([^"]+)"', manifest_data)
+        xml_dir = None
+
+        if strategy_name == "apkeditor":
+            res_root = os.path.join(dest_dir, "resources")
+            for root, dirs, files in os.walk(res_root):
+                if os.path.basename(root) == "xml" and os.path.basename(os.path.dirname(root)) == "res":
+                    xml_dir = root
+                    break
+            if not xml_dir:
+                xml_dir = os.path.join(res_root, "package_1", "res", "xml")
+        else:
+            xml_dir = os.path.join(dest_dir, "res", "xml")
+
+        os.makedirs(xml_dir, exist_ok=True)
+
+        if match:
+            existing_nsc_name = match.group(1)
+            existing_nsc_path = os.path.join(xml_dir, f"{existing_nsc_name}.xml")
+            with open(existing_nsc_path, "w", encoding="utf-8") as f:
+                f.write(nsc_content)
+            engine_context.log(f"[+] Existierende NSC '{existing_nsc_name}.xml' mit User-Cert-Trust überschrieben!")
+        else:
+            nsc_path = os.path.join(xml_dir, "kippy_nsc.xml")
+            with open(nsc_path, "w", encoding="utf-8") as f:
+                f.write(nsc_content)
+            manifest_data = manifest_data.replace("<application ", '<application android:networkSecurityConfig="@xml/kippy_nsc" ')
+            engine_context.log("[+] Manifest erfolgreich gepatcht (kippy_nsc hinzugefügt)!")
+            manifest_changed = True
+
+    # --- 2. Debuggable Patch ---
+    if engine_context.cfg.config.get("INJECT_DEBUGGABLE", False):
+        if 'android:debuggable="false"' in manifest_data:
+            manifest_data = manifest_data.replace('android:debuggable="false"', 'android:debuggable="true"')
+            engine_context.log("[+] Manifest-Hack angewendet: android:debuggable='true' (überschrieben).")
+            manifest_changed = True
+        elif 'android:debuggable="true"' not in manifest_data:
+            manifest_data = manifest_data.replace("<application ", '<application android:debuggable="true" ')
+            engine_context.log("[+] Manifest-Hack angewendet: android:debuggable='true' (hinzugefügt).")
+            manifest_changed = True
+
+    # --- 3. AAPT2 Fixes (Split) ---
     if strategy_name == "aapt2":
         app_source_dir = engine_context.cfg.paths.get("APP_SOURCE_DIR", "")
         has_merged_base = os.path.exists(os.path.join(app_source_dir, "merged_base.apk"))
@@ -152,11 +165,11 @@ def inject_nsc(engine_context: Any) -> bool:
                 engine_context.log("[+] Split-Zwang für AAPT2-Universal-Build aus Manifest entfernt!")
                 manifest_changed = True
 
+    # --- 4. ExtractNativeLibs Patch ---
     native_strategy = engine_context.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign")
     if native_strategy == "extractNativeLibs":
         if 'android:extractNativeLibs="false"' in manifest_data:
-            manifest_data = manifest_data.replace('android:extractNativeLibs="false"',
-                                                  'android:extractNativeLibs="true"')
+            manifest_data = manifest_data.replace('android:extractNativeLibs="false"', 'android:extractNativeLibs="true"')
             engine_context.log("[+] Manifest-Hack angewendet: extractNativeLibs='true' (Crash-Prevention).")
             manifest_changed = True
         elif 'android:extractNativeLibs="true"' not in manifest_data:
@@ -205,7 +218,7 @@ class Aapt2Strategy(ManifestBuildStrategy):
         return True
 
     def patch_manifest(self, engine_context: Any) -> bool:
-        return inject_nsc(engine_context)
+        return apply_manifest_patches(engine_context)
 
     def build(self, engine_context: Any) -> bool:
         engine_context.log("[*] Baue App streng mit AAPT2...")
@@ -219,7 +232,7 @@ class ApkEditorStrategy(ManifestBuildStrategy):
         return True
 
     def patch_manifest(self, engine_context: Any) -> bool:
-        return inject_nsc(engine_context)
+        return apply_manifest_patches(engine_context)
 
     def build(self, engine_context: Any) -> bool:
         engine_context.log("[*] Baue App mit APKEditor (ohne AAPT2)...")

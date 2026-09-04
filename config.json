@@ -141,5 +141,6 @@
                 "type": "trace_stop"
             }
         ]
-    }
+    },
+    "INJECT_DEBUGGABLE": true
 }

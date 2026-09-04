@@ -285,6 +285,20 @@ class WorkspaceTab(ttk.Frame):
         self.combo_strat.bind("<<ComboboxSelected>>",
                               lambda e: self.controller.change_manifest_strategy(self.combo_strat.get()))
 
+        # --- NEU: Manifest Optionen (NSC & Debuggable) ---
+        f_manifest = ttk.Frame(f_actions)
+        f_manifest.pack(fill="x", padx=10, pady=2)
+
+        self.var_nsc = tk.BooleanVar(value=self.app.cfg.config.get("INJECT_NSC", True))
+        chk_nsc = ttk.Checkbutton(f_manifest, text="MITM Cert (NSC)", variable=self.var_nsc,
+                                  command=lambda: self.controller.toggle_nsc(self.var_nsc.get()))
+        chk_nsc.pack(side="left", padx=2)
+
+        self.var_debuggable = tk.BooleanVar(value=self.app.cfg.config.get("INJECT_DEBUGGABLE", False))
+        chk_debuggable = ttk.Checkbutton(f_manifest, text="Debuggable Flag", variable=self.var_debuggable,
+                                         command=lambda: self.controller.toggle_debuggable(self.var_debuggable.get()))
+        chk_debuggable.pack(side="left", padx=10)
+
         f_native = ttk.Frame(f_actions)
         f_native.pack(fill="x", padx=10, pady=2)
         ttk.Label(f_native, text="Memory Alignment:").pack(side="left", padx=2)
@@ -313,7 +327,6 @@ class WorkspaceTab(ttk.Frame):
 
         ttk.Separator(f_actions, orient="horizontal").pack(fill="x", pady=5)
 
-        # --- NEU: Deinstallations- und Kombi-Buttons ---
         f_combo_build = ttk.Frame(f_actions)
         f_combo_build.pack(fill="x", padx=10, pady=2)
 

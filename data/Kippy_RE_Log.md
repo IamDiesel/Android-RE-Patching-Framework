@@ -2718,3 +2718,181 @@ smali_classes3\com\app\MainActivity.smali	.method public attachBaseContext(Landr
 smali\com\facebook\react\ReactActivity.smali	.method public attachBaseContext(Landroid/content/Context;)V...
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260903-202546)
+* **App:** org.nativescript.LibreLinkUp (v1.0.0)
+* **Name:** org.nativescript.LibreLinkUp
+* **Testergebnis:** WORKING
+
+  * **Smali Patch 1** in Datei: `smali/com/app/SecureDataStoreModule.smali`
+  ```smali
+.method private final decryptKeysetWithKeystore([BLjavax/crypto/SecretKey;)[B
+    .locals 4
+
+    # --- BEGINN DER ORIGINALEN METHODE (Stark gekürzt auf die Kern-Logik) ---
+    array-length v0, p1
+    const/4 v1, 0x3
+    if-lt v0, v1, :cond_fail
+
+    const/4 v0, 0x0
+    aget-byte v0, p1, v0
+    const/4 v1, 0x1
+    if-ne v0, v1, :cond_fail
+
+    aget-byte v0, p1, v1
+    and-int/lit16 v0, v0, 0xff
+    if-lez v0, :cond_fail
+
+    const/4 v1, 0x2
+    add-int/2addr v0, v1
+
+    array-length v2, p1
+    if-le v2, v0, :cond_fail
+
+    invoke-static {p1, v1, v0}, Lkotlin/collections/ArraysKt;->copyOfRange([BII)[B
+    move-result-object v1
+
+    array-length v2, p1
+    invoke-static {p1, v0, v2}, Lkotlin/collections/ArraysKt;->copyOfRange([BII)[B
+    move-result-object p1
+
+    const-string v0, "AES/GCM/NoPadding"
+    invoke-static {v0}, Ljavax/crypto/Cipher;->getInstance(Ljava/lang/String;)Ljavax/crypto/Cipher;
+    move-result-object v0
+
+    new-instance v2, Ljavax/crypto/spec/GCMParameterSpec;
+    const/16 v3, 0x80
+    invoke-direct {v2, v3, v1}, Ljavax/crypto/spec/GCMParameterSpec;-><init>(I[B)V
+
+    check-cast p2, Ljava/security/Key;
+    check-cast v2, Ljava/security/spec/AlgorithmParameterSpec;
+    const/4 v1, 0x2
+    invoke-virtual {v0, v1, p2, v2}, Ljavax/crypto/Cipher;->init(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V
+
+    sget-object p2, Ljava/nio/charset/StandardCharsets;->UTF_8:Ljava/nio/charset/Charset;
+    const-string v1, "org.newyu.librelinkup.secure-datastore:tink-keyset:v1"
+    invoke-virtual {v1, p2}, Ljava/lang/String;->getBytes(Ljava/nio/charset/Charset;)[B
+    move-result-object p2
+
+    invoke-virtual {v0, p2}, Ljavax/crypto/Cipher;->updateAAD([B)V
+
+    invoke-virtual {v0, p1}, Ljavax/crypto/Cipher;->doFinal([B)[B
+    move-result-object p0
+
+    # --- ENDE ORIGINALCODE ---
+
+    # ========================================================
+    # 🎯 GHOST PROTOCOL: SMALI LOGGER INJECTION
+    # Verwandelt das entschlüsselte Byte-Array in einen String 
+    # und wirft es brutal in den System-Logcat.
+    # ========================================================
+    
+    # ========================================================
+    # 🎯 GHOST PROTOCOL v2: BASE64 LOGGER INJECTION
+    # ========================================================
+    
+    # 1. Byte-Array (p0) sauber in Base64 encodieren (2 = Base64.NO_WRAP)
+    const/4 v1, 0x2
+    invoke-static {p0, v1}, Landroid/util/Base64;->encodeToString([BI)Ljava/lang/String;
+    move-result-object v1
+    
+    # 2. Präfix für das Logcat bauen
+    const-string v2, "============================================\n\n[🔓 GHOST-LOGGER] BASE64 KEYSET:\n\n"
+    
+    # 3. String zusammenbauen
+    new-instance v3, Ljava/lang/StringBuilder;
+    invoke-direct {v3}, Ljava/lang/StringBuilder;-><init>()V
+    invoke-virtual {v3, v2}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v3, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string v1, "\n\n============================================"
+    invoke-virtual {v3, v1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {v3}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v1
+    
+    # 4. In Logcat schreiben
+    const-string v2, "GHOST"
+    invoke-static {v2, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+
+    # Original-Return ausführen
+    return-object p0
+
+    :cond_fail
+    const/4 p0, 0x0
+    return-object p0
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali\com\app\MainApplication.smali`
+  ```smali
+.method public attachBaseContext(Landroid/content/Context;)V
+    .locals 0
+    invoke-super {p0, p1}, Landroid/app/Application;->attachBaseContext(Landroid/content/Context;)V
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 3** in Datei: `smali\com\facebook\react\ReactActivity.smali`
+  ```smali
+.method public onStart()V
+    .locals 0
+    invoke-super {p0}, Landroidx/appcompat/app/AppCompatActivity;->onStart()V
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 4** in Datei: `smali_classes3\com\app\MainActivity.smali`
+  ```smali
+.method public attachBaseContext(Landroid/content/Context;)V
+    .locals 0
+
+    # Den legitimen Android/React Native Lifecycle erhalten, den RASP aber löschen
+    invoke-super {p0, p1}, Lcom/facebook/react/ReactActivity;->attachBaseContext(Landroid/content/Context;)V
+
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 5** in Datei: `smali\com\facebook\react\ReactActivity.smali`
+  ```smali
+.method public attachBaseContext(Landroid/content/Context;)V
+    .locals 0
+    invoke-super {p0, p1}, Landroidx/appcompat/app/AppCompatActivity;->attachBaseContext(Landroid/content/Context;)V
+    return-void
+.end method
+  ```
+
+**Beobachtung:**
+LibreLinkUp: Success Extracted Google Tink Masterkey AES-256-GCM
+
+09-03 23:26:41.142  1242  1242 I adbd    : adbd service requested 'shell,v2,raw:logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|linker|frida|console|GHOST''
+09-03 23:26:57.541  1242  1242 I adbd    : adbd service requested 'shell,v2,raw:logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|linker|frida|console|GHOST''
+09-03 23:26:59.234 24715 24757 D GHOST   : ============================================
+09-03 23:26:59.234 24715 24757 D GHOST   : 
+09-03 23:26:59.234 24715 24757 D GHOST   : [ðŸ”“ GHOST-LOGGER] KLARTEXT GEFANGEN:
+09-03 23:26:59.234 24715 24757 D GHOST   : 
+09-03 23:26:59.234 24715 24757 D GHOST   : ï¿½ï¿½ï¿½ï¿½d
+09-03 23:26:59.234 24715 24757 D GHOST   : X
+09-03 23:26:59.234 24715 24757 D GHOST   : 0type.googleapis.com/google.crypto.tink.AesGcmKey" G9ï¿½ï¿½ï¿½ï¿½uï¿½+ï¿½ï¿½ï¿½hï¿½ï¿½Ã“@ï¿½5]ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ 
+09-03 23:26:59.234 24715 24757 D GHOST   : 
+09-03 23:26:59.234 24715 24757 D GHOST   : ============================================
+
+5 Patches, No Frida, aapt2, zipalign, App needs to be restarted after first try (crash)
+smali/com/app/SecureDataStoreModule.smali	.method private final decryptKeysetWithKeystore([BLjavax/cry...
+smali\com\app\MainApplication.smali	.method public attachBaseContext(Landroid/content/Context;)V...
+smali\com\facebook\react\ReactActivity.smali	.method public onStart()V     .locals 0     invoke-super {p0...
+smali_classes3\com\app\MainActivity.smali	.method public attachBaseContext(Landroid/content/Context;)V...
+smali\com\facebook\react\ReactActivity.smali	.method public attachBaseContext(Landroid/content/Context;)V...
+
+09-04 00:06:05.604  1242  1242 I adbd    : adbd service requested 'shell,v2,raw:logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|linker|frida|console|GHOST''
+09-04 00:06:15.784  1242  1242 I adbd    : adbd service requested 'shell,v2,raw:logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|linker|frida|console|GHOST''
+09-04 00:06:05.604  1242  1242 I adbd    : adbd service requested 'shell,v2,raw:logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|linker|frida|console|GHOST''
+09-04 00:06:15.784  1242  1242 I adbd    : adbd service requested 'shell,v2,raw:logcat | grep -iE 'LibreLinkUp|fatal|crash|debug|linker|frida|console|GHOST''
+09-04 00:06:17.098 31522 31609 D GHOST   : ============================================
+09-04 00:06:17.098 31522 31609 D GHOST   : 
+09-04 00:06:17.098 31522 31609 D GHOST   : [ðŸ”“ GHOST-LOGGER] BASE64 KEYSET:
+09-04 00:06:17.098 31522 31609 D GHOST   : 
+09-04 00:06:17.098 31522 31609 D GHOST   : COeC6IwOEmQKWAowdHlwZS5nb29nbGVhcGlzLmNvbS9nb29nbGUuY3J5cHRvLnRpbmsuQWVzR2NtS2V5EiIaIA8EWqkFGoOTtiIMn9ZHIvhZ0D5WJbABbmNOtNjGnQ9rGAEQARjnguiMDiAB
+09-04 00:06:17.098 31522 31609 D GHOST   : 
+09-04 00:06:17.098 31522 31609 D GHOST   : ============================================
+
+---

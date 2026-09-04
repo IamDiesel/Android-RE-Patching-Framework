@@ -35,8 +35,6 @@ class WorkspaceController:
                     shutil.copy(os.path.join(dest_dir, f), self.app.current_archive_path)
 
     def run_uninstall(self, silent=False):
-        """Führt ADB Uninstall aus. Kann manuell über den Button oder silent in der Pipeline aufgerufen werden."""
-
         def task():
             if not silent and self.app.check_lock(): return
             pkg = self.app.cfg.config.get("APP_PACKAGE", "")
@@ -55,28 +53,24 @@ class WorkspaceController:
                 self.app.log(f"[-] Deinstallation fehlgeschlagen oder App nicht installiert.")
 
         if silent:
-            task()  # Läuft bereits im asynchronen Thread von run_full_chain
+            task()
         else:
             threading.Thread(target=task, daemon=True).start()
 
     def run_full_chain(self):
-        """1-Click Workflow: Uninstall -> Build -> Flash"""
         if self.app.check_lock(): return
         self.view.sync_ui_to_state()
         self._disable_build_buttons()
 
         def task():
-            self.app.is_unpacking = True  # Lock für andere Prozesse setzen
+            self.app.is_unpacking = True
 
-            # 1. Uninstall (falls Checkbox aktiv)
             if self.view.var_uninstall.get():
                 self.run_uninstall(silent=True)
 
-            # 2. Build
             self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
             build_success = self.app.engine.run_pipeline("BUILD_NATIVE")
 
-            # 3. Flash
             if build_success:
                 self.app.log("\n=== PIPELINE START: FLASH ===")
                 flash_success = self.app.engine.run_pipeline("FLASH")
@@ -223,6 +217,18 @@ class WorkspaceController:
         self.app.cfg.save()
         status = "aktiviert" if state else "deaktiviert"
         self.app.log(f"[*] LSPatch-Injection für nächsten Build {status}.")
+
+    def toggle_nsc(self, state: bool):
+        self.app.cfg.config["INJECT_NSC"] = state
+        self.app.cfg.save()
+        status = "aktiviert" if state else "deaktiviert"
+        self.app.log(f"[*] MITM Cert Injection (NSC) für nächsten Build {status}.")
+
+    def toggle_debuggable(self, state: bool):
+        self.app.cfg.config["INJECT_DEBUGGABLE"] = state
+        self.app.cfg.save()
+        status = "aktiviert" if state else "deaktiviert"
+        self.app.log(f"[*] Debuggable-Flag für nächsten Build {status}.")
 
     def change_manifest_strategy(self, strategy: str):
         self.app.cfg.config["MANIFEST_STRATEGY"] = strategy

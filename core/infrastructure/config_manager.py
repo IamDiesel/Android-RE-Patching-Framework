@@ -15,6 +15,8 @@ DEFAULT_CONFIG = {
     "NATIVE_LIB_STRATEGY": "zipalign",
     "INJECT_FRIDA": False,
     "INJECT_LSPATCH": False,
+    "INJECT_NSC": True,           # NEU: Steuert das MITM Zertifikat
+    "INJECT_DEBUGGABLE": False,   # NEU: Steuert das Debuggable Flag
     "PIPELINES": {
         "PREPARE_WORKSPACE": [
             {"name": "Merge Split APKs", "type": "merge_splits"},
@@ -63,7 +65,6 @@ DEFAULT_CONFIG = {
         ],
         "TRACE_START": [
             {"name": "Clear Logcat", "type": "cmd", "cmd": "adb logcat -c", "cwd": "{BASE_DIR}"},
-            # Aktualisierter Filter unterstützt den neuen Tag 'CryptoAudit'
             {"name": "Start Logcat", "type": "trace_start", "cmd": "adb logcat --pid={PID} | grep -iE 'fatal|crash|debug|linker|frida|console|CryptoAudit'", "cwd": "{BASE_DIR}"}
         ],
         "TRACE_STOP": [
