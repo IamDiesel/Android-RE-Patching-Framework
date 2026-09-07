@@ -8,7 +8,7 @@
     "TRUSTMEALREADY_APK": "tools\\TrustMeAlready.apk",
     "MANIFEST_STRATEGY": "aapt2",
     "NATIVE_LIB_STRATEGY": "zipalign",
-    "INJECT_FRIDA": false,
+    "INJECT_FRIDA": true,
     "INJECT_LSPATCH": false,
     "PIPELINES": {
         "PREPARE_WORKSPACE": [
@@ -142,5 +142,12 @@
             }
         ]
     },
-    "INJECT_DEBUGGABLE": true
+    "INJECT_DEBUGGABLE": true,
+    "FRIDA_SETTINGS": {
+        "mode": "script",
+        "host": "127.0.0.1",
+        "port": 27042,
+        "script_directory_path": "/data/data/{APP_PACKAGE}/files/frida_scripts",
+        "active_script_id": null
+    }
 }

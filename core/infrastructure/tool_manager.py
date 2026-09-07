@@ -9,7 +9,6 @@ from core.application.event_bus import EventBus
 class ToolManager:
     """Lädt externe Abhängigkeiten herunter und injiziert sie in den System-PATH."""
 
-    # Feste Download-Links für die essentiellen Java/Android Tools
     TOOLS_JARS = {
         "uber-apk-signer.jar": "https://github.com/patrickfav/uber-apk-signer/releases/download/v1.3.0/uber-apk-signer-1.3.0.jar",
         "APKEditor.jar": "https://github.com/REAndroid/APKEditor/releases/download/V1.4.2/APKEditor-1.4.2.jar",
@@ -17,18 +16,16 @@ class ToolManager:
         "TrustMeAlready.apk": "https://github.com/ViRb3/TrustMeAlready/releases/download/v1.11/TrustMeAlready-v1.11-release.apk"
     }
 
-    # Der feste Link für Frida 17.17.0
     FRIDA_URL = "https://github.com/frida/frida/releases/download/17.17.0/frida-gadget-17.17.0-android-arm64.so.xz"
 
-    # Spezifisch für Windows
     WIN_APKTOOL_JAR = "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.9.3.jar"
     WIN_APKTOOL_BAT = "https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/windows/apktool.bat"
     WIN_PLATFORM_TOOLS = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
     WIN_BUILD_TOOLS = "https://dl.google.com/android/repository/build-tools_r34-windows.zip"
+    WIN_NODE_JS = "https://nodejs.org/dist/v20.11.1/node-v20.11.1-win-x64.zip"
 
     @classmethod
     def _download_file(cls, url: str, target_path: str) -> None:
-        """Lädt eine Datei mit einem sicheren User-Agent herunter, um 403-Fehler von GitHub zu vermeiden."""
         req = urllib.request.Request(url, headers={'User-Agent': 'Kippy-RE-Framework-Downloader'})
         with urllib.request.urlopen(req) as response, open(target_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
@@ -39,7 +36,6 @@ class ToolManager:
         os.makedirs(tools_dir, exist_ok=True)
         is_win = os.name == 'nt'
 
-        # 1. JARs und APKs laden
         for tool_name, url in cls.TOOLS_JARS.items():
             target_path = os.path.join(tools_dir, tool_name)
             if not os.path.exists(target_path):
@@ -50,7 +46,6 @@ class ToolManager:
                 except Exception as e:
                     EventBus.publish("LOG_INFO", f"[!] Download fehlgeschlagen für {tool_name}: {e}")
 
-        # 2. Frida-Gadget laden und in den RAM dekomprimieren
         frida_target = os.path.join(tools_dir, "libfrida-gadget.so")
         if not os.path.exists(frida_target):
             EventBus.publish("LOG_INFO", "[*] Lade Frida 17.17.0 Gadget herunter...")
@@ -64,67 +59,75 @@ class ToolManager:
             except Exception as e:
                 EventBus.publish("LOG_INFO", f"[!] Fehler bei Frida-Download: {e}")
 
-        # 3. Windows-Spezifische Binaries laden (Apktool, ADB, Zipalign)
         if is_win:
             cls._setup_windows_binaries(tools_dir)
+            cls._setup_node_js(tools_dir)
         else:
-            EventBus.publish("LOG_INFO",
-                             "[*] Nicht-Windows-System. Bitte installiere adb, apktool und zipalign manuell (z.B. apt/brew).")
+            EventBus.publish("LOG_INFO", "[*] Nicht-Windows-System. Bitte installiere adb, apktool, zipalign und node.js manuell.")
 
-        # 4. PATH Injection (Sehr wichtig, damit Python Subprozesse die Tools direkt finden!)
         cls._inject_into_path(tools_dir, is_win)
-
         cls._create_manual_instructions(tools_dir)
         EventBus.publish("LOG_INFO", "[+] Auto-Setup abgeschlossen. Alle Tool-Abhängigkeiten sind bereit.")
 
     @classmethod
     def _setup_windows_binaries(cls, tools_dir: str):
-        # Apktool (braucht BAT und JAR)
         apktool_bat = os.path.join(tools_dir, "apktool.bat")
         apktool_jar = os.path.join(tools_dir, "apktool.jar")
         if not os.path.exists(apktool_bat) or not os.path.exists(apktool_jar):
-            EventBus.publish("LOG_INFO", "[*] Lade Windows Apktool herunter...")
             try:
                 cls._download_file(cls.WIN_APKTOOL_BAT, apktool_bat)
                 cls._download_file(cls.WIN_APKTOOL_JAR, apktool_jar)
-            except Exception as e:
-                EventBus.publish("LOG_INFO", f"[!] Fehler bei Apktool: {e}")
+            except Exception: pass
 
-        # Platform-Tools (ADB)
         pt_dir = os.path.join(tools_dir, "platform-tools")
         if not os.path.exists(pt_dir) or not os.path.exists(os.path.join(pt_dir, "adb.exe")):
-            EventBus.publish("LOG_INFO", "[*] Lade Android Platform-Tools (ADB) herunter...")
             zip_path = os.path.join(tools_dir, "pt.zip")
             try:
                 cls._download_file(cls.WIN_PLATFORM_TOOLS, zip_path)
-                with zipfile.ZipFile(zip_path, 'r') as z:
-                    z.extractall(tools_dir)
+                with zipfile.ZipFile(zip_path, 'r') as z: z.extractall(tools_dir)
                 os.remove(zip_path)
-            except Exception as e:
-                EventBus.publish("LOG_INFO", f"[!] Fehler bei Platform-Tools: {e}")
+            except Exception: pass
 
-        # Build-Tools (Zipalign, AAPT2)
         bt_dir = os.path.join(tools_dir, "android-14")
         if not os.path.exists(bt_dir) or not os.path.exists(os.path.join(bt_dir, "zipalign.exe")):
-            EventBus.publish("LOG_INFO", "[*] Lade Android Build-Tools (Zipalign/AAPT2) herunter...")
             zip_path = os.path.join(tools_dir, "bt.zip")
             try:
                 cls._download_file(cls.WIN_BUILD_TOOLS, zip_path)
+                with zipfile.ZipFile(zip_path, 'r') as z: z.extractall(tools_dir)
+                os.remove(zip_path)
+            except Exception: pass
+
+    @classmethod
+    def _setup_node_js(cls, tools_dir: str):
+        # Prüfen, ob node.js bereits im globalen System existiert
+        if shutil.which("node") is not None:
+            return
+
+        node_dir = os.path.join(tools_dir, "node-v20.11.1-win-x64")
+        node_exe = os.path.join(node_dir, "node.exe")
+
+        if not os.path.exists(node_exe):
+            EventBus.publish("LOG_INFO", "[*] Lade portable Node.js Umgebung herunter (für frida-compile)...")
+            zip_path = os.path.join(tools_dir, "node.zip")
+            try:
+                cls._download_file(cls.WIN_NODE_JS, zip_path)
                 with zipfile.ZipFile(zip_path, 'r') as z:
                     z.extractall(tools_dir)
                 os.remove(zip_path)
+                EventBus.publish("LOG_INFO", "[+] Node.js erfolgreich eingerichtet!")
             except Exception as e:
-                EventBus.publish("LOG_INFO", f"[!] Fehler bei Build-Tools: {e}")
+                EventBus.publish("LOG_INFO", f"[!] Fehler bei Node.js Download: {e}")
 
     @classmethod
     def _inject_into_path(cls, tools_dir: str, is_win: bool):
-        """Fügt die heruntergeladenen Ordner dem PATH hinzu, sodass cmds wie 'adb' direkt funktionieren."""
         paths_to_add = [os.path.abspath(tools_dir)]
         if is_win:
             pt_dir = os.path.join(tools_dir, "platform-tools")
             bt_dir = os.path.join(tools_dir, "android-14")
+            node_dir = os.path.join(tools_dir, "node-v20.11.1-win-x64") # NEU
             if os.path.exists(pt_dir): paths_to_add.append(os.path.abspath(pt_dir))
             if os.path.exists(bt_dir): paths_to_add.append(os.path.abspath(bt_dir))
+            if os.path.exists(node_dir): paths_to_add.append(os.path.abspath(node_dir)) # NEU
 
         current_path = os.environ.get("PATH", "")
         new_path_elements = [p for p in paths_to_add if p not in current_path.split(os.pathsep)]
@@ -143,10 +146,11 @@ class ToolManager:
                 "3. uber-apk-signer.jar\n"
                 "4. lspatch.jar\n"
                 "5. TrustMeAlready.apk\n\n"
-                "Für Windows (Ohne globale Android Studio Installation):\n"
+                "Für Windows:\n"
                 "- apktool.jar und apktool.bat direkt in diesen Ordner\n"
-                "- Den Google 'platform-tools' Ordner hier entpacken (sodass adb.exe unter tools/platform-tools/adb.exe liegt)\n"
-                "- Den Google 'build-tools' Ordner hier als 'android-14' entpacken (sodass zipalign.exe unter tools/android-14/zipalign.exe liegt)\n"
+                "- platform-tools hier entpacken\n"
+                "- build-tools als 'android-14' entpacken\n"
+                "- Node.js portable (ZIP) als 'node-vX.Y.Z-win-x64' entpacken\n"
             )
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(content)

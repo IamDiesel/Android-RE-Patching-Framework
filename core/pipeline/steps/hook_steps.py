@@ -6,6 +6,8 @@ from typing import Dict, Any
 from core.pipeline.step_interface import PipelineStep
 from core.infrastructure.command_runner import CommandRunner
 from services.frida_service import FridaManager
+from services.frida_compiler_service import FridaCompilerService
+from core.domain.frida_models import FridaConfig
 
 
 class FridaInjectStep(PipelineStep):
@@ -13,18 +15,23 @@ class FridaInjectStep(PipelineStep):
         folder_name = engine_context.get_unpacked_dir_name()
         lib_dir_base = os.path.join(engine_context.cfg.paths["DEST_DIR"], folder_name, "lib")
 
-        # --- NEU: Intelligentes Aufräumen, wenn der Haken deaktiviert ist ---
+        # --- Tarnnamen definieren ---
+        gadget_name = "libmetrics.so"
+        config_name = "libmetrics.config.so"
+        script_name = "libmetrics.script.so"
+
+        # --- Intelligentes Aufräumen ---
         if not engine_context.cfg.config.get("INJECT_FRIDA", False):
             engine_context.log("[*] Frida Injection deaktiviert. Prüfe auf alte Artefakte...")
             cleaned = False
 
-            # Gehe durch alle Architektur-Ordner im entpackten Workspace und lösche Frida-Dateien
             if os.path.exists(lib_dir_base):
                 for arch in os.listdir(lib_dir_base):
                     arch_path = os.path.join(lib_dir_base, arch)
                     if os.path.isdir(arch_path):
-                        for f in ["libfrida-gadget.so", "libfrida-gadget.config.so", "libfrida-gadget.script.so",
-                                  "libfrida-script.so"]:
+                        # Löscht sowohl die Standardnamen als auch die getarnten Dateien
+                        for f in ["libfrida-gadget.so", "libfrida-gadget.config.so", "libfrida-script.so",
+                                  gadget_name, config_name, script_name]:
                             f_path = os.path.join(arch_path, f)
                             if os.path.exists(f_path):
                                 try:
@@ -34,17 +41,13 @@ class FridaInjectStep(PipelineStep):
                                     pass
 
             if cleaned:
-                engine_context.log("[-] Alte Frida-Dateien wurden restlos aus dem Build-Ordner entfernt.")
-            else:
-                engine_context.log("[*] Build-Ordner ist bereits sauber. Überspringe...")
-
+                engine_context.log("[-] Frida-Dateien wurden restlos aus dem Build-Ordner entfernt.")
             return True
 
-        # --- Reguläre Frida Injection (Wenn Haken aktiv) ---
-        engine_context.log("[*] Bereite Frida Injection (v17+ via frida-compile) vor...")
+        # --- Reguläre Frida Injection basierend auf FridaConfig ---
+        engine_context.log("[*] Bereite getarnte Frida Injection (v17+) vor...")
 
         try:
-            import tempfile
             lib_dir = os.path.join(lib_dir_base, "arm64-v8a")
             os.makedirs(lib_dir, exist_ok=True)
 
@@ -52,74 +55,75 @@ class FridaInjectStep(PipelineStep):
             if not os.path.exists(gadget_src):
                 engine_context.log("[!] libfrida-gadget.so (v17+) fehlt in 'tools/'!")
                 return False
-            shutil.copy(gadget_src, os.path.join(lib_dir, "libfrida-gadget.so"))
 
-            frida_proj_dir = os.path.join(tempfile.gettempdir(), "re_frida_project_2")
-            if os.path.exists(frida_proj_dir) and not os.path.exists(os.path.join(frida_proj_dir, ".latest_success")):
-                engine_context.log("[*] Bereinige fehlerhaften Node.js Workspace...")
-                shutil.rmtree(frida_proj_dir, ignore_errors=True)
+            # Gadget getarnt in die APK kopieren
+            shutil.copy(gadget_src, os.path.join(lib_dir, gadget_name))
 
-            os.makedirs(frida_proj_dir, exist_ok=True)
-            pkg_json_path = os.path.join(frida_proj_dir, "package.json")
-            npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
-            npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
+            frida_cfg: FridaConfig = engine_context.cfg.frida_config
+            pkg_name = engine_context.cfg.config.get("APP_PACKAGE", "")
 
-            log_file = os.path.join(engine_context.cfg.paths["ARCHIVE_DIR"], "live_cmd_log.txt")
+            gadget_config_dict = {}
 
-            if not os.path.exists(pkg_json_path):
-                engine_context.log(f"[*] Initialisiere stabilen Workspace in: {frida_proj_dir} ...")
-                pkg_data = {
-                    "name": "re_frida_agent", "private": True,
-                    "dependencies": {},
-                    "devDependencies": {"frida-compile": "latest", "@types/frida-gum": "latest"}
+            # --- Dynamische Generierung der Gadget-Config ---
+            if frida_cfg.mode == "listen":
+                gadget_config_dict = {
+                    "interaction": {
+                        "type": "listen",
+                        "address": frida_cfg.host,
+                        "port": frida_cfg.port,
+                        "on_load": "wait"
+                    }
                 }
-                with open(pkg_json_path, "w", encoding="utf-8") as f: json.dump(pkg_data, f, indent=4)
-
-                tsconfig_data = {
-                    "compilerOptions": {"target": "es2020", "lib": ["es2020", "dom"], "strict": False,
-                                        "moduleResolution": "node", "types": ["frida-gum"]}
+            elif frida_cfg.mode == "connect":
+                gadget_config_dict = {
+                    "interaction": {
+                        "type": "connect",
+                        "address": frida_cfg.host,
+                        "port": frida_cfg.port,
+                        "on_load": "wait"
+                    }
                 }
-                with open(os.path.join(frida_proj_dir, "tsconfig.json"), "w", encoding="utf-8") as f: json.dump(
-                    tsconfig_data, f, indent=4)
+            elif frida_cfg.mode == "script":
+                fm = FridaManager(engine_context.cfg.config.get("BASE_DIR", ""))
+                js_code = fm.get_active_code()
+                if not js_code:
+                    engine_context.log("[!] 'script'-Modus gewählt, aber kein aktives Skript gefunden!")
+                    return False
 
-                engine_context.log("[*] Führe 'npm install' aus (das dauert kurz)...")
-                CommandRunner.run_live(f"{npm_cmd} install", frida_proj_dir, lambda l: engine_context.log(f"[NPM] {l}"),
-                                       log_file)
-                with open(os.path.join(frida_proj_dir, ".latest_success"), "w") as f: f.write("ok")
+                engine_context.log("[*] Kompiliere Agent für Standalone-Betrieb...")
+                compiled_path = FridaCompilerService.compile_script(js_code, engine_context.cfg.paths["ARCHIVE_DIR"])
 
-            fm = FridaManager(engine_context.cfg.config.get("BASE_DIR", ""))
-            js_code = fm.get_active_code()
-            if not js_code:
-                engine_context.log("[!] Kein aktives Frida-Skript im Manager gefunden!")
-                return False
+                if not compiled_path:
+                    engine_context.log("[!] Kompilierung fehlgeschlagen.")
+                    return False
 
-            raw_script_path = os.path.join(frida_proj_dir, "index.js")
-            with open(raw_script_path, "w", encoding="utf-8") as f:
-                f.write(js_code)
+                target_script_path = os.path.join(lib_dir, script_name)
+                shutil.copy(compiled_path, target_script_path)
 
-            engine_context.log("[*] Kompiliere Agent mit frida-compile (latest)...")
-            compiled_out_path = os.path.join(frida_proj_dir, "agent_compiled.js")
-            compile_cmd = f"{npx_cmd} --yes frida-compile index.js -o agent_compiled.js -c"
-
-            success = CommandRunner.run_live(compile_cmd, frida_proj_dir,
-                                             lambda l: engine_context.log(f"[frida-compile] {l}"), log_file)
-            if not success:
-                engine_context.log("[!] Kompilierung fehlgeschlagen! Siehe Fehlermeldung oben.")
-                return False
-
-            # Konfiguration für den Listen-Modus (Wartet auf USB-Verbindung der Python Engine)
-            config_path = os.path.join(lib_dir, "libfrida-gadget.config.so")
-            listen_config = {
-                "interaction": {
-                    "type": "listen",
-                    "on_load": "wait"
+                gadget_config_dict = {
+                    "interaction": {
+                        "type": "script",
+                        "path": script_name,
+                        "on_change": "ignore"  # Verhindert den SELinux-Crash
+                    }
                 }
-            }
+            elif frida_cfg.mode == "script_directory":
+                target_dir = frida_cfg.script_directory_path.replace("{APP_PACKAGE}", pkg_name)
+                gadget_config_dict = {
+                    "interaction": {
+                        "type": "script-directory",
+                        "path": target_dir,
+                        "on_change": "ignore"  # Zwingend für SELinux, erfordert aber App-Neustart bei Skript-Änderungen
+                    }
+                }
+
+            # Config-Datei getarnt ablegen
+            config_path = os.path.join(lib_dir, config_name)
             with open(config_path, "w", encoding="utf-8") as f:
-                json.dump(listen_config, f, indent=4)
+                json.dump(gadget_config_dict, f, indent=4)
 
-            engine_context.cfg.paths["COMPILED_FRIDA_SCRIPT"] = compiled_out_path
-            engine_context.log("[+] Frida 17 Gadget im Listen-Modus (wait) injiziert!")
+            engine_context.log(
+                f"[+] Frida Gadget getarnt als '{gadget_name}' injiziert! Modus: {frida_cfg.mode.upper()}")
             return True
 
         except Exception as e:

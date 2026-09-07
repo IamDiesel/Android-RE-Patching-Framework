@@ -1,5 +1,6 @@
 import os
 import json
+from core.domain.frida_models import FridaConfig
 
 CURRENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -15,9 +16,11 @@ DEFAULT_CONFIG = {
     "NATIVE_LIB_STRATEGY": "zipalign",
     "INJECT_FRIDA": False,
     "INJECT_LSPATCH": False,
-    "INJECT_NSC": True,           # NEU: Steuert das MITM Zertifikat
-    "INJECT_DEBUGGABLE": False,   # NEU: Steuert das Debuggable Flag
+    "INJECT_NSC": True,
+    "INJECT_DEBUGGABLE": False,
+    "FRIDA_SETTINGS": FridaConfig().to_dict(),  # NEU: Integration der Frida-Modi
     "PIPELINES": {
+        # ... (Pipeline-Konfigurationen bleiben exakt wie vorher)
         "PREPARE_WORKSPACE": [
             {"name": "Merge Split APKs", "type": "merge_splits"},
             {"name": "Decompile APK", "type": "decompile"}
@@ -35,16 +38,13 @@ DEFAULT_CONFIG = {
              "cmd": "move /Y \"{EXTRACT_DIR}\\{SPLIT_NAME}.apk\" \"{DEST_DIR}\\{SPLIT_NAME}.apk\"",
              "cwd": "{BASE_DIR}"},
             {"name": "Zipalign (Page Alignment für .so)", "type": "cmd",
-             "cmd": "zipalign -p -f 4 \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}_aligned.apk\"",
-             "cwd": "{DEST_DIR}"},
+             "cmd": "zipalign -p -f 4 \"{SPLIT_NAME}.apk\" \"{SPLIT_NAME}_aligned.apk\"", "cwd": "{DEST_DIR}"},
             {"name": "Overwrite with Aligned APK", "type": "cmd",
-             "cmd": "move /Y \"{SPLIT_NAME}_aligned.apk\" \"{SPLIT_NAME}.apk\"",
-             "cwd": "{DEST_DIR}"},
+             "cmd": "move /Y \"{SPLIT_NAME}_aligned.apk\" \"{SPLIT_NAME}.apk\"", "cwd": "{DEST_DIR}"},
             {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-debugSigned*.apk\" 2>nul",
              "cwd": "{DEST_DIR}"},
             {"name": "Sign all APKs", "type": "cmd",
-             "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
-             "cwd": "{DEST_DIR}"}
+             "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "BUILD_NATIVE": [
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
@@ -56,8 +56,7 @@ DEFAULT_CONFIG = {
             {"name": "Clean old signatures", "type": "cmd", "cmd": "del /Q /S \"*-debugSigned*.apk\" 2>nul",
              "cwd": "{DEST_DIR}"},
             {"name": "Sign all APKs", "type": "cmd",
-             "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign",
-             "cwd": "{DEST_DIR}"}
+             "cmd": "java -jar \"{SIGNER_JAR}\" -a . --skipZipAlign --allowResign", "cwd": "{DEST_DIR}"}
         ],
         "FLASH": [
             {"name": "Install to Device", "type": "cmd",
@@ -65,7 +64,9 @@ DEFAULT_CONFIG = {
         ],
         "TRACE_START": [
             {"name": "Clear Logcat", "type": "cmd", "cmd": "adb logcat -c", "cwd": "{BASE_DIR}"},
-            {"name": "Start Logcat", "type": "trace_start", "cmd": "adb logcat --pid={PID} | grep -iE 'fatal|crash|debug|linker|frida|console|CryptoAudit'", "cwd": "{BASE_DIR}"}
+            {"name": "Start Logcat", "type": "trace_start",
+             "cmd": "adb logcat --pid={PID} | grep -iE 'fatal|crash|debug|linker|frida|console|CryptoAudit'",
+             "cwd": "{BASE_DIR}"}
         ],
         "TRACE_STOP": [
             {"name": "Stop Logcat", "type": "trace_stop"}
@@ -79,6 +80,7 @@ class ConfigManager:
         self.config_file = os.path.join(CURRENT_DIR, config_file)
         self.config = {}
         self.paths = {}
+        self.frida_config = FridaConfig()  # NEU: Typisiertes Datenmodell initialisieren
         self.load()
 
     def load(self, file_path=None):
@@ -92,6 +94,11 @@ class ConfigManager:
 
                 self.config["BASE_DIR"] = CURRENT_DIR
 
+                # NEU: Lade Frida-Einstellungen in das typsichere Modell
+                if "FRIDA_SETTINGS" in self.config:
+                    self.frida_config = FridaConfig.from_dict(self.config["FRIDA_SETTINGS"])
+
+                # Pipeline Safety Checks...
                 if "PIPELINES" not in self.config:
                     self.config["PIPELINES"] = {}
                 if "PREPARE_WORKSPACE" not in self.config["PIPELINES"]:
@@ -102,12 +109,19 @@ class ConfigManager:
                     self.config["PIPELINES"]["BUILD_NATIVE"] = DEFAULT_CONFIG["PIPELINES"]["BUILD_NATIVE"]
             except Exception:
                 self.config = DEFAULT_CONFIG.copy()
+                self.frida_config = FridaConfig()
         else:
             self.config = DEFAULT_CONFIG.copy()
+            self.frida_config = FridaConfig()
+
         self._update_paths()
 
     def save(self, file_path=None):
         target = file_path if file_path else self.config_file
+
+        # NEU: Synchronisiere das Objekt zurück in das Dict vor dem Speichern
+        self.config["FRIDA_SETTINGS"] = self.frida_config.to_dict()
+
         with open(target, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=4)
 
@@ -118,6 +132,7 @@ class ConfigManager:
 
     def restore_defaults(self):
         self.config = DEFAULT_CONFIG.copy()
+        self.frida_config = FridaConfig()
         self.save()
 
     def _update_paths(self):
@@ -155,7 +170,9 @@ class ConfigManager:
             "BASE_DIR": base_dir,
             "SPLIT_NAME": self.config.get("SPLIT_NAME", ""),
             "APP_PACKAGE": self.config.get("APP_PACKAGE", ""),
-            "SIGNER_JAR": os.path.join(base_dir, self.config.get("SIGNER_JAR", os.path.join("tools", "uber-apk-signer.jar"))),
-            "APKEDITOR_JAR": os.path.join(base_dir, self.config.get("APKEDITOR_JAR", os.path.join("tools", "APKEditor.jar")))
+            "SIGNER_JAR": os.path.join(base_dir,
+                                       self.config.get("SIGNER_JAR", os.path.join("tools", "uber-apk-signer.jar"))),
+            "APKEDITOR_JAR": os.path.join(base_dir,
+                                          self.config.get("APKEDITOR_JAR", os.path.join("tools", "APKEditor.jar")))
         })
         return vars_dict

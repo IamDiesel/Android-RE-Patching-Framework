@@ -40,7 +40,20 @@ class LogcatService:
                     if self.log_file_handle and not self.log_file_handle.closed:
                         self.log_file_handle.write(line)
                         self.log_file_handle.flush()
+
+                    # Standard Logcat Line Event (für das Logging Tab)
                     EventBus.publish("LOGCAT_LINE", line)
+
+                    # NEU: Extrahieren nativer Frida-Logs für die globale Konsole
+                    # Dies stellt sicher, dass Autark-Modi (Script / ScriptDirectory)
+                    # ihre Outputs global im Workspace melden.
+                    lower_line = line.lower()
+                    if "frida" in lower_line and not "logcat" in lower_line:
+                        # Bereinige den typischen Logcat Header (z.B. "09-07 12:34:56.789 1234 5678 I Frida  : ...")
+                        clean_msg = line.strip().split(":", 3)[-1].strip() if ":" in line else line.strip()
+                        # Prefix [Frida Device] unterscheidet es von [Frida] (RPC Host Bridge)
+                        EventBus.publish("LOG_INFO", f"[Frida Device] {clean_msg}")
+
         except Exception:
             pass
 
