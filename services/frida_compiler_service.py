@@ -54,6 +54,7 @@ class FridaCompilerService:
         if success:
             with open(os.path.join(workspace_dir, ".latest_success"), "w") as f:
                 f.write("ok")
+            EventBus.publish("LOG_INFO", "[+] Node.js Workspace erfolgreich initialisiert.")
         return success
 
     @classmethod
@@ -83,8 +84,18 @@ class FridaCompilerService:
         # 3. Kompilieren
         EventBus.publish("LOG_INFO", "[*] Kompiliere Frida-Agent...")
         compiled_out_path = os.path.join(frida_proj_dir, "agent_compiled.js")
-        npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
-        compile_cmd = f"{npx_cmd} --yes frida-compile index.js -o agent_compiled.js -c"
+
+        # --- BUGFIX: Umgehe npx, um Netzwerk-Timeouts und Registry-Checks zu verhindern ---
+        bin_name = "frida-compile.cmd" if os.name == "nt" else "frida-compile"
+        abs_bin_path = os.path.join(frida_proj_dir, "node_modules", ".bin", bin_name)
+
+        if os.path.exists(abs_bin_path):
+            # Direkter Aufruf der lokalen Node-Binärdatei (Extrem schnell, 100% Offline)
+            compile_cmd = f'"{abs_bin_path}" index.js -o agent_compiled.js -c'
+        else:
+            # Fallback (sollte nie eintreten, außer node_modules ist korrupt)
+            npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
+            compile_cmd = f'{npx_cmd} --yes frida-compile index.js -o agent_compiled.js -c'
 
         success = CommandRunner.run_live(
             compile_cmd,
