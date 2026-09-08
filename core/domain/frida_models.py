@@ -17,6 +17,7 @@ class FridaConfig:
     port: int = 27042
     script_directory_path: str = "/data/data/{APP_PACKAGE}/files/frida_scripts"
     active_script_id: Optional[str] = None
+    pause_on_load: bool = True  # NEU: Bestimmt ob Frida die App beim Start einfriert (wait vs resume)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -24,7 +25,8 @@ class FridaConfig:
             "host": self.host,
             "port": self.port,
             "script_directory_path": self.script_directory_path,
-            "active_script_id": self.active_script_id
+            "active_script_id": self.active_script_id,
+            "pause_on_load": self.pause_on_load
         }
 
     @classmethod
@@ -36,8 +38,11 @@ class FridaConfig:
             host=data.get("host", "127.0.0.1"),
             port=data.get("port", 27042),
             script_directory_path=data.get("script_directory_path", "/data/data/{APP_PACKAGE}/files/frida_scripts"),
-            active_script_id=data.get("active_script_id")
+            active_script_id=data.get("active_script_id"),
+            pause_on_load=data.get("pause_on_load", True)
         )
+
+
 @dataclass
 class FridaCollection:
     """Fasst mehrere FridaScripts zu einem Favoriten-Bündel zusammen."""

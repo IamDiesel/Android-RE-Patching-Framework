@@ -65,3 +65,46 @@ Die aktuelle Frida-Integration im Kippy RE-Framework unterstützt primär den pa
 3. **SELinux Crashes & Statische RASP-Erkennung:** Frida stürzt auf restriktiven Android-Systemen ab, wenn Dateisystem-Hooks gesetzt werden.
    * **Mitigation:** Die injizierten Dateien werden dynamisch in `libmetrics.so` etc. umbenannt, um statische String-Scans ins Leere laufen zu lassen. Durch die Konfiguration `"on_change": "ignore"` werden kritische SELinux-Verstöße im Autark-Betrieb verhindert. Der entsprechende Smali-Load-Call in der App (`invoke-static {v0}, Ljava/lang/System;->loadLibrary(...)`) muss im Workspace-Tab explizit auf `"metrics"` angepasst werden.
 4. **Cross-Thread GUI Updates:** Alle Services nutzen streng den `EventBus`, sodass Tkinter nicht blockiert oder abstürzt, wenn der Server oder ADB-Prozess im Hintergrund agiert.
+
+
+
+---
+
+---
+
+# Architektur & Refactoring Plan: Frida Integration (Phase 2 - UX & Async)
+
+## 1. Motivation und Zielsetzung
+Nachdem in Phase 1 die grundlegende Architektur für die vier Frida-Modi (`Listen`, `Connect`, `Script`, `ScriptDirectory`) sowie die RASP-Tarnung implementiert wurden, zeigten sich in der Praxis Usability-Probleme:
+1. **Fehlender Kontext:** Ausführungsbuttons waren unabhängig vom gewählten Modus immer sichtbar, was zu Fehlbedienungen führte.
+2. **UI-Freezes:** Die synchrone Kompilierung von JavaScript/TypeScript via Node.js blockierte den Tkinter-Main-Thread ohne visuelles Feedback.
+3. **Starre Ladeblockade:** Das harte Verdrahten von `"on_load": "wait"` führte in autarken Modi zu eingefrorenen Apps (Black Screen).
+4. **Zersplitterte UI:** Die Trennung von Modus-Konfiguration (Tab 2) und Editor (Tab 1) unterbrach den mentalen Workflow.
+
+Ziel dieser Phase war die Überführung in ein intelligentes, kontextsensitives Single-Window-Dashboard mit asynchronem Feedback.
+
+## 2. Technische Umsetzung & Änderungen
+
+### 2.1 Datenmodell & Pipeline (`pause_on_load`)
+* **`core/domain/frida_models.py`**: Die Datenklasse `FridaConfig` wurde um das Attribut `pause_on_load: bool` erweitert.
+* **`core/pipeline/steps/hook_steps.py`**: Der `FridaInjectStep` wertet dieses Flag nun dynamisch aus. Ist das Flag gesetzt, generiert das Framework `"on_load": "wait"` (App friert beim Start ein, bis Frida connected). Ist es deaktiviert, wird `"on_load": "resume"` injiziert (App startet flüssig durch).
+
+### 2.2 Thread-Entkopplung (`frida_manager_controller.py`)
+Alle netzwerk- und rechenintensiven Aufgaben wurden in Hintergrund-Threads ausgelagert, um Tkinter responsiv zu halten:
+* Methoden wie `push_to_device`, `push_live_script` und `fire_usb_listen` nutzen nun das `threading`-Modul.
+* Einführung von Callback-Delegates (`on_start`, `on_done`), die mittels `self.app.after(0, ...)` thread-sicher in den Main-Thread zurückfunken, um GUI-Status-Updates auszulösen.
+* Der Server-Status (`is_running`, `clients`) kann nun threadsicher von der GUI gepollt werden.
+
+### 2.3 Das Dynamische Action-Panel (`frida_manager_dialog.py`)
+Das starre Tab-Design wurde durch ein kontextsensitives Dashboard ersetzt:
+* **Top-Panel:** Eine kompakte Konfigurationsleiste bündelt nun Modus, Netzwerk-Setup und das App-Start-Verhalten direkt über dem Editor.
+* **Smartes Ausführungs-Panel:** Unter dem Editor wird bei jedem Modus-Wechsel (`_on_mode_change`) das UI dynamisch neu gezeichnet:
+  * *Listen-Modus:* Zeigt den `Fire USB` Button.
+  * *Connect-Modus:* Zeigt Server-Steuerung, Live-Status-Polling (🟢/🔴) und den `Push Live` Button.
+  * *Script-Modus:* Erklärt den Build-Zusammenhang und zeigt den Button zum Markieren des aktiven Skripts.
+  * *ScriptDirectory-Modus:* Öffnet den Device-Sync Drawer und bietet den Push-Button an.
+* **Asynchrones UI-Feedback:** Sobald eine Kompilierung startet, greift der `on_start`-Callback. Alle Action-Buttons werden ausgegraut (`state="disabled"`) und ihr Text wechselt auf `⏳ Kompiliere JS/TS...`. Erst der `on_done`-Callback schaltet die UI wieder frei.
+
+### 2.4 Quick-Action & Sicherheit (`workspace_tab.py`)
+* Der Button im Workspace wurde passend zur neuen Rolle in **"🦊 Frida Dashboard"** umbenannt.
+* **Safety Net (`_execute_save`):** Wählt der Nutzer den `ScriptDirectory`-Modus, prüft die UI automatisch, ob das `INJECT_DEBUGGABLE`-Flag im Workspace aktiv ist. Falls nicht, warnt die UI und bietet die automatische Aktivierung an, da der `run-as`-Befehl für den ADB-Sync zwingend eine debuggable App voraussetzt.

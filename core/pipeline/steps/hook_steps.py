@@ -65,13 +65,16 @@ class FridaInjectStep(PipelineStep):
             gadget_config_dict = {}
 
             # --- Dynamische Generierung der Gadget-Config ---
+            # Setzt das Lade-Verhalten basierend auf dem neuen UI-Schalter
+            load_behavior = "wait" if frida_cfg.pause_on_load else "resume"
+
             if frida_cfg.mode == "listen":
                 gadget_config_dict = {
                     "interaction": {
                         "type": "listen",
                         "address": frida_cfg.host,
                         "port": frida_cfg.port,
-                        "on_load": "wait"
+                        "on_load": load_behavior
                     }
                 }
             elif frida_cfg.mode == "connect":
@@ -80,7 +83,7 @@ class FridaInjectStep(PipelineStep):
                         "type": "connect",
                         "address": frida_cfg.host,
                         "port": frida_cfg.port,
-                        "on_load": "wait"
+                        "on_load": load_behavior
                     }
                 }
             elif frida_cfg.mode == "script":
@@ -104,7 +107,8 @@ class FridaInjectStep(PipelineStep):
                     "interaction": {
                         "type": "script",
                         "path": script_name,
-                        "on_change": "ignore"  # Verhindert den SELinux-Crash
+                        "on_change": "ignore",  # Verhindert den SELinux-Crash
+                        "on_load": load_behavior
                     }
                 }
             elif frida_cfg.mode == "script_directory":
@@ -113,7 +117,9 @@ class FridaInjectStep(PipelineStep):
                     "interaction": {
                         "type": "script-directory",
                         "path": target_dir,
-                        "on_change": "ignore"  # Zwingend für SELinux, erfordert aber App-Neustart bei Skript-Änderungen
+                        "on_change": "ignore",
+                        # Zwingend für SELinux, erfordert aber App-Neustart bei Skript-Änderungen
+                        "on_load": load_behavior
                     }
                 }
 

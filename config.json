@@ -148,6 +148,7 @@
         "host": "127.0.0.1",
         "port": 27042,
         "script_directory_path": "/data/data/{APP_PACKAGE}/files/frida_scripts",
-        "active_script_id": null
+        "active_script_id": null,
+        "pause_on_load": true
     }
 }

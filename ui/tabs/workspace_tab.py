@@ -317,7 +317,7 @@ class WorkspaceTab(ttk.Frame):
                                     command=lambda: self.controller.toggle_frida(self.var_frida.get()))
         chk_frida.pack(side="left", padx=2)
 
-        btn_frida_mgr = ttk.Button(f_inject, text="🦊 Skripte", command=self.controller.open_frida_manager)
+        btn_frida_mgr = ttk.Button(f_inject, text="🦊 Frida Manager", command=self.controller.open_frida_manager)
         btn_frida_mgr.pack(side="left", padx=(0, 10))
 
         self.var_lspatch = tk.BooleanVar(value=self.app.cfg.config.get("INJECT_LSPATCH", False))

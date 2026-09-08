@@ -8,13 +8,12 @@ from core.application.event_bus import EventBus
 
 class FridaCompilerService:
     """
-    Zustandsloser Service, der rohen JS/TS Frida-Code mittels Node.js und
-    frida-compile in ein ausführbares Agent-Skript übersetzt.
+    Kompiliert Frida-Code mittels Node.js und frida-compile in ein
+    ausführbares Agent-Skript und gibt den Fortschritt live an die GUI weiter.
     """
 
     @classmethod
     def _setup_node_workspace(cls, workspace_dir: str, log_file: str) -> bool:
-        """Initialisiert den Node.js Workspace, falls er nicht existiert."""
         if os.path.exists(workspace_dir) and os.path.exists(os.path.join(workspace_dir, ".latest_success")):
             return True
 
@@ -42,12 +41,13 @@ class FridaCompilerService:
             json.dump(tsconfig_data, f, indent=4)
 
         npm_cmd = "npm.cmd" if os.name == "nt" else "npm"
-        EventBus.publish("LOG_INFO", "[*] Führe 'npm install' aus (das dauert kurz)...")
+        EventBus.publish("LOG_INFO", "[*] Führe 'npm install' aus (Live-Log folgt)...")
 
+        # Das Live-Logging fängt jede Ausgabe von npm ab und zeigt sie im Workspace an
         success = CommandRunner.run_live(
             f"{npm_cmd} install",
             workspace_dir,
-            lambda l: EventBus.publish("LOG_INFO", f"[NPM] {l}"),
+            lambda l: EventBus.publish("LOG_INFO", f"[NPM] {l.strip()}"),
             log_file
         )
 
@@ -55,15 +55,13 @@ class FridaCompilerService:
             with open(os.path.join(workspace_dir, ".latest_success"), "w") as f:
                 f.write("ok")
             EventBus.publish("LOG_INFO", "[+] Node.js Workspace erfolgreich initialisiert.")
+        else:
+            EventBus.publish("LOG_INFO", "[!] NPM Install fehlgeschlagen!")
+
         return success
 
     @classmethod
     def compile_script(cls, raw_js_code: str, archive_dir: str) -> str:
-        """
-        Kompiliert das übergebene Skript synchron.
-        Gibt den absoluten Dateipfad zum kompilierten Skript zurück.
-        Bei Fehler wird ein leerer String zurückgegeben.
-        """
         if not raw_js_code:
             EventBus.publish("LOG_INFO", "[!] Leerer Code übergeben. Kompilierung abgebrochen.")
             return ""
@@ -71,36 +69,33 @@ class FridaCompilerService:
         frida_proj_dir = os.path.join(tempfile.gettempdir(), "re_frida_workspace")
         log_file = os.path.join(archive_dir, "frida_compile_log.txt")
 
-        # 1. Workspace sicherstellen
         if not cls._setup_node_workspace(frida_proj_dir, log_file):
             EventBus.publish("LOG_INFO", "[!] Fehler beim Einrichten des Node.js Workspaces.")
             return ""
 
-        # 2. Raw Code schreiben
         raw_script_path = os.path.join(frida_proj_dir, "index.js")
         with open(raw_script_path, "w", encoding="utf-8") as f:
             f.write(raw_js_code)
 
-        # 3. Kompilieren
-        EventBus.publish("LOG_INFO", "[*] Kompiliere Frida-Agent...")
+        EventBus.publish("LOG_INFO", "[*] Kompiliere Frida-Agent (Live-Log folgt)...")
         compiled_out_path = os.path.join(frida_proj_dir, "agent_compiled.js")
 
-        # --- BUGFIX: Umgehe npx, um Netzwerk-Timeouts und Registry-Checks zu verhindern ---
-        bin_name = "frida-compile.cmd" if os.name == "nt" else "frida-compile"
-        abs_bin_path = os.path.join(frida_proj_dir, "node_modules", ".bin", bin_name)
+        # Aufruf direkt über die lokale Installation
+        node_cmd = "node.exe" if os.name == "nt" else "node"
+        bin_script = os.path.join(frida_proj_dir, "node_modules", "frida-compile", "bin", "compile.js")
 
-        if os.path.exists(abs_bin_path):
-            # Direkter Aufruf der lokalen Node-Binärdatei (Extrem schnell, 100% Offline)
-            compile_cmd = f'"{abs_bin_path}" index.js -o agent_compiled.js -c'
+        if os.path.exists(bin_script):
+            compile_cmd = f'"{node_cmd}" "{bin_script}" index.js -o agent_compiled.js'
         else:
-            # Fallback (sollte nie eintreten, außer node_modules ist korrupt)
-            npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
-            compile_cmd = f'{npx_cmd} --yes frida-compile index.js -o agent_compiled.js -c'
+            bin_name = "frida-compile.cmd" if os.name == "nt" else "frida-compile"
+            abs_bin_path = os.path.join(frida_proj_dir, "node_modules", ".bin", bin_name)
+            compile_cmd = f'"{abs_bin_path}" index.js -o agent_compiled.js'
 
+        # Live-Logging für den Compiler-Prozess
         success = CommandRunner.run_live(
             compile_cmd,
             frida_proj_dir,
-            lambda l: EventBus.publish("LOG_INFO", f"[frida-compile] {l}"),
+            lambda l: EventBus.publish("LOG_INFO", f"[COMPILER] {l.strip()}"),
             log_file
         )
 
