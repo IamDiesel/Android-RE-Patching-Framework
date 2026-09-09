@@ -73,24 +73,30 @@ class LauncherLoggerTab(ttk.Frame):
         f_tools.pack(fill="x", pady=5)
 
         ttk.Label(f_tools, text="Suchen:").pack(side="left")
-        self.ent_search = ttk.Entry(f_tools, width=20)
+        self.ent_search = ttk.Entry(f_tools, width=15)
         self.ent_search.pack(side="left", padx=5)
         self.ent_search.bind("<Return>", lambda e: self.do_search())
         ttk.Button(f_tools, text="🔍", width=3, command=self.do_search).pack(side="left", padx=1)
         ttk.Button(f_tools, text="⬇ Next", command=self.search_next).pack(side="left", padx=1)
 
-        ttk.Separator(f_tools, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Separator(f_tools, orient="vertical").pack(side="left", fill="y", padx=5)
 
-        ttk.Label(f_tools, text="UI-Filter (Grep):").pack(side="left")
-        self.ent_filter = ttk.Entry(f_tools, width=20)
-        self.ent_filter.pack(side="left", padx=5)
+        # UI-Filter (Include)
+        ttk.Label(f_tools, text="Filter (OR):").pack(side="left")
+        self.ent_filter = ttk.Entry(f_tools, width=15)
+        self.ent_filter.pack(side="left", padx=2)
         self.ent_filter.bind("<KeyRelease>", self.apply_filter)
 
-        ttk.Separator(f_tools, orient="vertical").pack(side="left", fill="y", padx=10)
+        # Feature 2B: UI-Filter (Exclude)
+        ttk.Label(f_tools, text="Exclude (OR):").pack(side="left")
+        self.ent_exclude = ttk.Entry(f_tools, width=15)
+        self.ent_exclude.pack(side="left", padx=2)
+        self.ent_exclude.bind("<KeyRelease>", self.apply_filter)
+
+        ttk.Separator(f_tools, orient="vertical").pack(side="left", fill="y", padx=5)
 
         self.var_wrap = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f_tools, text="Zeilenumbruch", variable=self.var_wrap, command=self.toggle_wrap).pack(
-            side="left")
+        ttk.Checkbutton(f_tools, text="Zeilenumbruch", variable=self.var_wrap, command=self.toggle_wrap).pack(side="left")
 
         # --- Controls Row (GETRENNTE BUTTONS) ---
         f_ctrl = ttk.Frame(f_top)
@@ -168,15 +174,24 @@ class LauncherLoggerTab(ttk.Frame):
         else:
             self.do_search()
 
+        # Feature 2A & 2C: Zentrale Filter-Logik
+    def _check_log_filters(self, line: str, inc_query: list, exc_query: list) -> bool:
+        lower_line = line.lower()
+        # Wenn Exclude-Tokens existieren und IRGENDEINES vorkommt -> Verwerfen
+        if exc_query and any(ex in lower_line for ex in exc_query):
+            return False
+        # Wenn Include-Tokens existieren und KEINES vorkommt -> Verwerfen
+        if inc_query and not any(inc in lower_line for inc in inc_query):
+            return False
+        return True
+
     def apply_filter(self, event=None):
-        query = self.ent_filter.get().lower()
+        inc_query = self.ent_filter.get().lower().split()
+        exc_query = self.ent_exclude.get().lower().split()
+
         self.console.delete("1.0", tk.END)
-        if not query:
-            for line in self.raw_logs:
-                self._insert_colored_line(line)
-        else:
-            filtered = [line for line in self.raw_logs if query in line.lower()]
-            for line in filtered:
+        for line in self.raw_logs:
+            if self._check_log_filters(line, inc_query, exc_query):
                 self._insert_colored_line(line)
         self.console.see(tk.END)
         self.do_search()
@@ -317,10 +332,12 @@ class LauncherLoggerTab(ttk.Frame):
     def _append_log(self, line):
         """Wird ausgelöst, wenn EventBus "LOGCAT_LINE" empfängt"""
         self.raw_logs.append(line)
-        query = self.ent_filter.get().lower()
-        if not query or query in line.lower():
+
+        inc_query = self.ent_filter.get().lower().split()
+        exc_query = self.ent_exclude.get().lower().split()
+
+        if self._check_log_filters(line, inc_query, exc_query):
             self._insert_colored_line(line)
-            # Auto-Scroll nur, wenn wir sowieso ganz unten sind
             if self.console.yview()[1] >= 0.98:
                 self.console.see(tk.END)
 

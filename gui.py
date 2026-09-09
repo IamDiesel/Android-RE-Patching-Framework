@@ -15,6 +15,7 @@ from ui.tabs.app_manager_tab import AppManagerTab
 from ui.tabs.workspace_tab import WorkspaceTab
 from ui.tabs.history_tab import HistoryTab
 from ui.tabs.settings_tab import SettingsTab
+from ui.tabs.device_file_manager_tab import DeviceFileManagerTab
 
 # Core Module
 from core.application.event_bus import EventBus
@@ -66,11 +67,13 @@ class ReFrameworkApp(tk.Tk):
         self.api_tab = APIInspectorTab(self.notebook, self.cfg)
         self.history_tab = HistoryTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
+        self.device_file_tab = DeviceFileManagerTab(self.notebook, self)
 
         # Tabs zum Notebook hinzufügen
         self.notebook.add(self.app_manager_tab, text="📱 App Manager")
         self.notebook.add(self.workspace_tab, text="🔧 Workspace")
         self.notebook.add(self.api_tab, text="🌐 API Inspector")
+        self.notebook.add(self.device_file_tab, text="📂 File Explorer")
         self.notebook.add(self.history_tab, text="📊 Test Management")
         self.notebook.add(self.settings_tab, text="⚙️ Einstellungen")
 

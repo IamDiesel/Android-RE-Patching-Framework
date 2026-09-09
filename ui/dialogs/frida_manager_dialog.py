@@ -100,8 +100,14 @@ class FridaManagerDialog(tk.Toplevel):
         self.tree_scripts = ttk.Treeview(f_left, columns=("Status", "Name"), show="headings")
         self.tree_scripts.heading("Status", text="Aktiv")
         self.tree_scripts.heading("Name", text="Skript Name")
-        self.tree_scripts.column("Status", width=50, anchor="center")
-        self.tree_scripts.pack(fill="both", expand=True)
+        # Feature 1A: Breite reduziert und nicht dehnbar (stretch=False)
+        self.tree_scripts.column("Status", width=40, stretch=False, anchor="center")
+
+        # Feature 1C: Vertikaler Scrollbalken hinzugefügt
+        scroll_y_scripts = ttk.Scrollbar(f_left, orient="vertical", command=self.tree_scripts.yview)
+        self.tree_scripts.configure(yscrollcommand=scroll_y_scripts.set)
+        scroll_y_scripts.pack(side="right", fill="y")
+        self.tree_scripts.pack(side="left", fill="both", expand=True)
 
         self.tree_scripts.bind("<<TreeviewSelect>>", self.on_script_select)
         self.tree_scripts.bind("<Delete>", lambda e: self.delete_script())
@@ -370,7 +376,8 @@ class FridaManagerDialog(tk.Toplevel):
     # =========================================================================
     def populate_scripts(self):
         for i in self.tree_scripts.get_children(): self.tree_scripts.delete(i)
-        for s in self.controller.manager.scripts:
+        # Feature 1B: Umgekehrte Sortierung (neu zu alt) durch reversed()
+        for s in reversed(self.controller.manager.scripts):
             status = "✅" if s.id == self.controller.manager.active_script_id else ""
             self.tree_scripts.insert("", "end", iid=s.id, values=(status, s.name))
 

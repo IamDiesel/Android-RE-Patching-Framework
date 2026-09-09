@@ -160,7 +160,10 @@ class FavoritePatchesDialog(tk.Toplevel):
 
     def populate_list(self):
         for i in self.tree_favs.get_children(): self.tree_favs.delete(i)
-        for idx, f in enumerate(self.controller.fav_service.favs):
+
+        # Durch reversed(list(enumerate(...))) iterieren wir rückwärts durch die Liste,
+        # behalten aber den originalen Index (idx) für die 'iid' bei.
+        for idx, f in reversed(list(enumerate(self.controller.fav_service.favs))):
             self.tree_favs.insert("", "end", iid=str(idx), values=(f.get("name", "Unnamed"),))
 
     def on_select(self, event):

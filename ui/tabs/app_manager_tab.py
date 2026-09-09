@@ -100,7 +100,7 @@ class AppManagerTab(ttk.Frame):
                 self.listbox.insert(tk.END, pkg)
 
     def import_local_apk(self):
-        folderpath = filedialog.askdirectory(title="Ordner mit lokalen APKs auswählen (muss base.apk enthalten)")
+        folderpath = filedialog.askdirectory(initialdir=self.source_dir, title="Ordner mit lokalen APKs auswählen (muss base.apk enthalten)")
         if not folderpath: return
 
         if not os.path.exists(os.path.join(folderpath, "base.apk")):
