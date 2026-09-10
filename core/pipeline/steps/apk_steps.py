@@ -338,6 +338,22 @@ class DecompileStep(PipelineStep):
 
             if process.returncode in [0, 1, None]:
                 engine_context.log(f"[+] '{target_apk}' erfolgreich entpackt nach: {smali_dir}")
+
+                # =========================================================================
+                # NEU: Cache-Invalidierung!
+                # =========================================================================
+                dest_dir = engine_context.cfg.paths.get("DEST_DIR", "")
+                app_pkg = engine_context.cfg.config.get("APP_PACKAGE", "app")
+                cache_file = os.path.join(dest_dir, unpacked_name, f".{app_pkg}_index.pkl")
+
+                if os.path.exists(cache_file):
+                    try:
+                        os.remove(cache_file)
+                        engine_context.log("[-] Alter RAM-Cache (.pkl) gelöscht. Wird gleich frisch aufgebaut.")
+                    except Exception as e:
+                        engine_context.log(f"[!] Konnte alten RAM-Cache nicht löschen: {e}")
+                # =========================================================================
+
                 return True
             else:
                 engine_context.log(f"[!] Fehler beim Entpacken (Exit {process.returncode}).")
@@ -345,7 +361,6 @@ class DecompileStep(PipelineStep):
         except Exception as e:
             engine_context.log(f"[!] Ausnahme beim Entpacken: {e}")
             return False
-
 
 class ManifestBuildStep(PipelineStep):
     def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
@@ -405,14 +420,13 @@ class ManifestBuildStep(PipelineStep):
                     engine_context.log("[!] Fehler beim Injizieren der Bibliotheken via jar.")
                     return False
 
-        native_strategy = engine_context.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign")
-        if native_strategy == "zipalign":
-            engine_context.log("[*] Optimiere Speicher-Alignment für Android 14 (Zipalign -p 4)...")
-            cmd_zip = 'zipalign -p -f 4 "base.apk" "aligned_base.apk"'
-            if not run_build_cmd(cmd_zip, engine_context): return False
+        # FIX: Zipalign IMMER ausführen, da Android 11+ zwingend ein Alignment der resources.arsc verlangt!
+        engine_context.log("[*] Optimiere Speicher-Alignment für Android 14 (Zipalign -p 4)...")
+        cmd_zip = 'zipalign -p -f 4 "base.apk" "aligned_base.apk"'
+        if not run_build_cmd(cmd_zip, engine_context): return False
 
-            cmd_move = 'move /Y "aligned_base.apk" "base.apk"' if os.name == 'nt' else 'mv -f "aligned_base.apk" "base.apk"'
-            if not run_build_cmd(cmd_move, engine_context): return False
-            engine_context.log("[+] Zipalign erfolgreich abgeschlossen.")
+        cmd_move = 'move /Y "aligned_base.apk" "base.apk"' if os.name == 'nt' else 'mv -f "aligned_base.apk" "base.apk"'
+        if not run_build_cmd(cmd_move, engine_context): return False
+        engine_context.log("[+] Zipalign erfolgreich abgeschlossen.")
 
         return True

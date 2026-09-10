@@ -26,10 +26,10 @@ class UIUtils:
 
     @staticmethod
     def _copy_selection(event):
-        """Kopiert markierten Text oder selektierte Treeview-Reihen (Tab-getrennt)."""
+        """Kopiert markierten Text oder selektierte Treeview-Reihen (Tab-getrennt) inkl. Hierarchie."""
         widget = event.widget
 
-        # Für Treeviews bauen wir eine Tabulator-getrennte Tabelle
+        # Für Treeviews bauen wir eine Tabulator-getrennte Tabelle mit Einrückungen
         if isinstance(widget, ttk.Treeview):
             selected = widget.selection()
             if not selected:
@@ -37,14 +37,34 @@ class UIUtils:
 
             lines = []
             for item in selected:
-                # Hole den "text" (oft der Tree-Node Name) und die values
+                # 1. Hierarchie-Tiefe (Ebene) des aktuellen Elements ermitteln
+                depth = 0
+                parent_item = widget.parent(item)
+                while parent_item:
+                    depth += 1
+                    parent_item = widget.parent(parent_item)
+
+                # 2. Visuelle Einrückung erzeugen (4 Leerzeichen pro Ebene)
+                indent = "    " * depth
+
+                # 3. Text und Werte auslesen
                 text = widget.item(item, "text")
                 values = widget.item(item, "values")
 
                 parts = []
-                if text: parts.append(str(text))
-                if values: parts.extend([str(v) for v in values])
+                if text:
+                    # Einrückung auf die erste Hauptspalte (den Text) anwenden
+                    parts.append(indent + str(text))
 
+                if values:
+                    # Falls der Tree keinen 'text' nutzt, rücken wir stattdessen den ersten Value ein
+                    if not text and len(values) > 0:
+                        parts.append(indent + str(values[0]))
+                        parts.extend([str(v) for v in values[1:]])
+                    else:
+                        parts.extend([str(v) for v in values])
+
+                # Die Spalten mit Tabulator trennen, damit es sich sauber in Excel/Notepad einfügt
                 lines.append("\t".join(parts))
 
             if lines:
@@ -52,7 +72,7 @@ class UIUtils:
                 widget.clipboard_append("\n".join(lines))
             return "break"
 
-        # Für Standard-Textfelder lassen wir Tkinter den nativen Copy-Befehl machen
+        # Für Standard-Textfelder lassen wir Tkinter den nativen Copy-Befehl ausführen
         return None
 
     @staticmethod

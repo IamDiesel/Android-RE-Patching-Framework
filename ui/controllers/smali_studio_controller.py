@@ -1,6 +1,8 @@
 import os
 from tkinter import messagebox, simpledialog
 import threading
+import subprocess
+import sys
 
 from ui.controllers.smali_cg_controller import SmaliCGController
 from ui.dialogs.struct_dialog import CreateStructDialog
@@ -13,6 +15,7 @@ from services.xref_service import XrefService
 
 from core.application.session_state import SessionState
 from core.application.event_bus import EventBus
+from services.graphviz_service import GraphvizExportService
 
 
 class SmaliStudioController:
@@ -99,6 +102,9 @@ class SmaliStudioController:
 
     # --- Standard Loading ---
     def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
+        # FIX: Bearbeitungs-Modus beim Laden einer neuen Methode zwingend verlassen
+        self.editing_patch_idx = None
+
         block, method_def, lines = self.fs_service.extract_method_block(rel_filepath, target_line, method_signature)
         if not block:
             EventBus.publish("LOG_INFO", "[!] Konnte den Block in der Datei nicht extrahieren.")
@@ -114,7 +120,7 @@ class SmaliStudioController:
         disp_name = self.current_method_name.split('(')[
             0] if "(" in self.current_method_name else self.current_method_name
 
-        # NEU: Kompletten Pfad aus Workspace Variablen für das Label generieren
+        # Kompletten Pfad aus Workspace Variablen für das Label generieren
         pkg_name = self.app.cfg.config.get("APP_PACKAGE", "app")
         unpacked_folder = self.view.get_unpacked_dir_name()
         os_rel_path = self.current_smali_file.replace("/", "\\")
@@ -207,6 +213,9 @@ class SmaliStudioController:
                        lambda: self.cg_controller.find_and_highlight(data.get("current_node_id"), highlight_only=True))
 
     def load_custom_structure_into_editor(self, rel_filepath):
+        # FIX: Bearbeitungs-Modus beim Laden einer eigenen Struktur zwingend verlassen
+        self.editing_patch_idx = None
+
         filepath = os.path.join(self.fs_service.get_smali_dir(), rel_filepath)
         if not os.path.exists(filepath): return
         with open(filepath, "r", encoding="utf-8") as f:
@@ -247,6 +256,16 @@ class SmaliStudioController:
 
     def remove_smali_patch(self, idx):
         del self.smali_patches[idx]
+
+        # FIX: Index synchron halten oder Modus beenden, wenn der aktuell bearbeitete Patch gelöscht wird
+        if self.editing_patch_idx == idx:
+            self.editing_patch_idx = None
+            self.current_method_name = ""
+            self.view.lbl_smali_file.config(text="Patch gelöscht")
+            self.view.editor.clear_edit()
+        elif self.editing_patch_idx is not None and self.editing_patch_idx > idx:
+            self.editing_patch_idx -= 1
+
         self.view.refresh_smali_tree()
 
     def open_global_search(self):
@@ -282,6 +301,40 @@ class SmaliStudioController:
 
     def stop_auto_explore(self):
         self.exploration_service.stop_auto_explore()
+
+    def export_callgraph(self):
+        if not self.app.cg.nodes:
+            messagebox.showinfo("Leer", "Der Call Graph ist leer. Es gibt nichts zu exportieren!")
+            return
+
+        # Speicherort: Der Archive-Ordner des aktuellen Workspaces
+        export_dir = self.app.cfg.paths.get("ARCHIVE_DIR", os.path.expanduser("~"))
+
+        self.app.log("[*] Generiere Graphviz-Export...")
+        result_path = GraphvizExportService.export_to_svg(self.app.cg, export_dir)
+
+        if result_path:
+            if result_path.endswith(".svg"):
+                self.app.log(f"[+] Call Graph als SVG exportiert: {result_path}")
+                messagebox.showinfo("Exportiert", f"Graph erfolgreich exportiert!\nWird nun im Browser geöffnet.")
+
+                # FIX: Wir nutzen das webbrowser Modul, um die Windows-Dateizuordnung zu umgehen
+                # und das SVG zwingend im Standard-Browser (Chrome/Edge/Firefox) zu öffnen.
+                try:
+                    import webbrowser
+                    # Wir formatieren den Pfad als lokale URL, damit der Browser ihn direkt frisst
+                    file_url = f"file://{os.path.abspath(result_path)}"
+                    webbrowser.open(file_url)
+                except Exception as e:
+                    self.app.log(f"[!] Konnte SVG nicht automatisch öffnen: {e}")
+            else:
+                self.app.log(f"[!] SVG Generierung fehlgeschlagen. Rohe .dot Datei gespeichert: {result_path}")
+                messagebox.showwarning(
+                    "Graphviz fehlt",
+                    "Die .dot Datei wurde generiert, konnte aber nicht in ein Bild konvertiert werden.\n\n"
+                    "Bitte installiere 'Graphviz' für Windows (https://graphviz.org/download/) und achte darauf, "
+                    "während der Installation das Häkchen bei 'Add Graphviz to the system PATH' zu setzen."
+                )
 
     def clear_callgraph(self):
         self.app.cg.clear()

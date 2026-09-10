@@ -1,12 +1,12 @@
+import os
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from ui.tabs.smali_studio_tab import SmaliStudioTab
 from ui.tabs.launcher_logger_tab import LauncherLoggerTab
 from ui.dialogs.favorite_patches_dialog import FavoritePatchesDialog
 from core.application.event_bus import EventBus
 from core.domain.exceptions import PatchConflictException
-from core.application.session_state import SessionState
 from ui.controllers.workspace_controller import WorkspaceController
 
 
@@ -207,8 +207,6 @@ class WorkspaceTab(ttk.Frame):
         self.lib_rows.append({"frame": row_frame, "target": ent_target, "source": ent_source})
 
     def browse_lib(self, entry_target, entry_source):
-        from tkinter import filedialog
-        import os
         tools_dir = os.path.join(self.app.cfg.config.get("BASE_DIR", ""), "tools")
         init_dir = tools_dir if os.path.exists(tools_dir) else None
 
@@ -217,7 +215,6 @@ class WorkspaceTab(ttk.Frame):
         if path:
             entry_source.delete(0, tk.END)
             entry_source.insert(0, path)
-            import os
             entry_target.delete(0, tk.END)
             entry_target.insert(0, os.path.basename(path))
 
@@ -285,7 +282,7 @@ class WorkspaceTab(ttk.Frame):
         self.combo_strat.bind("<<ComboboxSelected>>",
                               lambda e: self.controller.change_manifest_strategy(self.combo_strat.get()))
 
-        # --- NEU: Manifest Optionen (NSC & Debuggable) ---
+        # --- Manifest Optionen (NSC, Debuggable & ExtractNativeLibs) ---
         f_manifest = ttk.Frame(f_actions)
         f_manifest.pack(fill="x", padx=10, pady=2)
 
@@ -299,16 +296,13 @@ class WorkspaceTab(ttk.Frame):
                                          command=lambda: self.controller.toggle_debuggable(self.var_debuggable.get()))
         chk_debuggable.pack(side="left", padx=10)
 
-        f_native = ttk.Frame(f_actions)
-        f_native.pack(fill="x", padx=10, pady=2)
-        ttk.Label(f_native, text="Memory Alignment:").pack(side="left", padx=2)
-        self.combo_native_lib = ttk.Combobox(f_native, values=["zipalign", "extractNativeLibs"], state="readonly",
-                                             width=16)
-        self.combo_native_lib.pack(side="left", padx=5)
-        self.combo_native_lib.set(self.app.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign"))
-        self.combo_native_lib.bind("<<ComboboxSelected>>",
-                                   lambda e: self.controller.change_native_lib_strategy(self.combo_native_lib.get()))
+        current_extract_state = self.app.cfg.config.get("NATIVE_LIB_STRATEGY", "zipalign") == "extractNativeLibs"
+        self.var_extract_libs = tk.BooleanVar(value=current_extract_state)
+        chk_extract_libs = ttk.Checkbutton(f_manifest, text="Legacy Libs (extractNativeLibs)", variable=self.var_extract_libs,
+                                         command=lambda: self.controller.toggle_extract_libs(self.var_extract_libs.get()))
+        chk_extract_libs.pack(side="left", padx=10)
 
+        # --- Inject Optionen (Frida, LSPatch) ---
         f_inject = ttk.Frame(f_actions)
         f_inject.pack(fill="x", padx=10, pady=2)
 
@@ -399,21 +393,34 @@ class WorkspaceTab(ttk.Frame):
     def open_favorites(self):
         FavoritePatchesDialog(self, self)
 
-    def sync_ui_to_state(self):
-        SessionState.active_hex_patches = [
+    def set_pipeline_buttons_state(self, state: str):
+        self.btn_build.config(state=state)
+        self.btn_flash.config(state=state)
+        self.btn_1click.config(state=state)
+
+    def is_uninstall_requested(self) -> bool:
+        return self.var_uninstall.get()
+
+    def get_hex_patch_data(self):
+        return [
             {"type": "hex", "file": p["file"].get().strip(), "ram": p["ram"].get().strip(),
              "base": p["base"].get().strip(), "orig": p["orig"].get().strip(), "patch": p["patch"].get().strip()}
             for p in self.patch_rows if p["ram"].get().strip() and p["file"].get().strip()
         ]
 
-        SessionState.active_lib_replacements = [
+    def get_lib_replacement_data(self):
+        return [
             {"type": "lib_replace", "target": p["target"].get().strip(), "source": p["source"].get().strip()}
             for p in self.lib_rows if p["target"].get().strip() and p["source"].get().strip()
         ]
 
     def get_all_patches(self):
-        self.sync_ui_to_state()
-        return SessionState.get_all_patches()
+        all_patches = []
+        all_patches.extend(self.get_hex_patch_data())
+        all_patches.extend(self.get_lib_replacement_data())
+        if self.smali_studio:
+            all_patches.extend(self.smali_studio.smali_patches)
+        return all_patches
 
     def load_patches_from_record(self, record, append=False):
         if not append:
@@ -454,9 +461,18 @@ class WorkspaceTab(ttk.Frame):
 
     def handle_patch_conflict(self, pce: PatchConflictException):
         def _show_dialog():
-            msg = f"Patch {pce.patch_index + 1} weicht von der Datei ab!\n\nDatei: {pce.file_path}\nMethode: {pce.method_sig}\n\nDie Decompiler-Formatierung (.line-Nummern, Kommentare) unterscheidet sich.\n\nMöchtest du in den manuellen Bearbeitungsmodus wechseln?\n"
-            if messagebox.askyesno("Patch Abweichung erkannt", msg):
-                self.app.log(f"[*] Öffne Konflikt in Smali Studio für Patch {pce.patch_index + 1}...")
+            msg = f"Patch {pce.patch_index + 1} weicht von der Zieldatei ab!\n\nDatei: {pce.file_path}\nMethode: {pce.method_sig}\n\nDie Pipeline hat den Build angehalten. Möchtest du den Konflikt jetzt mit dem Fuzzy Matcher lösen?\n"
+            if messagebox.askyesno("Patch Konflikt erkannt", msg):
+                self.app.log(f"[*] Öffne Konflikt-Löser für Patch {pce.patch_index + 1}...")
+
+                if self.smali_studio:
+                    patch_data = self.smali_studio.controller.smali_patches[pce.patch_index]
+                    # Index injizieren, damit der Fuzzer weiß, dass er updaten muss
+                    patch_data["_workspace_index"] = pce.patch_index
+
+                    from ui.dialogs.fuzzy_matcher_dialog import FuzzyMatchDialog
+                    FuzzyMatchDialog(self.winfo_toplevel(), self.app, self.smali_studio, patch_data,
+                                     title_suffix=f" (Build Konflikt Patch {pce.patch_index + 1})")
             else:
                 self.app.log(f"[!] Konfliktlösung durch Nutzer abgebrochen.")
 

@@ -142,14 +142,24 @@ class FuzzyMatchController:
             "edit": self.view.txt_edit.get("1.0", tk.END).strip()
         }
 
-        for p in self.smali_studio.smali_patches:
-            if p["file"].replace("\\", "/") == new_patch["file"] and p["orig"] == new_patch["orig"]:
-                return messagebox.showinfo("Duplikat", "Dieser Patch ist bereits in der Liste aktiv.", parent=self.view)
+        workspace_idx = self.fav_patch.get("_workspace_index", None)
 
-        self.smali_studio.smali_patches.append(new_patch)
+        if workspace_idx is not None:
+            # Konflikt-Modus: Bestehenden Patch im Workspace überschreiben
+            self.smali_studio.smali_patches[workspace_idx] = new_patch
+            self.app.log(f"[+] Patch {workspace_idx + 1} erfolgreich mit Fuzzy Matcher repariert!")
+        else:
+            # Favoriten-Modus: Neuen Patch anhängen
+            for p in self.smali_studio.smali_patches:
+                if p["file"].replace("\\", "/") == new_patch["file"] and p["orig"] == new_patch["orig"]:
+                    return messagebox.showinfo("Duplikat", "Dieser Patch ist bereits in der Liste aktiv.",
+                                               parent=self.view)
+            self.smali_studio.smali_patches.append(new_patch)
+            self.app.log(f"[+] Patch direkt aus Konflikt-Löser angewendet: {new_patch['file']}")
+
         self.smali_studio.refresh_smali_tree()
-        self.app.log(f"[+] Patch direkt aus Konflikt-Löser angewendet: {new_patch['file']}")
         self.view.destroy()
+
 
     def apply_and_update_fav(self):
         cand = self.view.get_selected_candidate()

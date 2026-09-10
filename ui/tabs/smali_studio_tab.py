@@ -137,6 +137,8 @@ class SmaliStudioTab(ttk.Frame):
                    command=lambda: self.controller.start_auto_explore()).pack(side="left", padx=1)
         ttk.Button(cg_toolbar_top, text="🛑 Stop", width=8, command=lambda: self.controller.stop_auto_explore()).pack(
             side="left", padx=1)
+        ttk.Button(cg_toolbar_top, text="🕸️ Export", width=9, command=lambda: self.controller.export_callgraph()).pack(
+            side="left", padx=1)
         ttk.Button(cg_toolbar_top, text="🗑 Clear", width=7, command=lambda: self.controller.clear_callgraph()).pack(
             side="right", padx=1)
         cg_toolbar_bottom = ttk.Frame(f_callgraph)

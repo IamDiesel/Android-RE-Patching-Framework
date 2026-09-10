@@ -24,6 +24,9 @@ class ToolManager:
     WIN_BUILD_TOOLS = "https://dl.google.com/android/repository/build-tools_r34-windows.zip"
     WIN_NODE_JS = "https://nodejs.org/dist/v20.11.1/node-v20.11.1-win-x64.zip"
 
+    # NEU: Korrekte URL für das portable ZIP-Archiv von Graphviz
+    WIN_GRAPHVIZ = "https://gitlab.com/api/v4/projects/4207231/packages/generic/graphviz-releases/10.0.1/windows_10_cmake_Release_Graphviz-10.0.1-win64.zip"
+
     @classmethod
     def _download_file(cls, url: str, target_path: str) -> None:
         req = urllib.request.Request(url, headers={'User-Agent': 'Kippy-RE-Framework-Downloader'})
@@ -63,7 +66,8 @@ class ToolManager:
             cls._setup_windows_binaries(tools_dir)
             cls._setup_node_js(tools_dir)
         else:
-            EventBus.publish("LOG_INFO", "[*] Nicht-Windows-System. Bitte installiere adb, apktool, zipalign und node.js manuell.")
+            EventBus.publish("LOG_INFO",
+                             "[*] Nicht-Windows-System. Bitte installiere adb, apktool, zipalign und node.js manuell.")
 
         cls._inject_into_path(tools_dir, is_win)
         cls._create_manual_instructions(tools_dir)
@@ -77,25 +81,59 @@ class ToolManager:
             try:
                 cls._download_file(cls.WIN_APKTOOL_BAT, apktool_bat)
                 cls._download_file(cls.WIN_APKTOOL_JAR, apktool_jar)
-            except Exception: pass
+            except Exception:
+                pass
 
         pt_dir = os.path.join(tools_dir, "platform-tools")
         if not os.path.exists(pt_dir) or not os.path.exists(os.path.join(pt_dir, "adb.exe")):
             zip_path = os.path.join(tools_dir, "pt.zip")
             try:
                 cls._download_file(cls.WIN_PLATFORM_TOOLS, zip_path)
-                with zipfile.ZipFile(zip_path, 'r') as z: z.extractall(tools_dir)
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.extractall(tools_dir)
                 os.remove(zip_path)
-            except Exception: pass
+            except Exception:
+                pass
 
         bt_dir = os.path.join(tools_dir, "android-14")
         if not os.path.exists(bt_dir) or not os.path.exists(os.path.join(bt_dir, "zipalign.exe")):
             zip_path = os.path.join(tools_dir, "bt.zip")
             try:
                 cls._download_file(cls.WIN_BUILD_TOOLS, zip_path)
-                with zipfile.ZipFile(zip_path, 'r') as z: z.extractall(tools_dir)
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.extractall(tools_dir)
                 os.remove(zip_path)
-            except Exception: pass
+            except Exception:
+                pass
+
+        # NEU: Graphviz Setup (Portable)
+        gv_dir = os.path.join(tools_dir, "graphviz")
+        dot_exists = False
+        if os.path.exists(gv_dir):
+            for root, _, files in os.walk(gv_dir):
+                if "dot.exe" in files:
+                    dot_exists = True
+                    break
+
+        if not dot_exists:
+            EventBus.publish("LOG_INFO", "[*] Lade portable Graphviz Umgebung herunter (ZIP ca. 5MB)...")
+            zip_path = os.path.join(tools_dir, "graphviz.zip")
+            try:
+                # 1. Herunterladen
+                cls._download_file(cls.WIN_GRAPHVIZ, zip_path)
+
+                # 2. Ordner sicherstellen
+                os.makedirs(gv_dir, exist_ok=True)
+
+                # 3. Entpacken
+                with zipfile.ZipFile(zip_path, 'r') as z:
+                    z.extractall(gv_dir)
+
+                # 4. Aufräumen
+                os.remove(zip_path)
+                EventBus.publish("LOG_INFO", "[+] Graphviz erfolgreich portabel eingerichtet!")
+            except Exception as e:
+                EventBus.publish("LOG_INFO", f"[!] Fehler bei Graphviz Download: {e}")
 
     @classmethod
     def _setup_node_js(cls, tools_dir: str):
@@ -124,10 +162,19 @@ class ToolManager:
         if is_win:
             pt_dir = os.path.join(tools_dir, "platform-tools")
             bt_dir = os.path.join(tools_dir, "android-14")
-            node_dir = os.path.join(tools_dir, "node-v20.11.1-win-x64") # NEU
+            node_dir = os.path.join(tools_dir, "node-v20.11.1-win-x64")
+
             if os.path.exists(pt_dir): paths_to_add.append(os.path.abspath(pt_dir))
             if os.path.exists(bt_dir): paths_to_add.append(os.path.abspath(bt_dir))
-            if os.path.exists(node_dir): paths_to_add.append(os.path.abspath(node_dir)) # NEU
+            if os.path.exists(node_dir): paths_to_add.append(os.path.abspath(node_dir))
+
+            # NEU: Graphviz Bin-Ordner dynamisch finden und injizieren
+            gv_dir = os.path.join(tools_dir, "graphviz")
+            if os.path.exists(gv_dir):
+                for root, _, files in os.walk(gv_dir):
+                    if "dot.exe" in files:
+                        paths_to_add.append(os.path.abspath(root))
+                        break
 
         current_path = os.environ.get("PATH", "")
         new_path_elements = [p for p in paths_to_add if p not in current_path.split(os.pathsep)]
@@ -151,6 +198,7 @@ class ToolManager:
                 "- platform-tools hier entpacken\n"
                 "- build-tools als 'android-14' entpacken\n"
                 "- Node.js portable (ZIP) als 'node-vX.Y.Z-win-x64' entpacken\n"
+                "- Graphviz portable (ZIP) als 'graphviz' entpacken (sodass dot.exe in einem Unterordner liegt)\n"
             )
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(content)

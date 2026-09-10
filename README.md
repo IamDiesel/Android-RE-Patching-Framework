@@ -14,9 +14,9 @@ This application automates the sequential execution of unpacking, binary hex pat
 
 The application is written in Python and utilizes `tkinter` for its graphical user interface. To prevent the main thread from blocking during file I/O or computationally intensive operations, the architecture implements the Model-View-Controller (MVC) paradigm alongside an event-driven Service-Oriented Architecture (SOA).
 
-* **Strict MVC Implementation:** The graphical user interfaces (Views) are decoupled from business logic. All data processing and subprocess executions are delegated to specific controllers (e.g., `WorkspaceController`, `FridaManagerController`) and stateless service classes.
-* **EventBus (Pub/Sub):** Cross-module communication is handled via a centralized event bus (`EventBus`). Background threads, such as those reading the ADB logcat output, processing RPC messages from Frida, or calculating code diffs, publish events that UI components subscribe to, preventing hard dependencies and Tkinter threading conflicts.
-* **Pipeline Engine (Command Pattern):** The build and modification sequence is executed based on an iterable JSON configuration (`config.json`) rather than imperative hardcoding. The `PipelineEngine` instantiates classes implementing the `PipelineStep` interface for each configured operation.
+*   **Strict MVC Implementation:** The graphical user interfaces (Views) are decoupled from business logic. All data processing and subprocess executions are delegated to specific controllers (e.g., `WorkspaceController`, `FridaManagerController`, `DeviceFileManagerController`) and stateless service classes.
+*   **EventBus (Pub/Sub):** Cross-module communication is handled via a centralized event bus (`EventBus`). Background threads, such as those reading the ADB logcat output, processing RPC messages from Frida, or calculating code diffs, publish events that UI components subscribe to, preventing hard dependencies and Tkinter threading conflicts.
+*   **Pipeline Engine (Command Pattern):** The build and modification sequence is executed based on an iterable JSON configuration (`config.json`) rather than imperative hardcoding. The `PipelineEngine` instantiates classes implementing the `PipelineStep` interface for each configured operation.
 
 ### 1.1 Directory Structure & Core Files
 
@@ -37,15 +37,16 @@ The framework is organized into a modular directory structure, separating state 
 ├── services/                   # Stateless background services
 │   ├── adb_network_service.py  # ADB proxy routing and certificate pushing
 │   ├── api_db_service.py       # SQLite database operations for intercepted HTTP traffic
+│   ├── device_file_service.py  # Run-as sandbox navigation and file transfer operations
 │   ├── frida_compiler_service.py # Node.js workspace setup and JS/TS compilation via frida-compile
 │   ├── frida_server_service.py # TCP-Tunnel and PortalService daemon for reverse connections
-│   ├── frida_sync_service.py   # ADB push/pull logic bypassing Scoped Storage via run-as
+│   ├── ghost_log_service.py    # Native file-streaming tail listener for Logcat bypass
 │   ├── logcat_service.py       # Asynchronous ADB logcat trace capturing & Frida log routing
 │   ├── smali_search_service.py # Threaded RAM caching and text indexing
 │   └── ...
 │
 ├── ui/                         # Graphical User Interface (MVC Implementation)
-│   ├── controllers/            # Logic handlers receiving UI events (Workspace, FridaManager, etc.)
+│   ├── controllers/            # Logic handlers receiving UI events (Workspace, FridaManager, DeviceFileManager, etc.)
 │   ├── dialogs/                # Popup windows (e.g., FridaManagerDialog with Drawer-Pattern)
 │   ├── tabs/                   # Main notebook sections (Workspace, Smali Studio, API Inspector)
 │   └── widgets/                # Reusable UI components (e.g., SmaliEditorWidget)
@@ -108,12 +109,13 @@ An integrated text editor for Dalvik bytecode manipulation. Features a threaded 
 Coordinates source code modifications (Smali, Hex, Native Libs) and dynamically reconstructs the application.
 
 * **RASP Evasion & SELinux Compliance:** During the build pipeline, the Frida Gadget is disguised (e.g., renamed to `libmetrics.so`) to bypass static string-based RASP memory scans. Additionally, `inotify` hooks are disabled (`"on_change": "ignore"`) to prevent SELinux-induced crashes on restrictive devices.
+* **Manifest & Library Strategies:** The workspace UI includes a dynamic toggle for `extractNativeLibs` (Legacy Libs). Disabling this enforces uncompressed native libraries with proper `zipalign`. Enabling it (`extractNativeLibs="true"`) dictates that the Android package manager extracts the libraries to the filesystem, which is required for the Frida Gadget to successfully locate its associated `.config.so` JSON configurations and bundled JavaScript payloads.
 
 ### 4.4 API Inspector (DAST / MITM Proxy)
 
 Integrates `mitmdump` as a subprocess to monitor and manipulate HTTP/S traffic. Features dynamic payload interception rules and an extraction engine using JSONPath or Byte-Offsets to populate UI tables with data from the SQLite backing store (`api_traffic.db`).
 
-### 4.5 Frida Advanced Manager (V8)
+### 4.5 Frida Advanced Manager (V8 & QuickJS)
 
 A comprehensive IDE-like interface for managing and injecting dynamic instrumentation scripts written in modern JavaScript/TypeScript. It natively supports four distinct operational modes for the Frida Gadget:
 
@@ -126,3 +128,15 @@ A comprehensive IDE-like interface for managing and injecting dynamic instrument
 
 
 **UI Features:** Includes a multi-tab layout with an integrated JS/TS editor (featuring custom syntax highlighting), persistent collection management, and a collapsable side-panel (Drawer-Pattern) for device synchronization. Logs from both RPC-based and native `__android_log_print` executions are harmonized and routed to the central workspace consoles.
+
+**The Ghost Protocol (Native File Trace):**
+To bypass strict Android Zygote `stdout` restrictions, Logcat truncation, and UI-blocking timeouts during time-critical loops (e.g., race conditions, early `<clinit>` setups), the framework provides a "Ghost Log" fallback. By utilizing Frida's C-level File API to write logs directly to `/data/data/{APP_PACKAGE}/ghost.log` and establishing a synchronous `adb shell run-as tail -f` background listener, the framework captures analysis data in real-time, completely bypassing the standard Android log buffers. The UI includes automated templates and dynamic toggle switches (`File-Stream (Ghost)`) for this architecture.
+
+### 4.6 Device File Explorer
+
+An integrated graphical file manager tailored for penetration testing and dynamic analysis. It leverages the `run-as` binary wrapper via ADB to bypass Android's Scoped Storage limitations, allowing direct navigation of the application's isolated sandbox (`/data/data/{APP_PACKAGE}/`) on non-rooted devices. Features include:
+
+* Asynchronous recursive directory parsing (distinguishing between directories and files).
+* Human-readable byte formatting for file sizes.
+* Threaded real-time download and upload functionality with progress tracking to the host PC's `Downloads` folder or a temporary OS directory for immediate opening.
+* Direct manipulation (delete/push) of internal application files (e.g., SharedPrefs, Databases, SQLite journals).

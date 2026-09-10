@@ -2896,3 +2896,501 @@ smali\com\facebook\react\ReactActivity.smali	.method public attachBaseContext(La
 09-04 00:06:17.098 31522 31609 D GHOST   : ============================================
 
 ---
+
+### 🔧 RE-Patch-Report (PID-20260908-192906)
+* **App:** org.nativescript.LibreLinkUp (v1.0.0)
+* **Name:** org.nativescript.LibreLinkUp
+* **Testergebnis:** WORKING
+
+  * **Smali Patch 1** in Datei: `smali\com\app\SecureDataStoreModule.smali`
+  ```smali
+.method private final decryptKeysetWithKeystore([BLjavax/crypto/SecretKey;)[B
+    .locals 6 # Erhöht von 4 auf 6 für den File-Exporter
+
+    # --- ORIGINALCODE DER METHODE ---
+    array-length v0, p1
+    const/4 v1, 0x3
+    if-lt v0, v1, :cond_fail
+    const/4 v0, 0x0
+    aget-byte v0, p1, v0
+    const/4 v1, 0x1
+    if-ne v0, v1, :cond_fail
+    aget-byte v0, p1, v1
+    and-int/lit16 v0, v0, 0xff
+    if-lez v0, :cond_fail
+    const/4 v1, 0x2
+    add-int/2addr v0, v1
+    array-length v2, p1
+    if-le v2, v0, :cond_fail
+    invoke-static {p1, v1, v0}, Lkotlin/collections/ArraysKt;->copyOfRange([BII)[B
+    move-result-object v1
+    array-length v2, p1
+    invoke-static {p1, v0, v2}, Lkotlin/collections/ArraysKt;->copyOfRange([BII)[B
+    move-result-object p1
+    const-string v0, "AES/GCM/NoPadding"
+    invoke-static {v0}, Ljavax/crypto/Cipher;->getInstance(Ljava/lang/String;)Ljavax/crypto/Cipher;
+    move-result-object v0
+    new-instance v2, Ljavax/crypto/spec/GCMParameterSpec;
+    const/16 v3, 0x80
+    invoke-direct {v2, v3, v1}, Ljavax/crypto/spec/GCMParameterSpec;-><init>(I[B)V
+    check-cast p2, Ljava/security/Key;
+    check-cast v2, Ljava/security/spec/AlgorithmParameterSpec;
+    const/4 v1, 0x2
+    invoke-virtual {v0, v1, p2, v2}, Ljavax/crypto/Cipher;->init(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V
+    sget-object p2, Ljava/nio/charset/StandardCharsets;->UTF_8:Ljava/nio/charset/Charset;
+    const-string v1, "org.newyu.librelinkup.secure-datastore:tink-keyset:v1"
+    invoke-virtual {v1, p2}, Ljava/lang/String;->getBytes(Ljava/nio/charset/Charset;)[B
+    move-result-object p2
+    invoke-virtual {v0, p2}, Ljavax/crypto/Cipher;->updateAAD([B)V
+    invoke-virtual {v0, p1}, Ljavax/crypto/Cipher;->doFinal([B)[B
+    move-result-object p0
+    # --- ENDE ORIGINALCODE ---
+
+    # ========================================================================
+    # 🎯 GHOST PROTOCOL v15.3: EXPORT DIREKT IN APPROOT (GARANTIERT EXISTENT)
+    # ========================================================================
+    const/4 v1, 0x2
+    invoke-static {p0, v1}, Landroid/util/Base64;->encodeToString([BI)Ljava/lang/String;
+    move-result-object v1
+
+    :try_start_file_write
+    new-instance v4, Ljava/io/File;
+    const-string v5, "/data/data/org.nativescript.LibreLinkUp/tink_keyset.txt"
+    invoke-direct {v4, v5}, Ljava/io/File;-><init>(Ljava/lang/String;)V
+
+    new-instance v5, Ljava/io/FileOutputStream;
+    invoke-direct {v5, v4}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
+
+    sget-object v4, Ljava/nio/charset/StandardCharsets;->UTF_8:Ljava/nio/charset/Charset;
+    invoke-virtual {v1, v4}, Ljava/lang/String;->getBytes(Ljava/nio/charset/Charset;)[B
+    move-result-object v4
+
+    invoke-virtual {v5, v4}, Ljava/io/FileOutputStream;->write([B)V
+    invoke-virtual {v5}, Ljava/io/FileOutputStream;->close()V
+
+    const-string v4, "GHOST"
+    const-string v5, "[💾 GHOST-FILE] Tink Keyset erfolgreich exportiert nach: tink_keyset.txt"
+    invoke-static {v4, v5}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+    :try_end_file_write
+    .catch Ljava/lang/Exception; {:try_start_file_write .. :try_end_file_write} :catch_file_write
+
+    :catch_file_write
+    # ========================================================================
+
+    return-object p0
+
+    :cond_fail
+    const/4 p0, 0x0
+    return-object p0
+.end method
+  ```
+
+  * **Smali Patch 2** in Datei: `smali\com\app\MainApplication.smali`
+  ```smali
+.method public attachBaseContext(Landroid/content/Context;)V
+    .locals 0
+    invoke-super {p0, p1}, Landroid/app/Application;->attachBaseContext(Landroid/content/Context;)V
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 3** in Datei: `smali\com\facebook\react\ReactActivity.smali`
+  ```smali
+.method public onStart()V
+    .locals 0
+    invoke-super {p0}, Landroidx/appcompat/app/AppCompatActivity;->onStart()V
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 4** in Datei: `smali_classes3\com\app\MainActivity.smali`
+  ```smali
+.method public attachBaseContext(Landroid/content/Context;)V
+    .locals 0
+
+    # Den legitimen Android/React Native Lifecycle erhalten, den RASP aber löschen
+    invoke-super {p0, p1}, Lcom/facebook/react/ReactActivity;->attachBaseContext(Landroid/content/Context;)V
+
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 5** in Datei: `smali\com\facebook\react\ReactActivity.smali`
+  ```smali
+.method public attachBaseContext(Landroid/content/Context;)V
+    .locals 0
+    invoke-super {p0, p1}, Landroidx/appcompat/app/AppCompatActivity;->attachBaseContext(Landroid/content/Context;)V
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 6** in Datei: `smali\com\app\SecureDataStoreModule.smali`
+  ```smali
+.method private final associatedDataForItem(Ljava/lang/String;)[B
+    .locals 4 # Erhöht von 1 auf 4 für den File-Exporter
+
+    # ========================================================================
+    # 🎯 GHOST PROTOCOL v15.4: EXPORT DIREKT IN APPROOT (GARANTIERT EXISTENT)
+    # ========================================================================
+    :try_start_key_write
+    invoke-virtual {p1}, Ljava/lang/String;->getBytes()[B
+    move-result-object v0
+
+    new-instance v1, Ljava/io/File;
+    const-string v2, "/data/data/org.nativescript.LibreLinkUp/datastore_key.txt"
+    invoke-direct {v1, v2}, Ljava/io/File;-><init>(Ljava/lang/String;)V
+
+    new-instance v2, Ljava/io/FileOutputStream;
+    invoke-direct {v2, v1}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
+
+    invoke-virtual {v2, v0}, Ljava/io/FileOutputStream;->write([B)V
+    invoke-virtual {v2}, Ljava/io/FileOutputStream;->close()V
+
+    const-string v0, "GHOST"
+    const-string v1, "[💾 GHOST-FILE] Datastore Key erfolgreich exportiert nach: datastore_key.txt"
+    invoke-static {v0, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+    :try_end_key_write
+    .catch Ljava/lang/Exception; {:try_start_key_write .. :try_end_key_write} :catch_key_write
+
+    :catch_key_write
+    # ========================================================================
+
+    # --- ORIGINALCODE DER METHODE ---
+    .line 482
+    new-instance p0, Ljava/lang/StringBuilder;
+    const-string v0, "org.newyu.librelinkup.secure-datastore:item:"
+    invoke-direct {p0, v0}, Ljava/lang/StringBuilder;-><init>(Ljava/lang/String;)V
+    invoke-virtual {p0, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    const-string p1, ":v1"
+    invoke-virtual {p0, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    invoke-virtual {p0}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object p0
+
+    .line 483
+    sget-object p1, Ljava/nio/charset/StandardCharsets;->UTF_8:Ljava/nio/charset/Charset;
+    const-string v0, "UTF_8"
+    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullExpressionValue(Ljava/lang/Object;Ljava/lang/String;)V
+    invoke-virtual {p0, p1}, Ljava/lang/String;->getBytes(Ljava/nio/charset/Charset;)[B
+    move-result-object p0
+    const-string p1, "getBytes(...)"
+    invoke-static {p0, p1}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullExpressionValue(Ljava/lang/Object;Ljava/lang/String;)V
+    return-object p0
+    # --- ENDE ORIGINALCODE ---
+.end method
+  ```
+
+  * **Smali Patch 7** in Datei: `smali\com\app\EncryptedSharedPreferencesModule.smali`
+  ```smali
+.method public final getItem(Ljava/lang/String;Lcom/facebook/react/bridge/Promise;)V
+    .locals 5
+    .annotation runtime Lcom/facebook/react/bridge/ReactMethod;
+    .end annotation
+
+    const-string v0, "key"
+
+    invoke-static {p1, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
+
+    const-string v0, "promise"
+
+    invoke-static {p2, v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNullParameter(Ljava/lang/Object;Ljava/lang/String;)V
+
+    .line 65
+    iget-object v0, p0, Lcom/app/EncryptedSharedPreferencesModule;->sharedPreferences:Landroid/content/SharedPreferences;
+
+    if-nez v0, :cond_0
+
+    .line 66
+    new-instance v0, Ljava/lang/NullPointerException;
+
+    const-string v1, "Could not initialize SharedPreferences"
+
+    invoke-direct {v0, v1}, Ljava/lang/NullPointerException;-><init>(Ljava/lang/String;)V
+
+    check-cast v0, Ljava/lang/Throwable;
+
+    invoke-interface {p2, v0}, Lcom/facebook/react/bridge/Promise;->reject(Ljava/lang/Throwable;)V
+
+    return-void
+
+    .line 70
+    :cond_0
+    invoke-static {v0}, Lkotlin/jvm/internal/Intrinsics;->checkNotNull(Ljava/lang/Object;)V
+
+    const/4 v1, 0x0
+
+    invoke-interface {v0, p1, v1}, Landroid/content/SharedPreferences;->getString(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+
+    move-result-object v0
+
+    # ========================================================================
+    # 🕵️‍♂️ GHOST PROTOCOL v21: VOLLSTÄNDIG ABSTURZSICHERER FILE-WRITER
+    # ========================================================================
+    # Null-Check: Wenn v0 null (0) ist, springe direkt zum Ende und skippe den File-Export
+    if-eqz v0, :ghost_file_skip
+
+    :try_start_file
+    # 1. Pfad zusammenbauen: "/data/data/org.nativescript.LibreLinkUp/esp_{Key}.txt"
+    new-instance v2, Ljava/lang/StringBuilder;
+
+    invoke-direct {v2}, Ljava/lang/StringBuilder;-><init>()V
+
+    const-string v3, "/data/data/org.nativescript.LibreLinkUp/esp_"
+
+    invoke-virtual {v2, v3}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v2, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    const-string v3, ".txt"
+
+    invoke-virtual {v2, v3}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v2}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object v2
+
+    # 2. FileWriter initialisieren und Klartext-Wert schreiben
+    new-instance v3, Ljava/io/FileWriter;
+
+    invoke-direct {v3, v2}, Ljava/io/FileWriter;-><init>(Ljava/lang/String;)V
+
+    invoke-virtual {v3, v0}, Ljava/io/FileWriter;->write(Ljava/lang/String;)V
+
+    invoke-virtual {v3}, Ljava/io/FileWriter;->close()V
+
+    # 3. Bestätigung im Logcat ausgeben
+    const-string v2, "GHOST"
+
+    new-instance v3, Ljava/lang/StringBuilder;
+
+    invoke-direct {v3}, Ljava/lang/StringBuilder;-><init>()V
+
+    const-string v4, "[💾 GHOST-ESP] Key dechiffriert exportiert: "
+
+    invoke-virtual {v3, v4}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v3, p1}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+
+    invoke-virtual {v3}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+
+    move-result-object v3
+
+    invoke-static {v2, v3}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+    :try_end_file
+    .catch Ljava/lang/Exception; {:try_start_file .. :try_end_file} :catch_file
+
+    goto :ghost_file_skip
+
+    :catch_file
+    move-exception v2
+    const-string v3, "GHOST"
+
+    const-string v4, "[❌ GHOST-ESP] Fehler beim Schreiben der SharedPreferences"
+
+    invoke-static {v3, v4, v2}, Landroid/util/Log;->e(Ljava/lang/String;Ljava/lang/String;Ljava/lang/Throwable;)I
+
+    :ghost_file_skip
+    # ========================================================================
+
+    .line 71
+    # Verspricht das Ergebnis an React Native zurückzugeben (v0 kann hier null oder der String sein)
+    invoke-interface {p2, v0}, Lcom/facebook/react/bridge/Promise;->resolve(Ljava/lang/Object;)V
+
+    return-void
+.end method
+  ```
+
+  * **Smali Patch 8** in Datei: `smali\com\app\MainApplication.smali`
+  ```smali
+.method static constructor <clinit>()V
+    .locals 2
+
+    # ========================================================================
+    # 🎯 GHOST PROTOCOL: DYNAMIC FRIDA INJECTION (THE ULTIMATE BYPASS)
+    # ========================================================================
+    new-instance v0, Ljava/io/File;
+    const-string v1, "/data/data/org.nativescript.LibreLinkUp/ghost_aes_key.txt"
+    invoke-direct {v0, v1}, Ljava/io/File;-><init>(Ljava/lang/String;)V
+
+    invoke-virtual {v0}, Ljava/io/File;->exists()Z
+    move-result v0
+
+    # Wenn v0 != 0 (true, Datei existiert), springe zu :skip_frida
+    if-nez v0, :skip_frida
+
+    # --- DATEI FEHLT: LADE FRIDA (Phase 1) ---
+    const-string v0, "metrics"
+    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V
+
+    const-string v0, "GHOST"
+    const-string v1, "[👻 BOOT] Phase 1: Key fehlt. Frida (libmetrics.so) geladen!"
+    invoke-static {v0, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+    
+    goto :continue_boot
+
+    :skip_frida
+    # --- DATEI EXISTIERT: FRIDA ÜBERSPRINGEN (Phase 2) ---
+    const-string v0, "GHOST"
+    const-string v1, "[👻 BOOT] Phase 2: Key gefunden. Frida blockiert. Stealth-Modus!"
+    invoke-static {v0, v1}, Landroid/util/Log;->d(Ljava/lang/String;Ljava/lang/String;)I
+
+    :continue_boot
+    # ========================================================================
+
+    # --- ORIGINALCODE DER METHODE ---
+    const/16 v0, 0x5f
+
+    new-array v0, v0, [B
+
+    fill-array-data v0, :array_0
+
+    sput-object v0, Lcom/app/MainApplication;->$$a:[B
+
+    const/16 v0, 0x27
+
+    sput v0, Lcom/app/MainApplication;->$$b:I
+
+    const/4 v0, 0x0
+
+    sput v0, Lcom/app/MainApplication;->ArtificialStackFrames:I
+
+    const/4 v0, 0x1
+
+    sput v0, Lcom/app/MainApplication;->coroutineCreation:I
+
+    invoke-static {}, Lcom/app/MainApplication;->CoroutineDebuggingKt()V
+
+    new-instance v0, Lcom/app/MainApplication$Companion;
+
+    const/4 v1, 0x0
+
+    invoke-direct {v0, v1}, Lcom/app/MainApplication$Companion;-><init>(Lkotlin/jvm/internal/DefaultConstructorMarker;)V
+
+    sput-object v0, Lcom/app/MainApplication;->Companion:Lcom/app/MainApplication$Companion;
+
+    return-void
+
+    nop
+
+    :array_0
+    .array-data 1
+        0x24t
+        -0x3dt
+        0x1et
+        -0x61t
+        -0x3t
+        -0x5t
+        -0x3t
+        0x9t
+        -0x5t
+        -0x17t
+        0xct
+        -0x3t
+        -0x10t
+        -0x8t
+        -0x2t
+        -0xbt
+        0x1t
+        -0xdt
+        0x6t
+        -0x2bt
+        0x27t
+        -0x16t
+        0x7t
+        -0xdt
+        0x2ct
+        -0x3t
+        -0x10t
+        -0x8t
+        -0x2t
+        -0xbt
+        0x1t
+        -0xdt
+        0x6t
+        -0x1et
+        0x1ct
+        -0x18t
+        -0x3t
+        0x3t
+        -0x2at
+        0x27t
+        -0x16t
+        0x7t
+        -0xdt
+        0x9t
+        0x7t
+        -0x2t
+        -0x8t
+        0x1t
+        -0x6t
+        -0x10t
+        0x0t
+        -0xet
+        -0x27t
+        0x2at
+        -0x12t
+        -0x9t
+        0xet
+        -0x10t
+        0x1t
+        -0x6t
+        0x7t
+        -0x2t
+        -0x8t
+        0x1t
+        -0x6t
+        -0x10t
+        0x0t
+        -0xet
+        -0x28t
+        0x28t
+        0x1t
+        -0xct
+        -0xft
+        -0x8t
+        0xct
+        0x2t
+        0x27t
+        -0x2t
+        -0x8t
+        0x1t
+        -0x6t
+        -0x10t
+        0x0t
+        -0xet
+        -0x26t
+        0x1ct
+        -0x8t
+        0xet
+        -0x13t
+        -0x5t
+        -0x3t
+        0x0t
+        -0xct
+        -0x21t
+        0x24t
+    .end array-data
+.end method
+  ```
+
+**Beobachtung:**
+2 Stufiger dynamischer PatcH:
+1. Aufstarten: Frida Patch aktiv, extrahiert schlüssel aus Speicher und legt datei n data/data an ("ghost_aes_key.txt"
+Wenn der smali patch in der main erkennt dass die Datei angelegt wurde, wird die frida.so nicht geladen und die smali patches in decryptKeysetwithkeystore, associatedDataForItem und getItem legen die restlichen keys / daten ab.
+
+adb shell "run-as org.nativescript.LibreLinkUp ls -la /data/data/org.nativescript.LibreLinkUp/"
+total 100
+drwx------  10 u0_a647 u0_a647        3452 2026-09-09 00:00 .
+drwxrwx--x 546 system  system        57344 2026-09-08 19:30 ..
+drwxrwx--x   2 u0_a647 u0_a647        3452 2026-09-08 19:32 app_textures
+drwx------   3 u0_a647 u0_a647        3452 2026-09-08 20:30 app_webview
+drwxrws--x   7 u0_a647 u0_a647_cache  3452 2026-09-08 19:35 cache
+drwxrws--x   2 u0_a647 u0_a647_cache  3452 2026-09-08 19:30 code_cache
+drwxrwx--x   2 u0_a647 u0_a647        3452 2026-09-08 19:32 databases
+-rw-------   1 u0_a647 u0_a647          14 2026-09-09 00:00 datastore_key.txt
+drwxrwx--x   6 u0_a647 u0_a647        3452 2026-09-08 23:12 files
+-rw-------   1 u0_a647 u0_a647          33 2026-09-09 00:00 ghost_aes_key.txt
+drwxrwx--x   3 u0_a647 u0_a647        3452 2026-09-08 19:35 no_backup
+drwxrwx--x   2 u0_a647 u0_a647        8192 2026-09-09 00:03 shared_prefs
+-rw-------   1 u0_a647 u0_a647         144 2026-09-09 00:00 tink_keyset.txt
+
+---

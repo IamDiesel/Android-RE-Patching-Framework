@@ -36,23 +36,39 @@ class LogcatService:
     def _read_logs(self):
         try:
             for line in iter(self.log_process.stdout.readline, ''):
-                if line:
-                    if self.log_file_handle and not self.log_file_handle.closed:
-                        self.log_file_handle.write(line)
-                        self.log_file_handle.flush()
+                if not line:
+                    continue
 
-                    # Standard Logcat Line Event (für das Logging Tab)
-                    EventBus.publish("LOGCAT_LINE", line)
+                # 1. Datei-Logging: Die rohe Zeile inkl. originaler Umbrüche speichern
+                if self.log_file_handle and not self.log_file_handle.closed:
+                    self.log_file_handle.write(line)
+                    self.log_file_handle.flush()
 
-                    # NEU: Extrahieren nativer Frida-Logs für die globale Konsole
-                    # Dies stellt sicher, dass Autark-Modi (Script / ScriptDirectory)
-                    # ihre Outputs global im Workspace melden.
-                    lower_line = line.lower()
-                    if "frida" in lower_line and not "logcat" in lower_line:
-                        # Bereinige den typischen Logcat Header (z.B. "09-07 12:34:56.789 1234 5678 I Frida  : ...")
-                        clean_msg = line.strip().split(":", 3)[-1].strip() if ":" in line else line.strip()
-                        # Prefix [Frida Device] unterscheidet es von [Frida] (RPC Host Bridge)
-                        EventBus.publish("LOG_INFO", f"[Frida Device] {clean_msg}")
+                # 2. UI-Logging: Ausschließlich den Umbruch am Ende abschneiden
+                clean_line = line.rstrip('\r\n')
+
+                # Wenn die Zeile danach komplett leer ist, überspringen wir sie für die UI
+                if not clean_line:
+                    continue
+
+                # Standard Logcat Line Event (für das Logging Tab)
+                EventBus.publish("LOGCAT_LINE", clean_line)
+
+                # NEU: Extrahieren nativer Frida-Logs für die globale Konsole
+                # Dies stellt sicher, dass Autark-Modi (Script / ScriptDirectory)
+                # ihre Outputs global im Workspace melden.
+                lower_line = clean_line.lower()
+                if "frida" in lower_line and not "logcat" in lower_line:
+                    # Bereinige den typischen Logcat Header (z.B. "09-07 12:34:56.789 1234 5678 I Frida  : ...")
+                    # FIX: Wir nutzen hier KEIN .strip() mehr auf der Nachricht, damit deine Einrückungen (Tabs/Spaces) bei Java Stacktraces erhalten bleiben!
+                    parts = clean_line.split(":", 3)
+                    clean_msg = parts[-1] if len(parts) > 1 else clean_line
+
+                    # Prefix [Frida Device] unterscheidet es von [Frida] (RPC Host Bridge)
+                    EventBus.publish("LOG_INFO", f"[Frida Device] {clean_msg}")
+
+        except Exception:
+            pass
 
         except Exception:
             pass

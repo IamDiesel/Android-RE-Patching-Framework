@@ -6,6 +6,8 @@ from typing import Dict, Any
 from core.pipeline.step_interface import PipelineStep
 from core.application.session_state import SessionState
 from core.domain.exceptions import PatchConflictException
+from core.fuzzing_engine import FuzzingEngine
+
 
 class InjectCustomLibsStep(PipelineStep):
     def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
@@ -43,7 +45,8 @@ class InjectCustomLibsStep(PipelineStep):
                     if os.path.exists(target_lib_path):
                         try:
                             shutil.copy2(source_path, target_lib_path)
-                            engine_context.log(f"[+] '{target_name}' in Architektur '{arch}' erfolgreich durch Custom-Lib überschrieben!")
+                            engine_context.log(
+                                f"[+] '{target_name}' in Architektur '{arch}' erfolgreich durch Custom-Lib überschrieben!")
                             replaced_count += 1
                             found_in_apk = True
                         except Exception as e:
@@ -51,10 +54,12 @@ class InjectCustomLibsStep(PipelineStep):
                             return False
 
             if not found_in_apk:
-                engine_context.log(f"[-] WARNUNG: Ziel-Lib '{target_name}' wurde in keiner Architektur der APK gefunden!")
+                engine_context.log(
+                    f"[-] WARNUNG: Ziel-Lib '{target_name}' wurde in keiner Architektur der APK gefunden!")
 
         engine_context.log(f"[+] Insgesamt {replaced_count} Lib(s) erfolgreich ausgetauscht.")
         return True
+
 
 class AnchorPatchStep(PipelineStep):
     def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
@@ -86,6 +91,7 @@ class AnchorPatchStep(PipelineStep):
             engine_context.log(f"[!] Patch-Fehler: {e}")
             return False
 
+
 class SmartPatchStep(PipelineStep):
     def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
         patches = SessionState.active_smali_patches
@@ -96,7 +102,8 @@ class SmartPatchStep(PipelineStep):
         folder_name = engine_context.get_unpacked_dir_name()
         src_dir = os.path.join(engine_context.cfg.paths.get("APP_SOURCE_DIR", ""), folder_name)
         dst_dir = os.path.join(engine_context.cfg.paths.get("DEST_DIR", ""), folder_name)
-        target_tool = "apkeditor" if engine_context.cfg.config.get("MANIFEST_STRATEGY", "smali_only") == "apkeditor" else "apktool"
+        target_tool = "apkeditor" if engine_context.cfg.config.get("MANIFEST_STRATEGY",
+                                                                   "smali_only") == "apkeditor" else "apktool"
 
         for idx, p in enumerate(patches):
             rel_file = p.get("file", "").replace("\\", "/")
@@ -138,9 +145,9 @@ class SmartPatchStep(PipelineStep):
                 with open(dst_file, "r", encoding="utf-8") as f:
                     content = f.read()
 
-                orig_block = p.get("orig", "").replace("\r\n", "\n")
-                edit_block = p.get("edit", "").replace("\r\n", "\n")
-                content = content.replace("\r\n", "\n")
+                orig_block = p.get("orig", "").replace("\r", "")
+                edit_block = p.get("edit", "").replace("\r", "")
+                content = content.replace("\r", "")
 
                 if orig_block in content:
                     content = content.replace(orig_block, edit_block)
@@ -149,17 +156,58 @@ class SmartPatchStep(PipelineStep):
                     method_match = re.search(r'^(\.method\s+[^\n]+)', orig_block, re.MULTILINE)
                     if method_match:
                         method_sig = method_match.group(1).strip()
-                        actual_method_pattern = re.compile(r'^' + re.escape(method_sig) + r'.*?^\.end method', re.MULTILINE | re.DOTALL)
+                        actual_method_pattern = re.compile(r'^' + re.escape(method_sig) + r'.*?^\.end method',
+                                                           re.MULTILINE | re.DOTALL)
                         actual_match = actual_method_pattern.search(content)
 
                         if actual_match:
                             actual_block = actual_match.group(0)
-                            raise PatchConflictException(idx, actual_rel_file, method_sig, orig_code=orig_block, actual_block=actual_block, edit_block=edit_block)
+
+                            norm_orig = FuzzingEngine._normalize_smali(orig_block)
+                            norm_actual = FuzzingEngine._normalize_smali(actual_block)
+
+                            if norm_orig == norm_actual:
+                                content = content.replace(actual_block, edit_block)
+                                engine_context.log(
+                                    f"[*] Smali-Patch {idx + 1} per Auto-Fix (Formatierung) in '{actual_rel_file}' angewendet.")
+                            else:
+                                # ==========================================================
+                                # DEEP DEBUGGING PRINTS FÜR DEN AUTO-FIX
+                                # ==========================================================
+                                engine_context.log(f"\n[DEBUG] --- AUTO-FIX FEHLGESCHLAGEN BEI PATCH {idx + 1} ---")
+                                engine_context.log(
+                                    f"[DEBUG] Length norm_orig: {len(norm_orig)} | Length norm_actual: {len(norm_actual)}")
+
+                                min_len = min(len(norm_orig), len(norm_actual))
+                                diff_idx = -1
+                                for i in range(min_len):
+                                    if norm_orig[i] != norm_actual[i]:
+                                        diff_idx = i
+                                        break
+
+                                if diff_idx != -1:
+                                    start = max(0, diff_idx - 30)
+                                    end = min(min_len, diff_idx + 30)
+                                    engine_context.log(f"[DEBUG] Erste Abweichung bei Zeichen-Index {diff_idx}:")
+                                    # repr() macht unsichtbare Zeichen (\n, \t, etc) sichtbar!
+                                    engine_context.log(f"[DEBUG] norm_orig   -> {repr(norm_orig[start:end])}")
+                                    engine_context.log(f"[DEBUG] norm_actual -> {repr(norm_actual[start:end])}")
+                                else:
+                                    engine_context.log("[DEBUG] Einer der Blöcke hat am Ende zusätzliche Zeichen:")
+                                    engine_context.log(f"[DEBUG] Ende norm_orig   -> {repr(norm_orig[-30:])}")
+                                    engine_context.log(f"[DEBUG] Ende norm_actual -> {repr(norm_actual[-30:])}")
+                                engine_context.log("[DEBUG] --------------------------------------------------\n")
+                                # ==========================================================
+
+                                raise PatchConflictException(idx, actual_rel_file, method_sig, orig_code=orig_block,
+                                                             actual_block=actual_block, edit_block=edit_block)
                         else:
-                            engine_context.log(f"[!] Methodensignatur '{method_sig}' für Patch {idx + 1} in '{actual_rel_file}' nicht gefunden!")
+                            engine_context.log(
+                                f"[!] Methodensignatur '{method_sig}' für Patch {idx + 1} in '{actual_rel_file}' nicht gefunden!")
                             return False
                     else:
-                        engine_context.log(f"[!] Original-Block in '{actual_rel_file}' nicht gefunden und keine .method Signatur erkannt!")
+                        engine_context.log(
+                            f"[!] Original-Block in '{actual_rel_file}' nicht gefunden und keine .method Signatur erkannt!")
                         return False
 
                 with open(dst_file, "w", encoding="utf-8") as f:

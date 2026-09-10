@@ -1,5 +1,5 @@
 {
-    "BASE_DIR": "C:\\Users\\Lenovo\\Documents\\GitHub\\Android RE Patching Framework",
+    "BASE_DIR": "C:\\Users\\Dogma\\PycharmProjects\\Android-RE-Patching-Framework",
     "SPLIT_NAME": "org.nativescript.LibreLinkUp",
     "APP_PACKAGE": "org.nativescript.LibreLinkUp",
     "SIGNER_JAR": "tools\\uber-apk-signer.jar",

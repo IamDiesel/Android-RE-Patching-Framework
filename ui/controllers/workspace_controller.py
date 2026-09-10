@@ -1,5 +1,4 @@
 import os
-import json
 import shutil
 import datetime
 import threading
@@ -18,14 +17,17 @@ class WorkspaceController:
         self.app = app
 
     def _disable_build_buttons(self):
-        self.view.btn_build.config(state="disabled")
-        self.view.btn_flash.config(state="disabled")
-        self.view.btn_1click.config(state="disabled")
+        # SAUBER: Der Controller sagt der View nur WAS passieren soll, nicht WIE.
+        self.view.set_pipeline_buttons_state("disabled")
 
     def _enable_build_buttons(self):
-        self.view.btn_build.config(state="normal")
-        self.view.btn_flash.config(state="normal")
-        self.view.btn_1click.config(state="normal")
+        self.view.set_pipeline_buttons_state("normal")
+
+    def _sync_state(self):
+        # SAUBER: Der Controller holt sich rohe Daten aus der View und aktualisiert den State
+        from core.application.session_state import SessionState
+        SessionState.active_hex_patches = self.view.get_hex_patch_data()
+        SessionState.active_lib_replacements = self.view.get_lib_replacement_data()
 
     def _copy_signed_apks_to_archive(self):
         dest_dir = self.app.cfg.paths.get("DEST_DIR", "")
@@ -59,13 +61,14 @@ class WorkspaceController:
 
     def run_full_chain(self):
         if self.app.check_lock(): return
-        self.view.sync_ui_to_state()
+        self._sync_state()
         self._disable_build_buttons()
 
         def task():
             self.app.is_unpacking = True
 
-            if self.view.var_uninstall.get():
+            # SAUBER: Abstrakte Abfrage statt direkter Zugriff auf Tkinter-Variablen
+            if self.view.is_uninstall_requested():
                 self.run_uninstall(silent=True)
 
             self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
@@ -92,7 +95,7 @@ class WorkspaceController:
 
     def run_build(self):
         if self.app.check_lock(): return
-        self.view.sync_ui_to_state()
+        self._sync_state()
         self._disable_build_buttons()
         self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
 
@@ -235,10 +238,12 @@ class WorkspaceController:
         self.app.cfg.save()
         self.app.log(f"[*] Manifest-Strategie global auf '{strategy}' geändert.")
 
-    def change_native_lib_strategy(self, strategy: str):
+    def toggle_extract_libs(self, state: bool):
+        strategy = "extractNativeLibs" if state else "zipalign"
         self.app.cfg.config["NATIVE_LIB_STRATEGY"] = strategy
         self.app.cfg.save()
-        self.app.log(f"[*] Native Libs Strategie global auf '{strategy}' geändert.")
+        status = "aktiviert" if state else "deaktiviert"
+        self.app.log(f"[*] Manifest-Hack 'extractNativeLibs' für nächsten Build {status}.")
 
     def save_session_result(self, name, version, result, observation, patches):
         record = {
