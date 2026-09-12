@@ -65,31 +65,33 @@ class WorkspaceController:
         self._disable_build_buttons()
 
         def task():
-            self.app.is_unpacking = True
+            try:
+                self.app.is_unpacking = True
 
-            # SAUBER: Abstrakte Abfrage statt direkter Zugriff auf Tkinter-Variablen
-            if self.view.is_uninstall_requested():
-                self.run_uninstall(silent=True)
+                if self.view.is_uninstall_requested():
+                    self.run_uninstall(silent=True)
 
-            self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
-            build_success = self.app.engine.run_pipeline("BUILD_NATIVE")
+                self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
+                build_success = self.app.engine.run_pipeline("BUILD_NATIVE")
 
-            if build_success:
-                self.app.log("\n=== PIPELINE START: FLASH ===")
-                flash_success = self.app.engine.run_pipeline("FLASH")
-                if flash_success:
-                    self._copy_signed_apks_to_archive()
-                    self.app.after(0, lambda: messagebox.showinfo("Erfolg",
-                                                                  "1-Click Pipeline erfolgreich abgeschlossen!\nDie gepatchte App ist jetzt auf dem Gerät installiert und startbereit."))
+                if build_success:
+                    self.app.log("\n=== PIPELINE START: FLASH ===")
+                    flash_success = self.app.engine.run_pipeline("FLASH")
+                    if flash_success:
+                        self._copy_signed_apks_to_archive()
+                        self.app.after(0, lambda: messagebox.showinfo("Erfolg",
+                                                                      "1-Click Pipeline erfolgreich abgeschlossen!\nDie gepatchte App ist jetzt auf dem Gerät installiert und startbereit."))
+                    else:
+                        self.app.after(0, lambda: messagebox.showerror("Fehler",
+                                                                       "Build war erfolgreich, aber das Installieren (Flash) via ADB ist fehlgeschlagen."))
                 else:
                     self.app.after(0, lambda: messagebox.showerror("Fehler",
-                                                                   "Build war erfolgreich, aber das Installieren (Flash) via ADB ist fehlgeschlagen."))
-            else:
-                self.app.after(0, lambda: messagebox.showerror("Fehler",
-                                                               "Build fehlgeschlagen. Die Pipeline wurde abgebrochen."))
-
-            self.app.is_unpacking = False
-            self.app.after(0, self._enable_build_buttons)
+                                                                   "Build fehlgeschlagen. Die Pipeline wurde abgebrochen."))
+            except Exception as e:
+                self.app.log(f"[!] Unerwarteter Fehler im Pipeline-Thread: {e}")
+            finally:
+                self.app.is_unpacking = False
+                self.app.after(0, self._enable_build_buttons)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -100,12 +102,16 @@ class WorkspaceController:
         self.app.log("\n=== PIPELINE START: BUILD_NATIVE ===")
 
         def task():
-            self.app.is_unpacking = True
-            success = self.app.engine.run_pipeline("BUILD_NATIVE")
-            self.app.is_unpacking = False
-            self.app.after(0, self._enable_build_buttons)
-            if success:
-                self.app.after(0, lambda: messagebox.showinfo("Build", "BUILD_NATIVE erfolgreich abgeschlossen!"))
+            try:
+                self.app.is_unpacking = True
+                success = self.app.engine.run_pipeline("BUILD_NATIVE")
+                if success:
+                    self.app.after(0, lambda: messagebox.showinfo("Build", "BUILD_NATIVE erfolgreich abgeschlossen!"))
+            except Exception as e:
+                self.app.log(f"[!] Unerwarteter Fehler im Build-Thread: {e}")
+            finally:
+                self.app.is_unpacking = False
+                self.app.after(0, self._enable_build_buttons)
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -113,6 +119,21 @@ class WorkspaceController:
         if self.app.check_lock(): return
         self._disable_build_buttons()
         self.app.log("\n=== PIPELINE START: FLASH ===")
+
+        def task():
+            try:
+                self.app.is_unpacking = True
+                success = self.app.engine.run_pipeline("FLASH")
+                if success:
+                    self._copy_signed_apks_to_archive()
+                    self.app.after(0, lambda: messagebox.showinfo("Flash", "FLASH erfolgreich abgeschlossen!"))
+            except Exception as e:
+                self.app.log(f"[!] Unerwarteter Fehler im Flash-Thread: {e}")
+            finally:
+                self.app.is_unpacking = False
+                self.app.after(0, self._enable_build_buttons)
+
+        threading.Thread(target=task, daemon=True).start()
 
         def task():
             self.app.is_unpacking = True

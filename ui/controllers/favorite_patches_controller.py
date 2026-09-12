@@ -62,7 +62,7 @@ class FavoritePatchesController:
         fav = self.fav_service.favs[int(sel[0])]
         patches_to_apply = self.get_active_patches(fav)
         studio = self.ws.smali_studio
-        if not studio or not studio._ensure_index_loaded(): return
+        if not studio or not studio._ensure_index_loaded(parent_widget=self.view): return
 
         success_count = 0
         failed_patches = []
@@ -125,7 +125,7 @@ class FavoritePatchesController:
         fav = self.fav_service.favs[int(sel[0])]
         patches_to_apply = self.get_active_patches(fav)
         studio = self.ws.smali_studio
-        if not studio or not studio._ensure_index_loaded(): return
+        if not studio or not studio._ensure_index_loaded(parent_widget=self.view): return
 
         current_patch = patches_to_apply[self.view.current_sub_patch_idx]
         ptype = current_patch.get("type", "smali")

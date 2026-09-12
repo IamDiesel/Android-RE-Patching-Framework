@@ -40,10 +40,12 @@ class SmaliStudioTab(ttk.Frame):
     def update_status(self, msg):
         self.app.after(0, lambda: self.lbl_progress_status.config(text=msg))
 
-    def _ensure_index_loaded(self):
+    def _ensure_index_loaded(self, parent_widget=None):
+        parent_dlg = parent_widget if parent_widget else self.winfo_toplevel()
+
         if self.search_engine.is_indexed: return True
         if self.search_engine.is_indexing:
-            messagebox.showinfo("Warte", "RAM Index wird gerade aufgebaut.")
+            messagebox.showinfo("Warte", "RAM Index wird gerade aufgebaut.", parent=parent_dlg)
             return False
 
         source_smali = self.get_smali_dir()
@@ -51,10 +53,12 @@ class SmaliStudioTab(ttk.Frame):
             dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), self.get_unpacked_dir_name())
             self.search_engine.build_ram_index(source_smali, dest_cache, self.app.cfg.config.get("APP_PACKAGE", "app"),
                                                lambda c: self.update_status(f"Bereit ({c} Dateien)"))
-            messagebox.showinfo("Lade Index...", "Cache wird geladen. Versuche es gleich noch einmal.")
+            messagebox.showinfo("Lade Index...", "Cache wird geladen. Versuche es gleich noch einmal.",
+                                parent=parent_dlg)
             return False
 
-        messagebox.showwarning("Fehler", "Kein entpackter Code gefunden! Bitte zuerst 'APK Entpacken' klicken.")
+        messagebox.showwarning("Fehler", "Kein entpackter Code gefunden! Bitte zuerst 'APK Entpacken' klicken.",
+                               parent=parent_dlg)
         return False
 
     def create_widgets(self):

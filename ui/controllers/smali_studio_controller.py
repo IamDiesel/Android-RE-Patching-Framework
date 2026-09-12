@@ -274,11 +274,13 @@ class SmaliStudioController:
             self.search_window.lift()
             self.search_window.focus_force()
             return
-        self.search_window = SmaliGlobalSearchWindow(self.view, self.search_engine.ram_cache, self.load_method)
+        root_window = self.view.winfo_toplevel()
+        self.search_window = SmaliGlobalSearchWindow(root_window, self.search_engine.ram_cache, self.load_method)
 
     def open_create_struct_dialog(self):
         if not self.view._ensure_index_loaded(): return
-        CreateStructDialog(self.view, self)
+        root_window = self.view.winfo_toplevel()
+        CreateStructDialog(root_window, self)
 
     # --- Call Graph Exploration Delegation ---
     def start_auto_explore(self):

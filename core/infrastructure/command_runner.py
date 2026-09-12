@@ -28,7 +28,8 @@ class CommandRunner:
         res = subprocess.run(
             cmd, shell=True, cwd=cwd,
             capture_output=True, text=True,
-            startupinfo=cls._get_startupinfo()
+            startupinfo=cls._get_startupinfo(),
+            close_fds=True  # FIX: Verhindert, dass Frida USB-Verbindungen an den Subprozess vererbt werden
         )
         return CommandResult(res.returncode, res.stdout, res.stderr)
 
@@ -45,7 +46,8 @@ class CommandRunner:
             cmd, shell=True, cwd=cwd,
             stdout=stdout_target, stderr=stderr_target,
             text=True, bufsize=1, errors="replace",
-            startupinfo=cls._get_startupinfo()
+            startupinfo=cls._get_startupinfo(),
+            close_fds=True  # FIX: Zwingt Windows dazu, Handles beim Spawnen des Kind-Prozesses zu kappen
         )
 
     @classmethod
