@@ -102,11 +102,18 @@ class SmartPatchStep(PipelineStep):
         folder_name = engine_context.get_unpacked_dir_name()
         src_dir = os.path.join(engine_context.cfg.paths.get("APP_SOURCE_DIR", ""), folder_name)
         dst_dir = os.path.join(engine_context.cfg.paths.get("DEST_DIR", ""), folder_name)
-        target_tool = "apkeditor" if engine_context.cfg.config.get("MANIFEST_STRATEGY",
-                                                                   "smali_only") == "apkeditor" else "apktool"
+        target_tool = "apkeditor" if engine_context.cfg.config.get("MANIFEST_STRATEGY", "smali_only") == "apkeditor" else "apktool"
 
+        # 1. Patches nach Datei gruppieren
+        file_groups = {}
         for idx, p in enumerate(patches):
             rel_file = p.get("file", "").replace("\\", "/")
+            if rel_file not in file_groups:
+                file_groups[rel_file] = []
+            file_groups[rel_file].append((idx, p))
+
+        # 2. Dateien iterieren und hierarchisch anwenden
+        for rel_file, file_patches in file_groups.items():
             parts = rel_file.split("/")
             dex_idx = None
             pure_path = rel_file
@@ -145,70 +152,50 @@ class SmartPatchStep(PipelineStep):
                 with open(dst_file, "r", encoding="utf-8") as f:
                     content = f.read()
 
-                orig_block = p.get("orig", "").replace("\r", "")
-                edit_block = p.get("edit", "").replace("\r", "")
                 content = content.replace("\r", "")
 
-                if orig_block in content:
-                    content = content.replace(orig_block, edit_block)
-                    engine_context.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{actual_rel_file}' angewendet.")
-                else:
-                    method_match = re.search(r'^(\.method\s+[^\n]+)', orig_block, re.MULTILINE)
-                    if method_match:
-                        method_sig = method_match.group(1).strip()
-                        actual_method_pattern = re.compile(r'^' + re.escape(method_sig) + r'.*?^\.end method',
-                                                           re.MULTILINE | re.DOTALL)
-                        actual_match = actual_method_pattern.search(content)
+                # 3. Sortieren: Full-File-Patches zuerst (0), dann Methoden-Patches (1)
+                file_patches.sort(key=lambda item: 0 if item[1].get("scope") == "file" else 1)
 
-                        if actual_match:
-                            actual_block = actual_match.group(0)
+                for idx, p in file_patches:
+                    orig_block = p.get("orig", "").replace("\r", "")
+                    edit_block = p.get("edit", "").replace("\r", "")
+                    scope = p.get("scope", "method")
 
-                            norm_orig = FuzzingEngine._normalize_smali(orig_block)
-                            norm_actual = FuzzingEngine._normalize_smali(actual_block)
+                    if scope == "file":
+                        # Full-File Patch: Wir ersetzen den gesamten Dateiinhalt.
+                        content = edit_block
+                        engine_context.log(f"[*] Full-File-Patch {idx + 1} erfolgreich in '{actual_rel_file}' angewendet.")
+                        continue
 
-                            if norm_orig == norm_actual:
-                                content = content.replace(actual_block, edit_block)
-                                engine_context.log(
-                                    f"[*] Smali-Patch {idx + 1} per Auto-Fix (Formatierung) in '{actual_rel_file}' angewendet.")
-                            else:
-                                # ==========================================================
-                                # DEEP DEBUGGING PRINTS FÜR DEN AUTO-FIX
-                                # ==========================================================
-                                engine_context.log(f"\n[DEBUG] --- AUTO-FIX FEHLGESCHLAGEN BEI PATCH {idx + 1} ---")
-                                engine_context.log(
-                                    f"[DEBUG] Length norm_orig: {len(norm_orig)} | Length norm_actual: {len(norm_actual)}")
-
-                                min_len = min(len(norm_orig), len(norm_actual))
-                                diff_idx = -1
-                                for i in range(min_len):
-                                    if norm_orig[i] != norm_actual[i]:
-                                        diff_idx = i
-                                        break
-
-                                if diff_idx != -1:
-                                    start = max(0, diff_idx - 30)
-                                    end = min(min_len, diff_idx + 30)
-                                    engine_context.log(f"[DEBUG] Erste Abweichung bei Zeichen-Index {diff_idx}:")
-                                    # repr() macht unsichtbare Zeichen (\n, \t, etc) sichtbar!
-                                    engine_context.log(f"[DEBUG] norm_orig   -> {repr(norm_orig[start:end])}")
-                                    engine_context.log(f"[DEBUG] norm_actual -> {repr(norm_actual[start:end])}")
-                                else:
-                                    engine_context.log("[DEBUG] Einer der Blöcke hat am Ende zusätzliche Zeichen:")
-                                    engine_context.log(f"[DEBUG] Ende norm_orig   -> {repr(norm_orig[-30:])}")
-                                    engine_context.log(f"[DEBUG] Ende norm_actual -> {repr(norm_actual[-30:])}")
-                                engine_context.log("[DEBUG] --------------------------------------------------\n")
-                                # ==========================================================
-
-                                raise PatchConflictException(idx, actual_rel_file, method_sig, orig_code=orig_block,
-                                                             actual_block=actual_block, edit_block=edit_block)
-                        else:
-                            engine_context.log(
-                                f"[!] Methodensignatur '{method_sig}' für Patch {idx + 1} in '{actual_rel_file}' nicht gefunden!")
-                            return False
+                    # Methoden-Patch
+                    if orig_block in content:
+                        content = content.replace(orig_block, edit_block)
+                        engine_context.log(f"[*] Smali-Patch {idx + 1} erfolgreich in '{actual_rel_file}' angewendet.")
                     else:
-                        engine_context.log(
-                            f"[!] Original-Block in '{actual_rel_file}' nicht gefunden und keine .method Signatur erkannt!")
-                        return False
+                        method_match = re.search(r'^(\.method\s+[^\n]+)', orig_block, re.MULTILINE)
+                        if method_match:
+                            method_sig = method_match.group(1).strip()
+                            actual_method_pattern = re.compile(r'^' + re.escape(method_sig) + r'.*?^\.end method', re.MULTILINE | re.DOTALL)
+                            actual_match = actual_method_pattern.search(content)
+
+                            if actual_match:
+                                actual_block = actual_match.group(0)
+                                norm_orig = FuzzingEngine._normalize_smali(orig_block)
+                                norm_actual = FuzzingEngine._normalize_smali(actual_block)
+
+                                if norm_orig == norm_actual:
+                                    content = content.replace(actual_block, edit_block)
+                                    engine_context.log(f"[*] Smali-Patch {idx + 1} per Auto-Fix in '{actual_rel_file}' angewendet.")
+                                else:
+                                    raise PatchConflictException(idx, actual_rel_file, method_sig, orig_code=orig_block, actual_block=actual_block, edit_block=edit_block)
+                            else:
+                                # SMART APPEND: Methode existiert nicht -> ans Dateiende hängen
+                                engine_context.log(f"[*] Methode '{method_sig}' (Patch {idx + 1}) nicht gefunden. Führe Smart Append aus.")
+                                content = content.rstrip() + "\n\n" + edit_block + "\n"
+                        else:
+                            engine_context.log(f"[!] Original-Block in '{actual_rel_file}' nicht gefunden und keine .method Signatur erkannt!")
+                            return False
 
                 with open(dst_file, "w", encoding="utf-8") as f:
                     f.write(content)

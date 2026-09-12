@@ -36,6 +36,17 @@ class SmaliStudioFSService:
             pass
         return None
 
+    def extract_full_file(self, rel_filepath):
+        """Liest die gesamte Smali-Datei ohne Modifikation als Block ein."""
+        filepath = os.path.join(self.get_smali_dir(), rel_filepath)
+        if not os.path.exists(filepath):
+            return None, None
+
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        return "".join(lines), lines
+
     def extract_method_block(self, rel_filepath, target_line=None, method_signature=None):
         """Liest die Datei und extrahiert den Smali-Block einer bestimmten Methode."""
         filepath = os.path.join(self.get_smali_dir(), rel_filepath)
@@ -73,12 +84,13 @@ class SmaliStudioFSService:
                         break
                 method_def = "<Klassen-Header & Felder>"
 
-        elif method_signature is not None:
+        elif method_signature is not None and method_signature != "<Klassen-Header & Felder>":
             for i, l in enumerate(lines):
-                if l.strip().startswith(".method") and method_signature in l:
-                    start_idx = i
-                    method_def = lines[start_idx].strip().replace(".method ", "")
-                    break
+                if l.strip().startswith(".method"):
+                    if f" {method_signature}" in l or f"\t{method_signature}" in l:
+                        start_idx = i
+                        method_def = lines[start_idx].strip().replace(".method ", "")
+                        break
 
             if start_idx != -1:
                 idx = start_idx
@@ -92,4 +104,10 @@ class SmaliStudioFSService:
             block = "".join(lines[start_idx:end_idx + 1])
             return block, method_def, lines
 
+            # NEU: Fallback, falls wir die komplette Datei oder den Datei-Kopf laden wollen
+        if method_signature == "<Klassen-Header & Felder>" or method_signature is None:
+            return "".join(lines), "<Klassen-Header & Felder>", lines
+
+            # Nur noch Fehler werfen, wenn wirklich eine falsche Signatur gesucht wurde
         return None, None, None
+

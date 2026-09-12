@@ -30,6 +30,12 @@ class SmaliStudioController:
         self.editing_patch_idx = None
         self._cg_filter_timer = None
 
+        # NEU: Baum-basierte Historie (Git-Branch Style)
+        self.history_nodes = {}  # Speichert alle Nodes: node_id -> dict(...)
+        self.history_root_id = None  # Der allererste Aufruf
+        self.current_history_id = None  # Wo befinden wir uns gerade im Baum?
+        self.history_counter = 0  # ID-Generator
+
         # Services initialisieren
         self.fs_service = SmaliStudioFSService(
             self.view.get_smali_dir,
@@ -42,6 +48,10 @@ class SmaliStudioController:
         self.struct_manager = view.struct_manager
         self.search_engine = view.search_engine
 
+        # Binde Modus-Umschalter an Controller (Ganze Datei vs. Nur Methode)
+        if hasattr(self.view.editor, "var_view_mode"):
+            self.view.editor.var_view_mode.trace_add("write", self._on_view_mode_changed)
+
         # EventBus Subscriptions für asynchrone Service-Updates
         EventBus.subscribe("CG_REFRESH_STABLE", lambda _: self.app.after(0, self.cg_controller.refresh_ui_stable))
         EventBus.subscribe("CG_FILTER_APPLY", lambda _: self.app.after(100,
@@ -49,6 +59,148 @@ class SmaliStudioController:
         EventBus.subscribe("XREF_SEARCH_STARTED", lambda _: self._prepare_xref_ui())
         EventBus.subscribe("XREF_SEARCH_FINISHED",
                            lambda data: self.app.after(0, lambda: self._render_xref_results(data)))
+
+    def _on_view_mode_changed(self, *args):
+        # Wenn der Klick aus der Historie kam, blockieren wir diesen Trigger
+        if getattr(self, "_ignore_mode_change", False):
+            return
+
+        if self.current_smali_file:
+            sig = self.current_method_name if self.current_method_name != "<Klassen-Header & Felder>" else None
+            self.load_method(self.current_smali_file, method_signature=sig, add_as_root=False, add_to_history=False)
+
+    def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True, add_to_history=True):
+        self.editing_patch_idx = None
+
+        block, method_def, lines = self.fs_service.extract_method_block(rel_filepath, target_line, method_signature)
+        if not lines:
+            EventBus.publish("LOG_INFO", "[!] Konnte die Datei nicht laden.")
+            return
+
+        mode = self.view.editor.var_view_mode.get() if hasattr(self.view.editor, "var_view_mode") else "method"
+        if mode == "file" and hasattr(self.fs_service, "extract_full_file"):
+            display_block, _ = self.fs_service.extract_full_file(rel_filepath)
+        else:
+            display_block = block if block else "".join(lines)
+
+        self.current_smali_file = rel_filepath.replace("\\", "/")
+        if method_def != "<Klassen-Header & Felder>" and method_def:
+            self.current_method_name = SmaliStudioParser.clean_signature(method_def)
+        else:
+            self.current_method_name = method_def or "<Klassen-Header & Felder>"
+
+        # --- NEU: Tree-basiertes History Tracking ---
+        if add_to_history:
+            new_id = f"hist_{self.history_counter}"
+            self.history_counter += 1
+
+            node = {
+                "id": new_id,
+                "file": self.current_smali_file,
+                "method": self.current_method_name,
+                "parent": self.current_history_id,
+                "children": []
+            }
+
+            # Verhindern, dass mehrfaches Klicken denselben Child-Knoten spammt
+            is_duplicate = False
+            if self.current_history_id and self.current_history_id in self.history_nodes:
+                parent_node = self.history_nodes[self.current_history_id]
+                if parent_node["children"]:
+                    last_child_id = parent_node["children"][-1]
+                    last_child = self.history_nodes[last_child_id]
+                    if last_child["file"] == node["file"] and last_child["method"] == node["method"]:
+                        self.current_history_id = last_child_id
+                        self.history_counter -= 1
+                        is_duplicate = True
+
+            if not is_duplicate:
+                self.history_nodes[new_id] = node
+                if self.current_history_id and self.current_history_id in self.history_nodes:
+                    self.history_nodes[self.current_history_id]["children"].append(new_id)
+                elif not self.history_root_id:
+                    self.history_root_id = new_id
+                self.current_history_id = new_id
+
+        self._refresh_history_tree()
+
+        # UI Updates
+        disp_name = self.current_method_name.split('(')[
+            0] if "(" in self.current_method_name else self.current_method_name
+        pkg_name = self.app.cfg.config.get("APP_PACKAGE", "app")
+        unpacked_folder = self.view.get_unpacked_dir_name()
+        os_rel_path = self.current_smali_file.replace("/", "\\")
+        self.view.lbl_smali_file.config(text=f"{pkg_name}\\{unpacked_folder}\\{os_rel_path}->{disp_name}")
+
+        self.view.editor.load_code(display_block)
+
+        if self.current_method_name != "<Klassen-Header & Felder>":
+            node_obj = self.app.cg.add_node(self.current_smali_file, self.current_method_name)
+            if add_as_root and not self._is_reachable_in_cg(node_obj.id):
+                self.app.cg.make_root(node_obj.id)
+            if block:
+                self._update_outgoing_calls(block)
+                self._update_data_flow(block)
+        else:
+            for i in self.view.tree_outgoing.get_children(): self.view.tree_outgoing.delete(i)
+            for i in self.view.tree_datagraph.get_children(): self.view.tree_datagraph.delete(i)
+
+        self._update_outline(lines)
+        self.cg_controller.refresh_ui()
+        self.app.after(50, lambda: self.cg_controller.find_and_highlight(
+            f"{self.current_smali_file}|{self.current_method_name}", highlight_only=True))
+        if self.view.ent_cg_filter.get().strip():
+            self.app.after(100, self.apply_cg_filter)
+
+    # --- Baum-Navigation ---
+    def load_history_node(self, node_id):
+        node = self.history_nodes.get(node_id)
+        if not node: return
+        self.current_history_id = node_id
+        sig = node["method"] if node["method"] != "<Klassen-Header & Felder>" else None
+        self.load_method(node["file"], method_signature=sig, add_as_root=False, add_to_history=False)
+
+    def navigate_back(self):
+        if not self.current_history_id: return
+        node = self.history_nodes.get(self.current_history_id)
+        if node and node["parent"]:
+            self.load_history_node(node["parent"])
+
+    def navigate_forward(self):
+        if not self.current_history_id: return
+        node = self.history_nodes.get(self.current_history_id)
+        if node and node["children"]:
+            # Springt bei mehreren Branches immer in den zuletzt erstellten Zweig
+            self.load_history_node(node["children"][-1])
+
+    def _build_tree(self, parent_iid, node_id):
+        node = self.history_nodes[node_id]
+        filename = node["file"].split('/')[-1]
+        m_sig = node["method"]
+
+        disp = m_sig.split('(')[0] if m_sig and '(' in m_sig else str(m_sig)
+        if disp == "<Klassen-Header & Felder>" or str(m_sig) == "None":
+            disp = "[Ganze Datei]"
+
+        text = f"{filename} -> {disp}"
+        tags = ("current",) if node_id == self.current_history_id else ("method",)
+
+        # Werte übergeben wir an die UI: (Pfad, Signatur, Node_ID)
+        self.view.tree_history.insert(parent_iid, "end", iid=node_id, text=text, values=(node["file"], m_sig, node_id),
+                                      tags=tags, open=True)
+
+        for child_id in node["children"]:
+            self._build_tree(node_id, child_id)
+
+    def _refresh_history_tree(self):
+        tree = self.view.tree_history
+        for i in tree.get_children(): tree.delete(i)
+
+        if self.history_root_id:
+            self._build_tree("", self.history_root_id)
+            if self.current_history_id:
+                tree.selection_set(self.current_history_id)
+                tree.see(self.current_history_id)
 
     @property
     def smali_patches(self):
@@ -99,56 +251,6 @@ class SmaliStudioController:
         if not hasattr(self, '_ram_dict') or len(self._ram_dict) != len(self.search_engine.ram_cache):
             self._ram_dict = {path.replace("\\", "/"): content for path, content in self.search_engine.ram_cache}
         self.cg_controller.apply_filter(term, self._ram_dict, self.view.lbl_cg_hits)
-
-    # --- Standard Loading ---
-    def load_method(self, rel_filepath, target_line=None, method_signature=None, add_as_root=True):
-        # FIX: Bearbeitungs-Modus beim Laden einer neuen Methode zwingend verlassen
-        self.editing_patch_idx = None
-
-        block, method_def, lines = self.fs_service.extract_method_block(rel_filepath, target_line, method_signature)
-        if not block:
-            EventBus.publish("LOG_INFO", "[!] Konnte den Block in der Datei nicht extrahieren.")
-            return
-
-        self.current_smali_file = rel_filepath.replace("\\", "/")
-        if method_def != "<Klassen-Header & Felder>":
-            self.current_method_name = SmaliStudioParser.clean_signature(method_def)
-        else:
-            self.current_method_name = method_def
-
-        # Anzeige-Name für Label bauen
-        disp_name = self.current_method_name.split('(')[
-            0] if "(" in self.current_method_name else self.current_method_name
-
-        # Kompletten Pfad aus Workspace Variablen für das Label generieren
-        pkg_name = self.app.cfg.config.get("APP_PACKAGE", "app")
-        unpacked_folder = self.view.get_unpacked_dir_name()
-        os_rel_path = self.current_smali_file.replace("/", "\\")
-        full_display_path = f"{pkg_name}\\{unpacked_folder}\\{os_rel_path}"
-
-        self.view.lbl_smali_file.config(text=f"{full_display_path}->{disp_name}")
-
-        self.view.editor.load_code(block)
-
-        if self.current_method_name != "<Klassen-Header & Felder>":
-            node = self.app.cg.add_node(self.current_smali_file, self.current_method_name)
-            if add_as_root:
-                if not self._is_reachable_in_cg(node.id):
-                    self.app.cg.make_root(node.id)
-
-            self._update_outgoing_calls(block)
-            self._update_data_flow(block)
-        else:
-            for i in self.view.tree_outgoing.get_children(): self.view.tree_outgoing.delete(i)
-            for i in self.view.tree_datagraph.get_children(): self.view.tree_datagraph.delete(i)
-
-        self._update_outline(lines)
-        self.cg_controller.refresh_ui()
-        self.app.after(50, lambda: self.cg_controller.find_and_highlight(
-            f"{self.current_smali_file}|{self.current_method_name}", highlight_only=True))
-
-        if self.view.ent_cg_filter.get().strip():
-            self.app.after(100, self.apply_cg_filter)
 
     def _is_reachable_in_cg(self, target_id):
         visited = set()
@@ -213,7 +315,7 @@ class SmaliStudioController:
                        lambda: self.cg_controller.find_and_highlight(data.get("current_node_id"), highlight_only=True))
 
     def load_custom_structure_into_editor(self, rel_filepath):
-        # FIX: Bearbeitungs-Modus beim Laden einer eigenen Struktur zwingend verlassen
+        # Bearbeitungs-Modus beim Laden einer eigenen Struktur zwingend verlassen
         self.editing_patch_idx = None
 
         filepath = os.path.join(self.fs_service.get_smali_dir(), rel_filepath)
@@ -237,10 +339,14 @@ class SmaliStudioController:
             self.struct_manager.save_existing_structure(f, edit)
             return
 
-        if not f or not orig or not edit: return messagebox.showwarning("Fehlt", "Original oder Edit ist leer!")
+        if not f or not orig or not edit:
+            return messagebox.showwarning("Fehlt", "Original oder Edit ist leer!")
+
+        # Scope basierend auf der Ansicht setzen
+        scope = "file" if hasattr(self.view.editor, "var_view_mode") and self.view.editor.var_view_mode.get() == "file" else "method"
 
         if self.editing_patch_idx is not None:
-            self.smali_patches[self.editing_patch_idx] = {"type": "smali", "file": f, "orig": orig, "edit": edit}
+            self.smali_patches[self.editing_patch_idx] = {"type": "smali", "scope": scope, "file": f, "orig": orig, "edit": edit}
             self.editing_patch_idx = None
         else:
             for p in self.smali_patches:
@@ -249,7 +355,7 @@ class SmaliStudioController:
                                                "Möchtest du den vorhandenen Patch überschreiben?"): return
                     self.smali_patches.remove(p)
                     break
-            self.smali_patches.append({"type": "smali", "file": f, "orig": orig, "edit": edit})
+            self.smali_patches.append({"type": "smali", "scope": scope, "file": f, "orig": orig, "edit": edit})
 
         self.view.refresh_smali_tree()
         self.view.editor.clear_edit()
@@ -257,7 +363,7 @@ class SmaliStudioController:
     def remove_smali_patch(self, idx):
         del self.smali_patches[idx]
 
-        # FIX: Index synchron halten oder Modus beenden, wenn der aktuell bearbeitete Patch gelöscht wird
+        # Index synchron halten oder Modus beenden, wenn der aktuell bearbeitete Patch gelöscht wird
         if self.editing_patch_idx == idx:
             self.editing_patch_idx = None
             self.current_method_name = ""
@@ -309,7 +415,6 @@ class SmaliStudioController:
             messagebox.showinfo("Leer", "Der Call Graph ist leer. Es gibt nichts zu exportieren!")
             return
 
-        # Speicherort: Der Archive-Ordner des aktuellen Workspaces
         export_dir = self.app.cfg.paths.get("ARCHIVE_DIR", os.path.expanduser("~"))
 
         self.app.log("[*] Generiere Graphviz-Export...")
@@ -320,11 +425,8 @@ class SmaliStudioController:
                 self.app.log(f"[+] Call Graph als SVG exportiert: {result_path}")
                 messagebox.showinfo("Exportiert", f"Graph erfolgreich exportiert!\nWird nun im Browser geöffnet.")
 
-                # FIX: Wir nutzen das webbrowser Modul, um die Windows-Dateizuordnung zu umgehen
-                # und das SVG zwingend im Standard-Browser (Chrome/Edge/Firefox) zu öffnen.
                 try:
                     import webbrowser
-                    # Wir formatieren den Pfad als lokale URL, damit der Browser ihn direkt frisst
                     file_url = f"file://{os.path.abspath(result_path)}"
                     webbrowser.open(file_url)
                 except Exception as e:

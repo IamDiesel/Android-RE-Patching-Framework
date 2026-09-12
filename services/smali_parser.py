@@ -18,6 +18,11 @@ class SmaliStudioParser:
     def parse_outline(lines: List[str], rel_filepath: str) -> List[Dict[str, Any]]:
         is_system: bool = is_system_api("L" + rel_filepath.replace(".smali", "") + ";")
         results: List[Dict[str, Any]] = []
+
+        # NEU: Root Node für komplette Datei
+        results.append(
+            {"type": "[C]", "display": "[Komplette Datei]", "tags": ("file_root", "none"), "signature": "none"})
+
         for line in lines:
             line = line.strip()
             if line.startswith(".method"):

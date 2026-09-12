@@ -1,6 +1,9 @@
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, messagebox
+
+# NEU: Wir importieren unseren eigenen Package Picker
+from ui.dialogs.package_picker_dialog import PackagePickerDialog
 
 
 class CreateStructDialog(tk.Toplevel):
@@ -37,15 +40,20 @@ class CreateStructDialog(tk.Toplevel):
         ttk.Button(self, text="🚀 Struktur generieren", command=self.confirm).pack(pady=20)
 
     def browse_path(self):
-        init_dir = self.controller.fs_service.get_smali_dir()
-        chosen_file = filedialog.asksaveasfilename(
-            initialdir=init_dir, title="Smali-Speicherort wählen",
-            filetypes=[("Smali Files", "*.smali")], defaultextension=".smali"
-        )
-        if chosen_file:
-            rel = os.path.relpath(chosen_file, init_dir).replace("\\", "/")
+        # Wir extrahieren den aktuellen Dateinamen aus dem Entry, falls der Nutzer
+        # dort schon "MeinTest.smali" reingeschrieben hat, um ihn an den Dialog zu übergeben.
+        current_path = self.ent_path.get().strip()
+        filename = "MyNewClass.smali"
+        if current_path:
+            filename = current_path.split("/")[-1]
+
+        # NEU: Aufruf unseres Workspace-internen Package-Pickers
+        dialog = PackagePickerDialog(self, self.controller.search_engine.ram_cache, initial_filename=filename)
+
+        # Wenn der Nutzer auf OK geklickt hat (result_path ist gesetzt)
+        if dialog.result_path:
             self.ent_path.delete(0, tk.END)
-            self.ent_path.insert(0, rel)
+            self.ent_path.insert(0, dialog.result_path)
 
     def confirm(self):
         rel_p = self.ent_path.get().strip()

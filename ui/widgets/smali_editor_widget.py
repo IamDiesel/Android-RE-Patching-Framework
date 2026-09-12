@@ -22,21 +22,34 @@ class SmaliEditorWidget(ttk.Frame):
         ttk.Label(f_orig_header, text="Original Code (Read-Only)").pack(side="left")
         self.btn_find_cg = ttk.Button(f_orig_header, text="🔍 Find in Call Graph")
         self.btn_find_cg.pack(side="left", padx=10)
+
+        # Radiobuttons für den Ansichtsmodus
+        self.var_view_mode = tk.StringVar(value="method")
+        f_mode = ttk.Frame(f_orig_header)
+        f_mode.pack(side="right", padx=10)
+        ttk.Radiobutton(f_mode, text="Nur Methode", variable=self.var_view_mode, value="method").pack(side="left",
+                                                                                                      padx=2)
+        ttk.Radiobutton(f_mode, text="Ganze Datei", variable=self.var_view_mode, value="file").pack(side="left", padx=2)
+
         f_orig.config(labelwidget=f_orig_header)
 
-        # Scrollbars anbinden (Horizontal & Vertikal)
-        self.scroll_y_orig = ttk.Scrollbar(f_orig, orient="vertical")
-        self.scroll_x_orig = ttk.Scrollbar(f_orig, orient="horizontal")
-        self.txt_orig = tk.Text(f_orig, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
+        # FIX: Erst Frame für Text & Scrollbars bauen, damit sie sauber gemeinsam resizen
+        container_orig = ttk.Frame(f_orig)
+        container_orig.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.scroll_y_orig = ttk.Scrollbar(container_orig, orient="vertical")
+        self.scroll_x_orig = ttk.Scrollbar(container_orig, orient="horizontal")
+        self.txt_orig = tk.Text(container_orig, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
                                 insertbackground="white", yscrollcommand=self.scroll_y_orig.set,
-                                xscrollcommand=self.scroll_x_orig.set)
+                                xscrollcommand=self.scroll_x_orig.set, state="disabled")  # Direkt auf disabled setzen
         self.scroll_y_orig.config(command=self.txt_orig.yview)
         self.scroll_x_orig.config(command=self.txt_orig.xview)
 
+        # Pack Order: Erst die Scrollbalken an die Ränder, dann das Textfeld dazwischen
         self.scroll_y_orig.pack(side="right", fill="y")
         self.scroll_x_orig.pack(side="bottom", fill="x")
-        self.txt_orig.pack(fill="both", expand=True, padx=2, pady=2)
-        self.txt_orig.bind("<Key>", lambda e: "break")
+        self.txt_orig.pack(side="left", fill="both", expand=True)
+        # Der <Key> "break" Hack wurde hier komplett entfernt!
 
         # Edit Buttons (Mitte)
         f_mid = ttk.Frame(paned)
@@ -53,9 +66,12 @@ class SmaliEditorWidget(ttk.Frame):
         f_edit = ttk.LabelFrame(paned, text="Editierter Code (Dein Patch)")
         paned.add(f_edit, weight=1)
 
-        self.scroll_y_edit = ttk.Scrollbar(f_edit, orient="vertical")
-        self.scroll_x_edit = ttk.Scrollbar(f_edit, orient="horizontal")
-        self.txt_edit = tk.Text(f_edit, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
+        container_edit = ttk.Frame(f_edit)
+        container_edit.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.scroll_y_edit = ttk.Scrollbar(container_edit, orient="vertical")
+        self.scroll_x_edit = ttk.Scrollbar(container_edit, orient="horizontal")
+        self.txt_edit = tk.Text(container_edit, wrap="none", font=("Consolas", 10), bg="#1E1E1E", fg="#D4D4D4",
                                 insertbackground="white", yscrollcommand=self.scroll_y_edit.set,
                                 xscrollcommand=self.scroll_x_edit.set)
         self.scroll_y_edit.config(command=self.txt_edit.yview)
@@ -63,7 +79,18 @@ class SmaliEditorWidget(ttk.Frame):
 
         self.scroll_y_edit.pack(side="right", fill="y")
         self.scroll_x_edit.pack(side="bottom", fill="x")
-        self.txt_edit.pack(fill="both", expand=True, padx=2, pady=2)
+        self.txt_edit.pack(side="left", fill="both", expand=True)
+
+    def load_code(self, code_block):
+        # FIX: Schreibschutz kurz aufheben, um den Code zu laden
+        self.txt_orig.config(state="normal")
+        self.txt_orig.delete("1.0", tk.END)
+        self.txt_orig.insert("1.0", code_block)
+        self._debounced_highlight(self.txt_orig)
+        # Und danach wieder sperren (Kopieren bleibt weiterhin erlaubt)
+        self.txt_orig.config(state="disabled")
+        self.clear_edit()
+
 
     def _bind_lazy_highlighting(self):
         """Bindet Events für das asynchrone, Viewport-basierte Highlighting."""
@@ -104,13 +131,6 @@ class SmaliEditorWidget(ttk.Frame):
         self.txt_edit.insert("1.0", content)
         self._debounced_highlight(self.txt_edit)
 
-    def load_code(self, code_block):
-        self.txt_orig.config(state="normal")
-        self.txt_orig.delete("1.0", tk.END)
-        self.txt_orig.insert("1.0", code_block)
-        self._debounced_highlight(self.txt_orig)
-        self.txt_orig.config(state="disabled")
-        self.clear_edit()
 
     def get_orig_text(self):
         return self.txt_orig.get("1.0", tk.END).strip()

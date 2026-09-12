@@ -35,11 +35,10 @@ class GhostLogService:
                 for line in self.process.stdout:
                     if not self.is_running: break
 
-                    # FIX: Nur die Umbrüche (\r und \n) entfernen,
-                    # aber Einrückungen am Zeilenanfang strikt beibehalten!
-                    clean_line = line.rstrip('\r\n')
+                    # FIX: striktes strip() entfernt \r, \n und Leerzeilen zuverlässig
+                    clean_line = line.strip()
 
-                    # Leere Zeilen aus dem Stream ignorieren wir
+                    # Leere Zeilen aus dem Stream ignorieren wir konsequent
                     if clean_line:
                         current_time = time.time()
 
@@ -49,7 +48,7 @@ class GhostLogService:
                         else:
                             now = datetime.datetime.now().strftime('%H:%M:%S')
                             EventBus.publish("GHOST_LOG_LINE", f"[{now}] [GHOST] {clean_line}")
-                            
+
         threading.Thread(target=task, daemon=True).start()
 
     def stop_capture(self):

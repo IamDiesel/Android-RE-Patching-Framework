@@ -77,6 +77,12 @@ class SmaliStudioTab(ttk.Frame):
 
         ttk.Button(top_bar, text="🔍 Globale Suche", command=lambda: self.controller.open_global_search()).pack(
             side="left", padx=5)
+        nav_frame = ttk.Frame(top_bar)
+        nav_frame.pack(side="left", padx=10)
+        ttk.Button(nav_frame, text="◀", width=3, command=lambda: self.controller.navigate_back()).pack(
+            side="left", padx=2)
+        ttk.Button(nav_frame, text="▶", width=3, command=lambda: self.controller.navigate_forward()).pack(
+            side="left", padx=2)
         ttk.Button(top_bar, text="💾 Zur Patch-Liste", command=lambda: self.controller.add_smali_patch()).pack(
             side="right", padx=5)
 
@@ -210,6 +216,24 @@ class SmaliStudioTab(ttk.Frame):
                 0]) if self.tree_custom_structs.selection() else None)
         self.left_nb.add(f_custom_structs, text="Eigene Strukturen")
 
+        # --- NEU: Historie Tab ---
+        f_history = ttk.Frame(self.left_nb)
+        self.tree_history = ttk.Treeview(f_history, columns=("File", "Method"), show="tree", displaycolumns=())
+        s_y_hist = ttk.Scrollbar(f_history, orient="vertical", command=self.tree_history.yview)
+        s_x_hist = ttk.Scrollbar(f_history, orient="horizontal", command=self.tree_history.xview)
+        self.tree_history.configure(yscrollcommand=s_y_hist.set, xscrollcommand=s_x_hist.set)
+        s_y_hist.pack(side="right", fill="y")
+        s_x_hist.pack(side="bottom", fill="x")
+        self.tree_history.pack(side="left", fill="both", expand=True)
+
+        self.tree_history.bind("<Double-1>", self.on_history_double_click)
+        # Kontraststarke Farben für helles Theme
+        self.tree_history.tag_configure("file", foreground="#0047AB")  # Kräftiges Dunkelblau (Cobalt) für Dateien
+        self.tree_history.tag_configure("method", foreground="#242424")  # Dunkles Grau/Fast Schwarz für Methoden
+        self.tree_history.tag_configure("current", background="#FFF2CC",
+                                        foreground="#000000")  # Dezent hellgelber Hintergrund für den aktuellen Standort
+        self.left_nb.add(f_history, text="Historie")
+
         # --- EDITOR (MITTE) ---
         self.editor = SmaliEditorWidget(main_paned)
         self.editor.btn_find_cg.config(command=lambda: self.controller.cg_controller.find_and_highlight(
@@ -272,20 +296,38 @@ class SmaliStudioTab(ttk.Frame):
         sel = self.tree_outline.selection()
         if sel:
             tags = self.tree_outline.item(sel[0], "tags")
+            if "file_root" in tags:
+                self.controller._ignore_mode_change = True
+                self.editor.var_view_mode.set("file")
+                self.controller.load_method(self.controller.current_smali_file,
+                                            method_signature="<Klassen-Header & Felder>", add_as_root=False)
+                self.controller._ignore_mode_change = False
+                return
             if "method" in tags or "system_api" in tags:
+                self.controller._ignore_mode_change = True
+                self.editor.var_view_mode.set("method")
                 sig = tags[1] if len(tags) > 1 else tags[0]
                 self.controller.load_method(self.controller.current_smali_file, method_signature=sig, add_as_root=True)
+                self.controller._ignore_mode_change = False
 
     def on_file_double_click(self, event):
         sel = self.tree_file.selection()
         if sel:
             tags = self.tree_file.item(sel[0], "tags")
-            # Ignoriere System-APIs
-            if "system_api" in tags:
-                return "break"
+            if "system_api" in tags: return "break"
+            if "file_root" in tags:
+                self.controller._ignore_mode_change = True
+                self.editor.var_view_mode.set("file")
+                self.controller.load_method(self.controller.current_smali_file,
+                                            method_signature="<Klassen-Header & Felder>", add_as_root=False)
+                self.controller._ignore_mode_change = False
+                return
             if "method" in tags:
+                self.controller._ignore_mode_change = True
+                self.editor.var_view_mode.set("method")
                 sig = tags[1] if len(tags) > 1 else tags[0]
                 self.controller.load_method(self.controller.current_smali_file, method_signature=sig, add_as_root=True)
+                self.controller._ignore_mode_change = False
 
     def on_callgraph_double_click(self, event):
         sel = self.tree_callstack.selection()
@@ -366,3 +408,23 @@ class SmaliStudioTab(ttk.Frame):
             if hasattr(self.editor, "apply_highlighting"): self.editor.apply_highlighting(self.editor.txt_edit)
         except Exception as e:
             self.app.log(f"[!] Fehler beim Einfügen: {e}")
+
+    def on_history_double_click(self, event):
+        sel = self.tree_history.selection()
+        if not sel: return
+        vals = self.tree_history.item(sel[0], "values")
+
+        # Wir erwarten jetzt 3 Werte: (file_path, method_sig, node_id)
+        if vals and len(vals) == 3:
+            f_path, m_sig, node_id = vals
+
+            self.controller._ignore_mode_change = True
+
+            if m_sig == "<Klassen-Header & Felder>" or str(m_sig) == "None":
+                self.editor.var_view_mode.set("file")
+                self.controller.load_history_node(node_id)
+            else:
+                self.editor.var_view_mode.set("method")
+                self.controller.load_history_node(node_id)
+
+            self.controller._ignore_mode_change = False
