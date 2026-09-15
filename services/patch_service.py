@@ -29,58 +29,57 @@ class PatchService:
             cleaned.append(l)
         return "\n".join(cleaned)
 
+    @classmethod
+    def evaluate_smali_patch(cls, patch: Dict[str, Any], ram_cache: List[Tuple[str, str]],
+                             existing_patches: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Prüft einen Smali-Patch gegen den RAM-Cache (Exakter Match, Fuzzy-Match oder Append).
+        Gibt ein Status-Dictionary zurück.
+        """
+        target_norm = cls.normalize_path(patch.get("file", ""))
+        orig_code = patch.get("orig", "").replace("\r\n", "\n").strip()
 
-@classmethod
-def evaluate_smali_patch(cls, patch: Dict[str, Any], ram_cache: List[Tuple[str, str]],
-                         existing_patches: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Prüft einen Smali-Patch gegen den RAM-Cache (Exakter Match, Fuzzy-Match oder Append).
-    Gibt ein Status-Dictionary zurück.
-    """
-    target_norm = cls.normalize_path(patch.get("file", ""))
-    orig_code = patch.get("orig", "").replace("\r\n", "\n").strip()
+        found_content, found_path = None, None
+        for path, content in ram_cache:
+            if cls.normalize_path(path) == target_norm:
+                found_content = content.replace("\r\n", "\n")
+                found_path = path
+                break
 
-    found_content, found_path = None, None
-    for path, content in ram_cache:
-        if cls.normalize_path(path) == target_norm:
-            found_content = content.replace("\r\n", "\n")
-            found_path = path
-            break
+        if not found_content:
+            return {"success": False, "reason": "not_found"}
 
-    if not found_content:
-        return {"success": False, "reason": "not_found"}
+        scope = patch.get("scope", "method")
 
-    scope = patch.get("scope", "method")
-
-    # 1. Full-File Scope (Wird immer als exact match gewertet, da er die Datei komplett überschreibt)
-    if scope == "file":
-        if not any(p["file"] == found_path and p.get("scope") == "file" for p in existing_patches):
-            return {"success": True, "type": "exact", "file": found_path, "orig": orig_code}
-        return {"success": True, "type": "already_applied"}
-
-    # 2. Versuch: Exakter Match (Method scope)
-    if orig_code in found_content:
-        if not any(p["file"] == found_path and p["orig"] == orig_code for p in existing_patches):
-            return {"success": True, "type": "exact", "file": found_path, "orig": orig_code}
-        return {"success": True, "type": "already_applied"}
-
-    # 3. Versuch: Struktureller Match (Ignoriert .line und Kommentare)
-    c_orig = cls.clean_smali_for_match(orig_code)
-    m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
-    if m:
-        sig = m.group(1).strip()
-        actual_match = re.search(r'^' + re.escape(sig) + r'.*?^\.end method', found_content, re.MULTILINE | re.DOTALL)
-
-        if actual_match:
-            actual_code = actual_match.group(0)
-            if c_orig == cls.clean_smali_for_match(actual_code):
-                if not any(p["file"] == found_path and p["orig"] == actual_code for p in existing_patches):
-                    return {"success": True, "type": "structural", "file": found_path, "orig": actual_code}
-                return {"success": True, "type": "already_applied"}
-        else:
-            # 4. Versuch: Smart Append (Methode existiert nicht in Datei)
-            if not any(p["file"] == found_path and p["orig"] == orig_code for p in existing_patches):
-                return {"success": True, "type": "append", "file": found_path, "orig": orig_code}
+        # 1. Full-File Scope (Wird immer als exact match gewertet, da er die Datei komplett überschreibt)
+        if scope == "file":
+            if not any(p["file"] == found_path and p.get("scope") == "file" for p in existing_patches):
+                return {"success": True, "type": "exact", "file": found_path, "orig": orig_code}
             return {"success": True, "type": "already_applied"}
 
-    return {"success": False, "reason": "conflict"}
+        # 2. Versuch: Exakter Match (Method scope)
+        if orig_code in found_content:
+            if not any(p["file"] == found_path and p["orig"] == orig_code for p in existing_patches):
+                return {"success": True, "type": "exact", "file": found_path, "orig": orig_code}
+            return {"success": True, "type": "already_applied"}
+
+        # 3. Versuch: Struktureller Match (Ignoriert .line und Kommentare)
+        c_orig = cls.clean_smali_for_match(orig_code)
+        m = re.search(r'^(\.method\s+[^\n]+)', orig_code, re.MULTILINE)
+        if m:
+            sig = m.group(1).strip()
+            actual_match = re.search(r'^' + re.escape(sig) + r'.*?^\.end method', found_content, re.MULTILINE | re.DOTALL)
+
+            if actual_match:
+                actual_code = actual_match.group(0)
+                if c_orig == cls.clean_smali_for_match(actual_code):
+                    if not any(p["file"] == found_path and p["orig"] == actual_code for p in existing_patches):
+                        return {"success": True, "type": "structural", "file": found_path, "orig": actual_code}
+                    return {"success": True, "type": "already_applied"}
+            else:
+                # 4. Versuch: Smart Append (Methode existiert nicht in Datei)
+                if not any(p["file"] == found_path and p["orig"] == orig_code for p in existing_patches):
+                    return {"success": True, "type": "append", "file": found_path, "orig": orig_code}
+                return {"success": True, "type": "already_applied"}
+
+        return {"success": False, "reason": "conflict"}
