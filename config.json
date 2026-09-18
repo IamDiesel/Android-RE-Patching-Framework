@@ -1,5 +1,5 @@
 {
-    "BASE_DIR": "C:\\Users\\Dogma\\PycharmProjects\\Android-RE-Patching-Framework",
+    "BASE_DIR": "C:\\Users\\Lenovo\\Documents\\GitHub\\Android RE Patching Framework",
     "SPLIT_NAME": "org.nativescript.LibreLinkUp",
     "APP_PACKAGE": "org.nativescript.LibreLinkUp",
     "SIGNER_JAR": "tools\\uber-apk-signer.jar",
@@ -8,7 +8,7 @@
     "TRUSTMEALREADY_APK": "tools\\TrustMeAlready.apk",
     "MANIFEST_STRATEGY": "aapt2",
     "NATIVE_LIB_STRATEGY": "zipalign",
-    "INJECT_FRIDA": true,
+    "INJECT_FRIDA": false,
     "INJECT_LSPATCH": false,
     "PIPELINES": {
         "PREPARE_WORKSPACE": [
@@ -89,6 +89,10 @@
                 "type": "inject_custom_libs"
             },
             {
+                "name": "Inject Added Libs",
+                "type": "inject_added_libs"
+            },
+            {
                 "name": "Inject Frida Gadget",
                 "type": "inject_frida"
             },
@@ -150,5 +154,14 @@
         "script_directory_path": "/data/data/{APP_PACKAGE}/files/frida_scripts",
         "active_script_id": null,
         "pause_on_load": true
-    }
+    },
+    "NDK_DIR": "",
+    "DEFAULT_ABI": "arm64-v8a",
+    "DEFAULT_API_LEVEL": 30,
+    "NDK_FALLBACK_VERSION": "r27c",
+    "NATIVE_MAX_PAGE_SIZE": 16384,
+    "INJECT_NSC": true,
+    "EXEC_RUN_DIR_DEFAULT": "/data/local/tmp",
+    "EXEC_BACKUP_KEEP": 10,
+    "EXEC_COLOR_PER_EXE": true
 }

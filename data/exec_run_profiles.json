@@ -1,0 +1,28 @@
+{
+    "presets": {
+        "engine": {
+            "run_dir": "/data/local/tmp",
+            "run_args": "./libb11bb8.so",
+            "run_env": "LD_LIBRARY_PATH=/data/local/tmp",
+            "run_cwd": "/data/local/tmp",
+            "runtime_deps": [
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/libre_go_dump/libc++_shared.so",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/kp_resp.iv",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/kp_resp.ct",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/kp_resp.tag",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/graph.iv",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/graph.ct",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/graph.tag",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/bundle.bin",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/prov_vectors_0004/unwrap1.bin",
+                "C:/Users/Lenovo/Documents/GitHub/Android RE Patching Framework/Claude outputs/libre_go_dump/libb11bb8.so"
+            ],
+            "stage_inputs": [
+                "cdfe1.bin",
+                "cdfe2.bin"
+            ],
+            "pull_globs": [],
+            "cleanup_after": false
+        }
+    }
+}

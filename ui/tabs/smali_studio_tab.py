@@ -5,6 +5,7 @@ from tkinter import ttk, messagebox
 from ui.widgets.smali_editor_widget import SmaliEditorWidget
 from services.smali_search_service import SmaliSearchEngine
 from services.smali_struct_service import SmaliStructManager
+from services.native_lib_service import NativeLibManager
 from ui.utils import UIUtils
 from ui.controllers.smali_studio_controller import SmaliStudioController
 from core.application.event_bus import EventBus
@@ -61,6 +62,50 @@ class SmaliStudioTab(ttk.Frame):
                                parent=parent_dlg)
         return False
 
+    def open_loadlibrary_helper(self):
+        """F15: fuegt System.loadLibrary(<aktive LibForge-Lib>) als Smali am Cursor ein."""
+        import os
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        base_dir = self.app.cfg.config.get("BASE_DIR", os.getcwd())
+        try:
+            active = NativeLibManager(base_dir).get_active()
+        except Exception as e:
+            messagebox.showerror("LibForge", f"Aktive Libs nicht ladbar: {e}")
+            return
+        if not active:
+            messagebox.showinfo("LibForge",
+                                "Keine aktiven LibForge-Libs.\nBaue/aktiviere zuerst eine Lib im LibForge-Reiter.")
+            return
+        names = [l.name for l in active]
+        win = tk.Toplevel(self)
+        win.title("loadLibrary einfuegen")
+        win.transient(self.winfo_toplevel())
+        win.grab_set()
+        ttk.Label(win, text="Aktive LibForge-Lib:").grid(row=0, column=0, padx=8, pady=8, sticky="w")
+        cmb = ttk.Combobox(win, values=names, state="readonly", width=28)
+        cmb.grid(row=0, column=1, padx=8, pady=8)
+        cmb.current(0)
+        ttk.Label(win, text="Register:").grid(row=1, column=0, padx=8, sticky="w")
+        ent_reg = ttk.Entry(win, width=8)
+        ent_reg.grid(row=1, column=1, padx=8, sticky="w")
+        ent_reg.insert(0, "v0")
+        def do_insert():
+            name = cmb.get().strip()
+            reg = ent_reg.get().strip() or "v0"
+            snippet = (f'    const-string {reg}, "{name}"\n'
+                       f'    invoke-static {{{reg}}}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n')
+            try:
+                self.editor.txt_edit.insert("insert", snippet)
+            except Exception:
+                pass
+            win.destroy()
+            self.app.log(f"[*] LibForge: loadLibrary('{name}') in den Editor eingefuegt.")
+        bf = ttk.Frame(win)
+        bf.grid(row=2, column=0, columnspan=2, pady=10)
+        ttk.Button(bf, text="Einfuegen", command=do_insert).pack(side="left", padx=5)
+        ttk.Button(bf, text="Abbrechen", command=win.destroy).pack(side="left", padx=5)
+
     def create_widgets(self):
         top_bar = ttk.Frame(self)
         top_bar.pack(side="top", fill="x", pady=5, padx=5)
@@ -68,6 +113,8 @@ class SmaliStudioTab(ttk.Frame):
         ttk.Button(top_bar, text="📦 APK Entpacken", command=lambda: self.controller.unpack_apk_async()).pack(
             side="left", padx=5)
         ttk.Button(top_bar, text="➕ Neue Struktur", command=lambda: self.controller.open_create_struct_dialog()).pack(
+            side="left", padx=5)
+        ttk.Button(top_bar, text="📚 loadLibrary", command=self.open_loadlibrary_helper).pack(
             side="left", padx=5)
 
         self.progress_var = tk.IntVar()

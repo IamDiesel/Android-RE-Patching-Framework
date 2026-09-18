@@ -15,7 +15,8 @@ class SettingsTab(ttk.Frame):
 
         for i, (lbl, key) in enumerate(
                 [("Base Dir", "BASE_DIR"), ("Split APK", "SPLIT_NAME"), ("Package", "APP_PACKAGE"),
-                 ("Signer", "SIGNER_JAR"), ("APKEditor", "APKEDITOR_JAR")]):
+                 ("Signer", "SIGNER_JAR"), ("APKEditor", "APKEDITOR_JAR"),
+                 ("NDK-Pfad (leer=auto)", "NDK_DIR")]):
             ttk.Label(p_frame, text=lbl + ":").grid(row=i, column=0, sticky="w", padx=5, pady=2)
             ent = ttk.Entry(p_frame, width=60)
             ent.grid(row=i, column=1, padx=5, pady=2)

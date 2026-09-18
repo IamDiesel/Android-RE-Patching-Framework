@@ -3,6 +3,7 @@ from tkinter import ttk, messagebox, filedialog, simpledialog
 import json
 import os
 import time
+import threading
 
 from core.application.event_bus import EventBus
 from core.data_extractor import DataExtractor
@@ -57,6 +58,7 @@ class APIInspectorTab(ttk.Frame):
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=5)
 
         ttk.Button(toolbar, text="📱 Push Cert", command=self.push_cert).pack(side="left", padx=2)
+        ttk.Button(toolbar, text="🔐 Cert installieren", command=self.install_cert).pack(side="left", padx=2)
         ttk.Button(toolbar, text="🔌 Route USB", command=self.route_usb).pack(side="left", padx=2)
         ttk.Button(toolbar, text="📡 Route WLAN", command=self.route_wlan).pack(side="left", padx=2)
         ttk.Button(toolbar, text="❌ Reset Route", command=self.reset_route).pack(side="left", padx=2)
@@ -218,11 +220,21 @@ class APIInspectorTab(ttk.Frame):
         self.txt_res.delete("1.0", tk.END)
         self.ent_comment.delete(0, tk.END)
 
+    def _run_bg(self, title, fn):
+        """Fuehrt eine adb-Aktion im Hintergrund aus (kein UI-Freeze) und zeigt das Ergebnis."""
+        def task():
+            try:
+                ok, msg = fn()
+            except Exception as e:
+                ok, msg = False, str(e)
+            self.after(0, lambda: (messagebox.showinfo if ok else messagebox.showwarning)(title, msg))
+        threading.Thread(target=task, daemon=True).start()
+
     def push_cert(self):
-        if AdbNetworkService.push_cert():
-            messagebox.showinfo("Zertifikat", "Installiere es in Android als CA-Zertifikat.")
-        else:
-            messagebox.showwarning("Hinweis", "Zertifikat fehlt.")
+        self._run_bg("Zertifikat", AdbNetworkService.push_cert)
+
+    def install_cert(self):
+        self._run_bg("Zertifikat installieren", AdbNetworkService.open_cert_install)
 
     def route_usb(self):
         AdbNetworkService.route_usb()

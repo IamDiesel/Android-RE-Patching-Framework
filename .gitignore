@@ -18,6 +18,11 @@ destination/
 archives/
 tools/
 doc/
+Claude outputs/
+Helper/
+data/exec_backups/
+data/native*
+data/SUCCLOG_SESSION_KEY
 
 # Device Logs
 trace.txt
@@ -57,3 +62,12 @@ Helper/TEST/librelink_ultimate_decryptor.py
 Helper/TEST/mmkv_base64.txt
 Helper/TEST/secure_datastore_v1.preferences_pb
 Helper/tink_keyset.txt
+
+data/Kippy_RE_Log.md
+data/Kippy_RE_Log.md
+services/native_lib_service.py.bak_20260917-234214
+ui/controllers/exec_run_controller.py.bak_20260917-232700
+ui/controllers/exec_run_controller.py.bak_20260917-234214
+ui/controllers/lib_forge_controller.py.bak_20260917-232700
+ui/controllers/lib_forge_controller.py.bak_20260917-234214
+services/native_lib_service.py.bak_20260917-232700

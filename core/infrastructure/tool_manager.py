@@ -202,3 +202,130 @@ class ToolManager:
             )
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(content)
+    # ================= NDK / clang (LibForge) =================
+    NDK_FALLBACK_VERSION = "r27c"
+
+    @classmethod
+    def _host_tag(cls) -> str:
+        import sys
+        if os.name == "nt":
+            return "windows-x86_64"
+        if sys.platform == "darwin":
+            return "darwin-x86_64"
+        return "linux-x86_64"
+
+    @classmethod
+    def _clang_in_ndk(cls, ndk_dir: str) -> str:
+        if not ndk_dir:
+            return ""
+        exe = "clang.exe" if os.name == "nt" else "clang"
+        p = os.path.join(ndk_dir, "toolchains", "llvm", "prebuilt", cls._host_tag(), "bin", exe)
+        return p if os.path.exists(p) else ""
+
+    @classmethod
+    def _newest_child(cls, root: str) -> str:
+        try:
+            subs = [os.path.join(root, d) for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
+            subs.sort(key=lambda p: os.path.basename(p), reverse=True)
+            return subs[0] if subs else ""
+        except Exception:
+            return ""
+
+    @classmethod
+    def _ndk_search_roots(cls, base_dir: str) -> list:
+        roots = [os.path.join(base_dir, "tools", "ndk")]
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            roots.append(os.path.join(la, "Android", "Sdk", "ndk"))
+        up = os.environ.get("USERPROFILE")
+        if up:
+            roots.append(os.path.join(up, "AppData", "Local", "Android", "Sdk", "ndk"))
+        for env in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+            v = os.environ.get(env)
+            if v:
+                roots.append(os.path.join(v, "ndk"))
+        home = os.path.expanduser("~")
+        roots.append(os.path.join(home, "Android", "Sdk", "ndk"))
+        roots.append(os.path.join(home, "Library", "Android", "sdk", "ndk"))
+        return roots
+
+    @classmethod
+    def resolve_ndk(cls, config: dict) -> str:
+        """Findet ein installiertes NDK (Override -> SDK -> env -> tools/ndk). Gibt Pfad oder '' zurueck."""
+        config = config or {}
+        base_dir = config.get("BASE_DIR", os.getcwd())
+        override = str(config.get("NDK_DIR", "") or "").strip()
+        if override and cls._clang_in_ndk(override):
+            return override
+        for root in cls._ndk_search_roots(base_dir):
+            if not os.path.isdir(root):
+                continue
+            if cls._clang_in_ndk(root):
+                return root
+            newest = cls._newest_child(root)
+            if newest and cls._clang_in_ndk(newest):
+                return newest
+        return ""
+
+    @classmethod
+    def download_ndk(cls, config: dict) -> str:
+        """Laedt das gepinnte NDK-ZIP und entpackt es nach tools/ndk/. Gibt NDK-Pfad oder '' zurueck."""
+        import sys
+        config = config or {}
+        base_dir = config.get("BASE_DIR", os.getcwd())
+        version = str(config.get("NDK_FALLBACK_VERSION", cls.NDK_FALLBACK_VERSION))
+        host = "windows" if os.name == "nt" else ("darwin" if sys.platform == "darwin" else "linux")
+        ndk_root = os.path.join(base_dir, "tools", "ndk")
+        os.makedirs(ndk_root, exist_ok=True)
+        url = f"https://dl.google.com/android/repository/android-ndk-{version}-{host}.zip"
+        zip_path = os.path.join(ndk_root, f"android-ndk-{version}.zip")
+        EventBus.publish("LOG_INFO", f"[*] Kein NDK gefunden. Lade NDK {version} herunter (grosses Archiv, einmalig)...")
+        try:
+            cls._download_file(url, zip_path)
+            EventBus.publish("LOG_INFO", "[*] Entpacke NDK (kann etwas dauern)...")
+            with zipfile.ZipFile(zip_path, "r") as z:
+                z.extractall(ndk_root)
+            os.remove(zip_path)
+        except Exception as e:
+            EventBus.publish("LOG_INFO", f"[!] NDK-Download fehlgeschlagen: {e}")
+            return ""
+        cand = os.path.join(ndk_root, f"android-ndk-{version}")
+        if cls._clang_in_ndk(cand):
+            EventBus.publish("LOG_INFO", "[+] NDK erfolgreich eingerichtet.")
+            return cand
+        newest = cls._newest_child(ndk_root)
+        return newest if cls._clang_in_ndk(newest) else ""
+
+    @classmethod
+    def _verify_clang(cls, clang_path: str) -> bool:
+        try:
+            from core.infrastructure.command_runner import CommandRunner
+            res = CommandRunner.run_blocking(f'"{clang_path}" --version', cwd=os.path.dirname(clang_path))
+            return getattr(res, "returncode", 1) == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def resolve_clang(cls, config: dict, allow_download: bool = True) -> str:
+        """Liefert den clang-Pfad (oder '') und injiziert das Toolchain-bin dynamisch in den PATH."""
+        ndk = cls.resolve_ndk(config)
+        if not ndk and allow_download:
+            ndk = cls.download_ndk(config)
+        if not ndk:
+            EventBus.publish("LOG_INFO",
+                             "[!] NDK/clang nicht gefunden. In Android Studio (SDK Tools > NDK) installieren "
+                             "oder NDK-Pfad in den Einstellungen setzen.")
+            return ""
+        clang = cls._clang_in_ndk(ndk)
+        if not clang:
+            EventBus.publish("LOG_INFO", f"[!] clang im NDK nicht gefunden: {ndk}")
+            return ""
+        bin_dir = os.path.dirname(clang)
+        cur = os.environ.get("PATH", "")
+        if bin_dir not in cur.split(os.pathsep):
+            os.environ["PATH"] = bin_dir + os.pathsep + cur
+        if not cls._verify_clang(clang):
+            EventBus.publish("LOG_INFO", f"[!] clang gefunden, aber '--version' schlug fehl: {clang}")
+            return ""
+        EventBus.publish("LOG_INFO", f"[+] NDK/clang bereit: {ndk}")
+        return clang

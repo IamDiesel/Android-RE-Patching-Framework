@@ -14,6 +14,14 @@ DEFAULT_CONFIG = {
     "TRUSTMEALREADY_APK": os.path.join("tools", "TrustMeAlready.apk"),
     "MANIFEST_STRATEGY": "apkeditor",
     "NATIVE_LIB_STRATEGY": "zipalign",
+    "NDK_DIR": "",
+    "DEFAULT_ABI": "arm64-v8a",
+    "DEFAULT_API_LEVEL": 30,
+    "NDK_FALLBACK_VERSION": "r27c",
+    "NATIVE_MAX_PAGE_SIZE": 16384,  # 16-KB-Page-Alignment fuer gebaute Libs (Android 15/16); 0 = aus
+    "EXEC_RUN_DIR_DEFAULT": "/data/local/tmp",  # ExeDeploy: Standard-Run-Dir (exec-erlaubt)
+    "EXEC_BACKUP_KEEP": 10,                      # ExeDeploy: max. lokale Sync-Backup-Staende
+    "EXEC_COLOR_PER_EXE": True,                  # ExeDeploy: eigene Konsolenfarbe je Executable
     "INJECT_FRIDA": False,
     "INJECT_LSPATCH": False,
     "INJECT_NSC": True,
@@ -50,6 +58,7 @@ DEFAULT_CONFIG = {
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
             {"name": "Inject Custom Libs", "type": "inject_custom_libs"},
+            {"name": "Inject Added Libs", "type": "inject_added_libs"},
             {"name": "Inject Frida Gadget", "type": "inject_frida"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
             {"name": "Apply LSPatch", "type": "apply_lspatch"},
@@ -105,8 +114,15 @@ class ConfigManager:
                     self.config["PIPELINES"]["PREPARE_WORKSPACE"] = DEFAULT_CONFIG["PIPELINES"]["PREPARE_WORKSPACE"]
 
                 current_native_steps = [s.get("name") for s in self.config["PIPELINES"].get("BUILD_NATIVE", [])]
-                if "Inject Frida Gadget" not in current_native_steps or "Apply LSPatch" not in current_native_steps or "Inject Custom Libs" not in current_native_steps:
+                if "Inject Frida Gadget" not in current_native_steps or "Apply LSPatch" not in current_native_steps or "Inject Custom Libs" not in current_native_steps or "Inject Added Libs" not in current_native_steps:
                     self.config["PIPELINES"]["BUILD_NATIVE"] = DEFAULT_CONFIG["PIPELINES"]["BUILD_NATIVE"]
+
+                # LibForge/ExeDeploy: neue Keys robust nachziehen (bestehende config.json)
+                for _k in ("NDK_DIR", "DEFAULT_ABI", "DEFAULT_API_LEVEL", "NDK_FALLBACK_VERSION",
+                           "NATIVE_MAX_PAGE_SIZE", "INJECT_NSC",
+                           "EXEC_RUN_DIR_DEFAULT", "EXEC_BACKUP_KEEP", "EXEC_COLOR_PER_EXE"):
+                    if _k not in self.config:
+                        self.config[_k] = DEFAULT_CONFIG[_k]
             except Exception:
                 self.config = DEFAULT_CONFIG.copy()
                 self.frida_config = FridaConfig()

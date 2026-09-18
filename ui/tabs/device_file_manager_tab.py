@@ -19,9 +19,11 @@ class DeviceFileManagerTab(ttk.Frame):
         ttk.Label(top_frame, text="App-Package:").pack(side="left", padx=2)
         self.cb_pkg = ttk.Combobox(top_frame, state="readonly", width=30)
         self.cb_pkg.pack(side="left", padx=5)
-        self.cb_pkg.bind("<<ComboboxSelected>>", lambda e: self.controller.load_directory(self.cb_pkg.get(),
-                                                                                          f"/data/data/{self.cb_pkg.get()}/"))
+        self.cb_pkg.bind("<<ComboboxSelected>>", lambda e: self.controller.load_directory(
+            self.cb_pkg.get(), f"/data/data/{self.cb_pkg.get()}/", domain="runas"))
         ttk.Button(top_frame, text="🔄 Apps laden", command=self.controller.load_packages).pack(side="left", padx=5)
+        ttk.Button(top_frame, text="⚙ /data/local/tmp",
+                   command=lambda: self.controller.open_at("/data/local/tmp/", domain="shell")).pack(side="left", padx=5)
 
         path_frame = ttk.Frame(self)
         path_frame.pack(fill="x", padx=5, pady=2)
@@ -53,6 +55,8 @@ class DeviceFileManagerTab(ttk.Frame):
         ttk.Button(bot_frame, text="📥 Download (Pull)", command=self.on_download).pack(side="right", padx=2)
         ttk.Button(bot_frame, text="📤 Upload (Push) [STRG+V]", command=self.controller.upload_file).pack(side="right",
                                                                                                          padx=2)
+        ttk.Button(bot_frame, text="📤 Upload (mehrere)", command=self.controller.upload_files).pack(side="right", padx=2)
+        ttk.Button(bot_frame, text="📁 Ordner hochladen", command=self.controller.upload_dir).pack(side="right", padx=2)
         ttk.Button(bot_frame, text="🗑 Löschen", command=self.on_delete).pack(side="right", padx=2)
 
     def update_packages(self, pkgs):

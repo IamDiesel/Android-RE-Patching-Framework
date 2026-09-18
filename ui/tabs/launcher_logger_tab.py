@@ -1,13 +1,17 @@
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import os
 import sys
+import time
+import threading
 
 from core.infrastructure.command_runner import CommandRunner
 from core.application.event_bus import EventBus
 from services.profile_manager_service import ProfileManagerService
 from services.logcat_service import LogcatService
 from services.ghost_log_service import GhostLogService
+from ui.panels.exec_run_panel import ExecRunPanel
+from ui.widgets.tooltip import add_tooltip
 
 
 class LauncherLoggerTab(ttk.Frame):
@@ -17,6 +21,9 @@ class LauncherLoggerTab(ttk.Frame):
         self.app = ws.app
         self.raw_logs = []
         self.search_pos = "1.0"
+        self._exec_tags = {}   # exe-Name -> Konsolen-Tag (Farbe pro Executable)
+        self._session_fh = None  # gemeinsames Log (App + Logcat + Exe) fuer diese Session
+        self._app_launched = False  # ob die App in dieser Sitzung gestartet wurde (Status-Punkt)
 
         data_dir = os.path.join(self.app.cfg.config.get("BASE_DIR", ""), "data")
         config_file = os.path.join(data_dir, "logger_profiles.json")
@@ -29,9 +36,11 @@ class LauncherLoggerTab(ttk.Frame):
         EventBus.subscribe("LOGCAT_LINE", lambda line: self.after(0, self._append_log, line))
         EventBus.subscribe("LOG_INFO", lambda msg: self.after(0, self._append_frida_log, msg))
         EventBus.subscribe("GHOST_LOG_LINE", lambda line: self.after(0, self._append_ghost_log, line))
+        EventBus.subscribe("EXEC_OUTPUT", lambda data: self.after(0, self._append_exec_output, data))
 
         self.create_widgets()
         self.bind("<Destroy>", self.on_close)
+        self._poll_status()   # Status-Punkte (App/Logcat/Exe) aktuell halten
 
     def _format_cmd(self, cmd):
         pkg = self.app.cfg.config.get("APP_PACKAGE", "")
@@ -41,102 +50,120 @@ class LauncherLoggerTab(ttk.Frame):
         return cmd
 
     def create_widgets(self):
-        f_top = ttk.Frame(self)
-        f_top.pack(fill="x", padx=10, pady=5)
+        # ===== Obere Zeile: App (links) · Executable (rechts) — 50/50 =====
+        f_split = ttk.Frame(self)
+        f_split.pack(fill="x", padx=10, pady=(5, 2))
+        f_split.columnconfigure(0, weight=1)   # App  50 %
+        f_split.columnconfigure(1, weight=1)   # Exe  50 %
 
-        # --- Intent / App Start Row ---
-        f_intent = ttk.Frame(f_top)
-        f_intent.pack(fill="x", pady=2)
-        ttk.Label(f_intent, text="App Start (Intent):", width=18).pack(side="left")
-
+        app_box = ttk.LabelFrame(f_split, text="▶ App Start")
+        app_box.grid(row=0, column=0, sticky="nsew")
+        f_intent = ttk.Frame(app_box)
+        f_intent.pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Label(f_intent, text="Intent:", width=8).pack(side="left")
         self.cb_intents = ttk.Combobox(f_intent, values=self.profile_mgr.profiles["intents"])
-        self.cb_intents.pack(side="left", fill="x", expand=True, padx=5)
+        self.cb_intents.pack(side="left", fill="x", expand=True, padx=4)
         if self.profile_mgr.profiles["intents"]: self.cb_intents.current(0)
+        ttk.Button(f_intent, text="💾", width=3,
+                   command=lambda: self.save_template("intents", self.cb_intents)).pack(side="left", padx=1)
+        ttk.Button(f_intent, text="🗑", width=3,
+                   command=lambda: self.delete_template("intents", self.cb_intents)).pack(side="left", padx=1)
 
-        ttk.Button(f_intent, text="💾 Speichern", command=lambda: self.save_template("intents", self.cb_intents)).pack(
-            side="left", padx=2)
-        ttk.Button(f_intent, text="🗑 Löschen", command=lambda: self.delete_template("intents", self.cb_intents)).pack(
-            side="left", padx=2)
+        self.exec_panel = ExecRunPanel(f_split, self.app)
+        self.exec_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
 
-        # --- Logcat Shell Row ---
-        f_logcat = ttk.Frame(f_top)
-        f_logcat.pack(fill="x", pady=2)
-        ttk.Label(f_logcat, text="ADB Logcat Filter:", width=18).pack(side="left")
-
-        self.cb_logcats = ttk.Combobox(f_logcat, values=self.profile_mgr.profiles["logcats"])
-        self.cb_logcats.pack(side="left", fill="x", expand=True, padx=5)
-        if self.profile_mgr.profiles["logcats"]: self.cb_logcats.current(0)
-
-        ttk.Button(f_logcat, text="💾 Speichern", command=lambda: self.save_template("logcats", self.cb_logcats)).pack(
-            side="left", padx=2)
-        ttk.Button(f_logcat, text="🗑 Löschen", command=lambda: self.delete_template("logcats", self.cb_logcats)).pack(
-            side="left", padx=2)
-
-        # --- Tool Row (Search, Filter, Wrap) ---
-        f_tools = ttk.Frame(f_top)
-        f_tools.pack(fill="x", pady=5)
-
+        # ===== Werkzeugzeile: Suche / Filter / Anzeige (kompakt, eine Zeile) =====
+        f_tools = ttk.Frame(self)
+        f_tools.pack(fill="x", padx=10, pady=(0, 2))
         ttk.Label(f_tools, text="Suchen:").pack(side="left")
-        self.ent_search = ttk.Entry(f_tools, width=15)
-        self.ent_search.pack(side="left", padx=5)
+        self.ent_search = ttk.Entry(f_tools, width=14)
+        self.ent_search.pack(side="left", padx=3)
         self.ent_search.bind("<Return>", lambda e: self.do_search())
         ttk.Button(f_tools, text="🔍", width=3, command=self.do_search).pack(side="left", padx=1)
         ttk.Button(f_tools, text="⬇ Next", command=self.search_next).pack(side="left", padx=1)
-
         ttk.Separator(f_tools, orient="vertical").pack(side="left", fill="y", padx=5)
-
-        ttk.Label(f_tools, text="Filter (OR):").pack(side="left")
-        self.ent_filter = ttk.Entry(f_tools, width=15)
+        ttk.Label(f_tools, text="Filter:").pack(side="left")
+        self.ent_filter = ttk.Entry(f_tools, width=14)
         self.ent_filter.pack(side="left", padx=2)
         self.ent_filter.bind("<KeyRelease>", self.apply_filter)
-
-        ttk.Label(f_tools, text="Exclude (OR):").pack(side="left")
-        self.ent_exclude = ttk.Entry(f_tools, width=15)
+        ttk.Label(f_tools, text="Exclude:").pack(side="left")
+        self.ent_exclude = ttk.Entry(f_tools, width=14)
         self.ent_exclude.pack(side="left", padx=2)
         self.ent_exclude.bind("<KeyRelease>", self.apply_filter)
-
         ttk.Separator(f_tools, orient="vertical").pack(side="left", fill="y", padx=5)
-
         self.var_wrap = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f_tools, text="Zeilenumbruch", variable=self.var_wrap, command=self.toggle_wrap).pack(
-            side="left")
+        ttk.Checkbutton(f_tools, text="Umbruch", variable=self.var_wrap, command=self.toggle_wrap).pack(side="left")
+        b_savef = ttk.Button(f_tools, text="💾 Speichern", command=self.save_filtered_log)
+        b_savef.pack(side="left", padx=(8, 2))
+        add_tooltip(b_savef, "Speichert die AKTUELL angezeigte (gefilterte) Konsole in eine Datei.")
+        ttk.Button(f_tools, text="🗑 Anzeige leeren", command=self.clear_console).pack(side="left", padx=2)
+        ttk.Button(f_tools, text="📂 Archiv", command=self.open_archive).pack(side="left", padx=2)
+        self.lbl_status = ttk.Label(f_tools, text="Status: Bereit", font=("Segoe UI", 9, "italic"), foreground="gray")
+        self.lbl_status.pack(side="right", padx=5)
 
-        # --- Controls Row ---
-        f_ctrl = ttk.Frame(f_top)
-        f_ctrl.pack(fill="x", pady=5)
-
-        self.btn_start_app = ttk.Button(f_ctrl, text="▶ App Starten", command=self.start_app_only)
-        self.btn_start_app.pack(side="left", padx=2)
-
-        self.btn_start_log = ttk.Button(f_ctrl, text="▶ Logcat Starten", command=self.start_logcat_only)
-        self.btn_start_log.pack(side="left", padx=2)
-
-        self.btn_start_combo = ttk.Button(f_ctrl, text="▶ Kombiniert (App + Log)", command=self.start_combined)
-        self.btn_start_combo.pack(side="left", padx=2)
-
+        # ===== Logcat-Konfiguration (unten): Early + Ghost + Logcat (breiter) =====
+        f_logcat = ttk.Frame(self)
+        f_logcat.pack(fill="x", padx=10, pady=(0, 3))
         self.var_early_log = tk.BooleanVar(value=True)
-        ttk.Checkbutton(f_ctrl, text="Early Logcat", variable=self.var_early_log).pack(side="left", padx=(5, 5))
-
-        # NEU: Option für den File-Stream Bypass
+        ttk.Checkbutton(f_logcat, text="Early Logcat", variable=self.var_early_log).pack(side="left", padx=(0, 8))
         self.var_ghost_stream = tk.BooleanVar(value=False)
-        ttk.Checkbutton(f_ctrl, text="File-Stream (Ghost)", variable=self.var_ghost_stream).pack(side="left",
-                                                                                                 padx=(0, 15))
+        ttk.Checkbutton(f_logcat, text="File-Stream (Ghost)", variable=self.var_ghost_stream).pack(side="left", padx=(0, 10))
+        ttk.Label(f_logcat, text="Logcat:").pack(side="left")
+        self.cb_logcats = ttk.Combobox(f_logcat, values=self.profile_mgr.profiles["logcats"], width=100)
+        self.cb_logcats.pack(side="left", padx=4)
+        if self.profile_mgr.profiles["logcats"]: self.cb_logcats.current(0)
+        ttk.Button(f_logcat, text="💾", width=3,
+                   command=lambda: self.save_template("logcats", self.cb_logcats)).pack(side="left", padx=1)
+        ttk.Button(f_logcat, text="🗑", width=3,
+                   command=lambda: self.delete_template("logcats", self.cb_logcats)).pack(side="left", padx=1)
+        add_tooltip(self.cb_logcats, "Logcat-Filter (grep). {PID}/{APP_NAME}/{APP_PACKAGE} werden ersetzt.")
 
-        self.btn_stop = ttk.Button(f_ctrl, text="⏹ Stop Logging", command=self.stop_capture, state="disabled")
-        self.btn_stop.pack(side="left", padx=2)
+        # ===== Konsole mit Steuerung LINKS daneben (spart vertikalen Platz) =====
+        ttk.Label(self, text="Gemeinsames Live-Log (App + Logcat + Executable)",
+                  font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=12, pady=(2, 0))
+        console_area = ttk.Frame(self)
+        console_area.pack(fill="both", expand=True, padx=10, pady=(0, 5))
 
-        ttk.Separator(f_ctrl, orient="vertical").pack(side="left", fill="y", padx=5)
+        # --- Steuerung (links neben der Konsole, kompakt untereinander) ---
+        mid = ttk.LabelFrame(console_area, text="Steuerung")
+        mid.pack(side="left", fill="y", padx=(0, 6))
 
-        ttk.Button(f_ctrl, text="🗑 Anzeige leeren", command=self.clear_console).pack(side="left", padx=5)
-        ttk.Button(f_ctrl, text="📂 Archiv (PID) öffnen", command=self.open_archive).pack(side="right", padx=5)
+        self.var_ms_app = tk.BooleanVar(value=True)
+        self.var_ms_log = tk.BooleanVar(value=True)
+        self.var_ms_exe = tk.BooleanVar(value=False)
 
-        # --- Status ---
-        self.lbl_status = ttk.Label(f_top, text="Status: Bereit", font=("Segoe UI", 9, "italic"), foreground="gray")
-        self.lbl_status.pack(anchor="w", padx=5, pady=2)
+        def _mk(rw, text, cmd, var, key, tip_btn):
+            b = ttk.Button(mid, text=text, width=14, command=cmd)
+            b.grid(row=rw, column=0, sticky="we", padx=(6, 2), pady=1)
+            add_tooltip(b, tip_btn)
+            dot = ttk.Label(mid, text="⚪", width=2)
+            dot.grid(row=rw, column=1, padx=(0, 1), pady=1)
+            setattr(self, "dot_" + key, dot)
+            chk = ttk.Checkbutton(mid, variable=var)
+            chk.grid(row=rw, column=2, padx=(0, 2), pady=1)
+            add_tooltip(chk, "In „Multi-Start“ einbeziehen")
+            setattr(self, "chk_" + key, chk)
 
-        # --- Live Console ---
-        f_console = ttk.Frame(self)
-        f_console.pack(fill="both", expand=True, padx=10, pady=5)
+        _mk(0, "▶ App starten", self.start_app_action, self.var_ms_app, "app",
+            "Startet nur die App (Intent).")
+        _mk(1, "▶ Logcat starten", self.start_logcat_action, self.var_ms_log, "log",
+            "Startet nur Logcat (Aufzeichnung ins gemeinsame Log).")
+        _mk(2, "▶ Exe starten", self.start_exe_action, self.var_ms_exe, "exe",
+            "Deployt & startet das im Executable-Bereich gewählte Ziel.")
+
+        tk.Frame(mid, width=2, bg="#8A8A8A").grid(row=0, column=3, rowspan=3, sticky="ns", padx=(2, 4), pady=2)
+
+        self.btn_multi = ttk.Button(mid, text="▶▶ Multi-Start", command=self.start_multi)
+        self.btn_multi.grid(row=3, column=0, columnspan=4, sticky="we", padx=6, pady=(3, 1))
+        add_tooltip(self.btn_multi, "Startet gemeinsam alles, was angehakt ist "
+                                    "(z. B. Logcat + App, Logcat + Exe, oder alle drei).")
+        self.btn_stop_all = ttk.Button(mid, text="⏹ Alles stoppen", command=self.stop_all)
+        self.btn_stop_all.grid(row=4, column=0, columnspan=4, sticky="we", padx=6, pady=(0, 4))
+        add_tooltip(self.btn_stop_all, "Stoppt Logcat/Ghost, das laufende Executable und force-stoppt die App.")
+
+        # --- Konsole (rechts, füllt den restlichen Platz) ---
+        f_console = ttk.Frame(console_area)
+        f_console.pack(side="left", fill="both", expand=True)
 
         self.console = tk.Text(f_console, bg="#1E1E1E", fg="#D4D4D4", font=("Consolas", 10), wrap="word")
 
@@ -145,6 +172,8 @@ class LauncherLoggerTab(ttk.Frame):
         self.console.tag_configure("frida_log", foreground="#E5C07B", font=("Consolas", 10, "bold"))
         self.console.tag_configure("error_log", foreground="#E06C75", font=("Consolas", 10, "bold"))
         self.console.tag_configure("ghost_log", foreground="#00FFFF", font=("Consolas", 10, "bold"))  # Helles Cyan
+        self.console.tag_configure("exec_out", foreground="#98C379", font=("Consolas", 10, "bold"))   # Gruen (stdout)
+        self.console.tag_configure("exec_sys", foreground="#888888", font=("Consolas", 10, "italic"))  # Grau (Status)
 
         scroll_y = ttk.Scrollbar(f_console, orient="vertical", command=self.console.yview)
         scroll_y.pack(side="right", fill="y")
@@ -306,12 +335,8 @@ class LauncherLoggerTab(ttk.Frame):
         try:
             log_file_path = self.logcat_service.start_capture(adb, logcat_cmd, archive_dir)
             self.console.insert(tk.END, f"[*] Starte Logcat: \"{adb}\" shell \"{logcat_cmd}\"\n")
-
-            self.btn_start_app.config(state="disabled")
-            self.btn_start_log.config(state="disabled")
-            self.btn_start_combo.config(state="disabled")
-            self.btn_stop.config(state="normal")
             self.lbl_status.config(text=f"🔴 Recording to: {os.path.basename(log_file_path)}", foreground="red")
+            self._refresh_run_status()
         except Exception as e:
             self.console.insert(tk.END, f"[!] Fehler beim Starten von Logcat: {e}\n", "error_log")
 
@@ -321,25 +346,208 @@ class LauncherLoggerTab(ttk.Frame):
         self.console.see(tk.END)
         try:
             CommandRunner.run_background(full_intent_cmd, cwd=base_dir)
+            self._app_launched = True
+            self._refresh_run_status()
         except Exception as e:
             self.console.insert(tk.END, f"[!] Fehler beim App Start: {e}\n", "error_log")
 
     def _append_frida_log(self, msg):
         if msg.startswith("[Frida]") or msg.startswith("[Frida ERROR]"):
             self.console.insert(tk.END, msg + "\n", "frida_log")
+            self._write_session(msg)
             self.console.see(tk.END)
         elif msg.startswith("[!]"):
             self.console.insert(tk.END, msg + "\n", "error_log")
+            self._write_session(msg)
             self.console.see(tk.END)
 
     def _append_ghost_log(self, line):
         self.raw_logs.append(line)
+        self._write_session(line)
         inc_query = self.ent_filter.get().lower().split()
         exc_query = self.ent_exclude.get().lower().split()
         if self._check_log_filters(line, inc_query, exc_query):
             self.console.insert(tk.END, line + "\n", "ghost_log")
             if self.console.yview()[1] >= 0.98:
                 self.console.see(tk.END)
+
+    def _exec_color_tag(self, exe):
+        """Stabile Farbe je Executable (fuer parallele Laeufe), sofern aktiviert."""
+        if not self.app.cfg.config.get("EXEC_COLOR_PER_EXE", True):
+            return "exec_out"
+        if exe not in self._exec_tags:
+            palette = ["#98C379", "#61AFEF", "#C678DD", "#56B6C2", "#D19A66", "#E5C07B"]
+            color = palette[abs(hash(exe)) % len(palette)]
+            tag = f"exec_c{len(self._exec_tags)}"
+            self.console.tag_configure(tag, foreground=color, font=("Consolas", 10, "bold"))
+            self._exec_tags[exe] = tag
+        return self._exec_tags[exe]
+
+    def _append_exec_output(self, data):
+        """EXEC_OUTPUT vom DeviceExecService: farbig + getaggt als '[<exe>] <text>'."""
+        exe = (data or {}).get("exe", "exe")
+        stream = (data or {}).get("stream", "out")
+        text = (data or {}).get("text", "")
+        line = f"[{exe}] {text}"
+        self.raw_logs.append(line)
+        self._write_session(line)
+        inc_query = self.ent_filter.get().lower().split()
+        exc_query = self.ent_exclude.get().lower().split()
+        if not self._check_log_filters(line, inc_query, exc_query):
+            return
+        if stream == "err":
+            tag = "error_log"
+        elif stream == "sys":
+            tag = "exec_sys"
+        else:
+            tag = self._exec_color_tag(exe)
+        self.console.insert(tk.END, line + "\n", tag)
+        if self.console.yview()[1] >= 0.98:
+            self.console.see(tk.END)
+
+    # ================= Gemeinsames Log + gefiltertes Speichern =================
+    def _session_path(self):
+        archive_dir = getattr(self.app, 'current_archive_path', "") or \
+            self.app.cfg.paths.get("ARCHIVE_DIR", "")
+        os.makedirs(archive_dir, exist_ok=True)
+        return os.path.join(archive_dir, f"session_{time.strftime('%Y%m%d-%H%M%S')}.log")
+
+    def _write_session(self, line):
+        """Schreibt JEDE Konsolenzeile (App/Logcat/Ghost/Exe) in EIN gemeinsames Session-Log."""
+        try:
+            if self._session_fh is None:
+                self._session_fh = open(self._session_path(), "a", encoding="utf-8", errors="replace")
+            self._session_fh.write(line + "\n")
+            self._session_fh.flush()
+        except Exception:
+            pass
+
+    def save_filtered_log(self):
+        """Speichert die aktuell angezeigte (gefilterte) Konsole in eine wählbare Datei."""
+        content = self.console.get("1.0", tk.END)
+        if not content.strip():
+            messagebox.showinfo("Speichern", "Konsole ist leer.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Gefilterte Konsole speichern",
+            defaultextension=".log",
+            initialfile=f"console_{time.strftime('%Y%m%d-%H%M%S')}.log",
+            filetypes=[("Log", "*.log"), ("Text", "*.txt"), ("Alle", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(content)
+            self.lbl_status.config(text=f"Gespeichert: {os.path.basename(path)}", foreground="green")
+        except Exception as e:
+            messagebox.showerror("Speichern", f"Fehler: {e}")
+
+    # ================= Steuerung: Einzel-Start / Multi-Start / Alles stoppen =================
+    def _sys(self, msg):
+        """Systemzeile in Konsole (grau) + gemeinsames Log."""
+        self.console.insert(tk.END, msg + "\n", "exec_sys")
+        self._write_session(msg)
+        self.console.see(tk.END)
+
+    def _device_ready(self):
+        adb = self.app.cfg.paths.get("ADB", "adb")
+        r = CommandRunner.run_blocking(f'"{adb}" get-state', ".", timeout=4)
+        return r.returncode == 0 and "device" in (r.stdout or "")
+
+    def _guard(self, fn):
+        """Führt fn nur aus, wenn ein Gerät erreichbar ist — Gerätecheck im Thread (kein Freeze)."""
+        def task():
+            if not self._device_ready():
+                self.app.after(0, lambda: (
+                    self._sys("[!] Kein Gerät verbunden (adb get-state: Timeout/kein Gerät)."),
+                    self.lbl_status.config(text="Kein Gerät", foreground="red")))
+                return
+            self.app.after(0, fn)
+        threading.Thread(target=task, daemon=True).start()
+
+    def start_app_action(self):
+        self._guard(self.start_app_only)
+
+    def start_logcat_action(self):
+        self._guard(self.start_logcat_only)
+
+    def start_exe_action(self):
+        self._guard(self._start_exe)
+
+    def _start_exe(self):
+        try:
+            self.exec_panel.deploy_selected()
+        except Exception as e:
+            self._sys(f"[!] ExeDeploy: {e}")
+        self._refresh_run_status()
+
+    def start_multi(self):
+        if not (self.var_ms_app.get() or self.var_ms_log.get() or self.var_ms_exe.get()):
+            messagebox.showinfo("Multi-Start", "Nichts ausgewählt — bitte rechts Checkboxen setzen.")
+            return
+
+        def run():
+            if self.var_ms_app.get() and self.var_ms_log.get():
+                self.start_combined()          # App + Logcat (inkl. Early-Logging-Logik)
+            elif self.var_ms_app.get():
+                self.start_app_only()
+            elif self.var_ms_log.get():
+                self.start_logcat_only()
+            if self.var_ms_exe.get():
+                self._start_exe()
+            self._refresh_run_status()
+
+        self._guard(run)
+
+    def stop_all(self):
+        # Logcat / Ghost sofort stoppen (lokal, kein Gerät nötig)
+        try:
+            self.stop_capture()
+        except Exception:
+            pass
+        # Executable stoppen (lokal + pkill; pkill läuft mit Timeout im Service)
+        try:
+            lib = self.exec_panel.selected_lib()
+            ctrl = getattr(self.app, "exec_run_controller", None)
+            if lib and ctrl:
+                ctrl.stop(lib)
+        except Exception:
+            pass
+
+        # App force-stop (im Thread, mit Timeout — friert nicht ein)
+        def task():
+            adb = self.app.cfg.paths.get("ADB", "adb")
+            pkg = self.app.cfg.config.get("APP_PACKAGE", "")
+            if pkg:
+                CommandRunner.run_blocking(f'"{adb}" shell am force-stop {pkg}', ".", timeout=8)
+            self._app_launched = False
+            self.app.after(0, lambda: (self._sys("[*] Alles gestoppt (Logcat/Exe/App)."),
+                                       self._refresh_run_status()))
+        threading.Thread(target=task, daemon=True).start()
+
+    # ---- Status-Punkte + Multi-Start-Klammer ----
+    def _refresh_run_status(self):
+        log_on = bool(getattr(self.logcat_service, "is_running", False))
+        exe_on = False
+        try:
+            lib = self.exec_panel.selected_lib()
+            ctrl = getattr(self.app, "exec_run_controller", None)
+            exe_on = bool(lib and ctrl and ctrl.exec_service.is_running(lib.name))
+        except Exception:
+            pass
+        if hasattr(self, "dot_log"):
+            self.dot_log.config(text="🟢" if log_on else "⚪")
+        if hasattr(self, "dot_app"):
+            self.dot_app.config(text="🟢" if self._app_launched else "⚪")
+        if hasattr(self, "dot_exe"):
+            self.dot_exe.config(text="🟢" if exe_on else "⚪")
+
+    def _poll_status(self):
+        self._refresh_run_status()
+        try:
+            self.after(1500, self._poll_status)
+        except Exception:
+            pass
 
     def _insert_colored_line(self, line):
         tag = ""
@@ -358,6 +566,7 @@ class LauncherLoggerTab(ttk.Frame):
 
     def _append_log(self, line):
         self.raw_logs.append(line)
+        self._write_session(line)
         inc_query = self.ent_filter.get().lower().split()
         exc_query = self.ent_exclude.get().lower().split()
         if self._check_log_filters(line, inc_query, exc_query):
@@ -368,13 +577,10 @@ class LauncherLoggerTab(ttk.Frame):
     def stop_capture(self):
         self.logcat_service.stop_capture()
         self.ghost_log_service.stop_capture()
-        self.btn_start_app.config(state="normal")
-        self.btn_start_log.config(state="normal")
-        self.btn_start_combo.config(state="normal")
-        self.btn_stop.config(state="disabled")
         self.lbl_status.config(text="Status: Gestoppt", foreground="gray")
         self.console.insert(tk.END, "\n[*] Logging gestoppt.\n")
         self.console.see(tk.END)
+        self._refresh_run_status()
 
     def clear_console(self):
         self.raw_logs.clear()
@@ -394,3 +600,9 @@ class LauncherLoggerTab(ttk.Frame):
         if self.logcat_service.is_running:
             self.logcat_service.stop_capture()
         self.ghost_log_service.stop_capture()
+        if self._session_fh:
+            try:
+                self._session_fh.close()
+            except Exception:
+                pass
+            self._session_fh = None

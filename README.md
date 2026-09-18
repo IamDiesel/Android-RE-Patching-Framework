@@ -213,3 +213,54 @@ An integrated graphical file manager leveraging the `run-as` binary wrapper via 
 ### 4.7 Test Management & History Tracker
 
 Automatically records test sessions, including the deployed configurations, applied patches, and environmental observations. Data is retained persistently in `RE_History.json` and a SQLite Database. The framework also generates aggregated Markdown reports (`Kippy_RE_Log.md`) compiling injected codes and testing results suitable for vulnerability disclosures and documentation.
+### 4.8 LibForge (Native Lib Builder)
+
+Ergänzt den „Native Lib Replacer" um das **Erstellen, Kompilieren, Importieren und additive
+Injizieren eigener nativer Bibliotheken**. Reiter im Workspace neben dem Replacer.
+
+* **Editor & Compile:** C-Code mit Syntax-Highlighting; Kompilierung via NDK-`clang` zu `lib<name>.so`
+  (`NativeCompilerService`). Build-Fehler erscheinen live in der Konsole (`CommandRunner.run_live` → EventBus).
+* **Import:** Fertige `.so` per Filedialog importierbar (ohne Quellcode/Build).
+* **Verwaltung:** Persistenz in `data/native_libs.json` + `data/native_libs/<id>/` (`NativeLibManager`).
+  Libs sind **aktiv/inaktiv** schaltbar (ohne Löschen) und per Button/„Entf" **löschbar**; **Recompile
+  überschreibt** die `.so`. Beschreibung + Code stehen parallel zur Lib.
+* **Toolchain:** Der `ToolManager` erkennt ein installiertes NDK, lädt es bei Bedarf herunter
+  (gepinnt `NDK_FALLBACK_VERSION`), verifiziert `clang` und injiziert das Toolchain-`bin` dynamisch
+  in den `PATH`. Neuer Pipeline-Step `inject_added_libs` (in `BUILD_NATIVE`) spielt alle **aktiven**
+  Libs additiv in `lib/<abi>/` ein (Clobber-Guard: überschreibt keine echten App-Libs).
+* **Laden:** bleibt manuell per Smali-Patch. LibForge zeigt/kopiert den `System.loadLibrary`-Snippet;
+  **Smali Studio** hat zusätzlich einen **loadLibrary-Helfer** mit Dropdown der aktiven Libs
+  (tippfehlerfrei, fügt den Smali-Block am Cursor ein).
+* **Config-Keys** (`config_manager.py` / `config.json`): `NDK_DIR`, `DEFAULT_ABI`, `DEFAULT_API_LEVEL`,
+  `NDK_FALLBACK_VERSION`.
+
+### 4.9 ExeDeploy (Executable Runner + Sync)
+
+Ergänzt LibForge um das **Deployen, Ausführen, Synchronisieren und Aufräumen** eigener nativer
+**Executables** (PIE-Binaries wie `skb_oracle`) — ohne Root, konsequent über `adb` + `run-as`.
+Ein `OUTPUT_KIND = executable`-Target wird nicht per `loadLibrary` injiziert, sondern über ein
+**„Deploy & Run"-Panel** gesteuert.
+
+* **Runner (`DeviceExecService`):** Push von Binary + wählbaren Runtime-Deps in ein exec-erlaubtes
+  Verzeichnis (Default `/data/local/tmp`), `chmod 755`; geräteinternes **Input-Staging** von
+  App-Home-Dateien (`run-as <pkg> cat … > <run_dir>/…`, kein PC-Roundtrip); **nicht-blockierende**
+  Ausführung (parallel zur App) mit Live-Stream; `Stop` beendet lokalen Prozess **und** Remote
+  (`pkill`); `Cleanup`; optionaler Ergebnis-`pull`.
+* **Farbige, getaggte Konsole:** stdout/stderr laufen als `[<exe>] …` in die farbcodierte Konsole
+  des Reiters „🚀 App Start & Live-Log" (EventBus-Event `EXEC_OUTPUT`); Grün=stdout, Rot=stderr,
+  optional eigene Farbe je Executable (`EXEC_COLOR_PER_EXE`).
+* **Zwei Bedien-Orte (ein Controller):** dasselbe `ExecRunPanel` erscheint im LibForge-Reiter **und**
+  im „App Start & Live-Log"-Reiter; beide nutzen den gemeinsamen `ExecRunController`
+  (`app.exec_run_controller`). Ziel-Dropdown listet alle Executable-Targets
+  (`NativeLibManager.get_executables()`).
+* **Filemanager-Integration:** Buttons **„📂 Executable-Ordner"** (Run-Dir, Shell-Domain via
+  `adb shell ls`) und **„📁 App-Ordner"** (App-Home, `run-as`) springen direkt in den File-Explorer.
+  Der Filemanager unterstützt jetzt zusätzlich **Multi-Datei- und rekursiven Ordner-Upload**
+  (`push_files`/`push_dir`) sowie einen **Shell-Domain-Modus** (`/data/local/tmp`).
+* **Local↔Remote-Sync (`DeviceSyncService`):** Push/Pull zwischen lokalem Target-Ordner und Run-Dir
+  mit **lokaler versionierter Sicherung** vor jedem Überschreiben (`data/exec_backups/<tag>/<ts>/`,
+  Retention `EXEC_BACKUP_KEEP`).
+* **Config-Keys** (`config_manager.py` / `config.json`): `EXEC_RUN_DIR_DEFAULT`, `EXEC_BACKUP_KEEP`,
+  `EXEC_COLOR_PER_EXE`.
+* **Nicht gerootet / Datenschutz:** ausschließlich `adb` + `run-as`, niemals `su`; Capture-Dateien
+  bleiben durch geräteinternes Staging auf dem Gerät (Ergebnis-`pull` nur explizit).

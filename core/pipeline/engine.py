@@ -24,6 +24,7 @@ class PipelineEngine:
         from .steps.trace_steps import TraceStartStep, TraceStopStep
         from .steps.apk_steps import DecompileStep, MergeSplitsStep, ManifestBuildStep
         from .steps.patch_steps import SmartPatchStep, AnchorPatchStep, InjectCustomLibsStep
+        from .steps.lib_steps import InjectAddedLibsStep
         from .steps.hook_steps import FridaInjectStep, LSPatchInjectStep
 
         self._steps = {
@@ -37,6 +38,7 @@ class PipelineEngine:
             "smart_patch": SmartPatchStep(),
             "anchor_patch": AnchorPatchStep(),
             "inject_custom_libs": InjectCustomLibsStep(),
+            "inject_added_libs": InjectAddedLibsStep(),
             "inject_frida": FridaInjectStep(),
             "apply_lspatch": LSPatchInjectStep()
         }

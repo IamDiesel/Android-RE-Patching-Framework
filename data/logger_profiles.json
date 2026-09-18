@@ -22,6 +22,7 @@
         "logcat | grep -iE 'LibreLinkUp|KIPPY|GHOST|metrics|frida|fatal|crash|exception|error|denied|linker|dlopen'",
         "logcat | grep -iE '{APP_NAME}|LibreLinkUp|fatal|crash|debug|frida|console|Caused by|Exception|Error|GHOST'",
         "logcat | grep -iE '{APP_NAME}|fatal|crash|debug|linker|frida|console|GHOS|key|Error|Java'",
-        "logcat | grep -iE '{APP_NAME}|LibreLinkUp|fatal|crash|debug|frida|console|Caused by|Exception|Error|GHOST|Java'"
+        "logcat | grep -iE '{APP_NAME}|LibreLinkUp|fatal|crash|debug|frida|console|Caused by|Exception|Error|GHOST|Java'",
+        "logcat | grep -iE '{APP_NAME}|LibreLinkUp|fatal|crash|debug|frida|console|Caused by|Exception|Error|GHOST|Java|SIGN|DATA1|UNWRAP'"
     ]
 }

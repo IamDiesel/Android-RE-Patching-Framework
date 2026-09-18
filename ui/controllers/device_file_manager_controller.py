@@ -14,6 +14,7 @@ class DeviceFileManagerController:
         self.service = DeviceFileService(app.cfg)
         self.current_pkg = ""
         self.current_path = ""
+        self.current_domain = "runas"   # "runas" (App-Home) | "shell" (z.B. /data/local/tmp)
         self.cancel_download_flag = False
 
     def get_downloads_dir(self):
@@ -46,17 +47,32 @@ class DeviceFileManagerController:
 
         threading.Thread(target=task, daemon=True).start()
 
-    def load_directory(self, pkg: str, path: str):
+    def load_directory(self, pkg: str, path: str, domain: str = None):
         if not path.endswith("/"): path += "/"
+        if domain is not None:
+            self.current_domain = domain
         self.current_pkg, self.current_path = pkg, path
-        self.view.update_status(f"Lade {path}...")
+        self.view.update_status(f"Lade {path} [{self.current_domain}] ...")
 
         def task():
-            lines = self.service.list_dir(pkg, path)
+            if self.current_domain == "shell":
+                lines = self.service.list_dir_shell(path)
+            else:
+                lines = self.service.list_dir(pkg, path)
             parsed = self._parse_ls(lines)
             self.app.after(0, lambda: self.view.render_files(parsed, path))
 
         threading.Thread(target=task, daemon=True).start()
+
+    def open_at(self, path: str, domain: str = "runas"):
+        """Shortcut-Einsprung (z.B. aus dem ExeDeploy-Panel): Domain setzen + Verzeichnis laden."""
+        pkg = self.app.cfg.config.get("APP_PACKAGE", "") if domain == "runas" else ""
+        if domain == "runas" and hasattr(self.view, "cb_pkg"):
+            try:
+                self.view.cb_pkg.set(pkg)
+            except Exception:
+                pass
+        self.load_directory(pkg, path, domain=domain)
 
     def _parse_ls(self, lines: list):
         files = []
@@ -80,7 +96,7 @@ class DeviceFileManagerController:
         self.view.update_status(f"Lade '{filename}' in Temp-Ordner...")
 
         def task():
-            success = self.service.pull_file(self.current_pkg, remote_path, local_path)
+            success = self.service.pull_file(self.current_pkg, remote_path, local_path, domain=self.current_domain)
             if success:
                 try:
                     if os.name == 'nt':
@@ -124,7 +140,7 @@ class DeviceFileManagerController:
         def task():
             # Rekursive Auflistung und Größenberechnung
             self.app.after(0, lambda: self.view.update_download_status("Scanne Dateien und Ordner..."))
-            files = self.service.resolve_files_for_download(self.current_pkg, remote_paths)
+            files = self.service.resolve_files_for_download(self.current_pkg, remote_paths, domain=self.current_domain)
 
             total_size = sum(f["size"] for f in files)
             copied_size = 0
@@ -149,7 +165,7 @@ class DeviceFileManagerController:
                 self.app.after(0, lambda rf=remote_file, idx=i, cs=copied_size:
                 self.view.update_download_progress(rf, idx + 1, len(files), cs, total_size))
 
-                success = self.service.pull_file(self.current_pkg, remote_file, local_file)
+                success = self.service.pull_file(self.current_pkg, remote_file, local_file, domain=self.current_domain)
                 if success:
                     copied_size += file_size
 
@@ -169,11 +185,48 @@ class DeviceFileManagerController:
         self.view.update_status(f"Lade {filename} hoch...")
 
         def task():
-            success = self.service.push_file(self.current_pkg, local_path, remote_path)
+            if self.current_domain == "shell":
+                success = self.service.push_file_shell(local_path, remote_path)
+            else:
+                success = self.service.push_file(self.current_pkg, local_path, remote_path)
             if success:
                 self.app.after(0, lambda: messagebox.showinfo("Upload", f"{filename} erfolgreich hochgeladen!"))
             else:
                 self.app.after(0, lambda: messagebox.showerror("Upload", f"Upload von {filename} fehlgeschlagen!"))
+            self.app.after(0, lambda: self.load_directory(self.current_pkg, self.current_path))
+            self.app.after(0, lambda: self.view.update_status("Bereit."))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def upload_files(self):
+        """Mehrere Einzeldateien hochladen (Multi-Select)."""
+        paths = filedialog.askopenfilenames(initialdir=self.get_downloads_dir(),
+                                             title="Dateien zum Hochladen wählen")
+        if not paths: return
+        remote_dir = self.current_path.rstrip("/")
+        self.view.update_status(f"Lade {len(paths)} Datei(en) hoch...")
+
+        def task():
+            ok, fail = self.service.push_files(self.current_pkg, list(paths), remote_dir, domain=self.current_domain)
+            msg = f"{ok} Datei(en) hochgeladen." + (f" {len(fail)} fehlgeschlagen." if fail else "")
+            self.app.after(0, lambda: messagebox.showinfo("Upload", msg))
+            self.app.after(0, lambda: self.load_directory(self.current_pkg, self.current_path))
+            self.app.after(0, lambda: self.view.update_status("Bereit."))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def upload_dir(self):
+        """Ganzen Ordner rekursiv hochladen."""
+        local_dir = filedialog.askdirectory(initialdir=self.get_downloads_dir(),
+                                             title="Ordner zum rekursiven Hochladen wählen")
+        if not local_dir: return
+        remote_dir = self.current_path.rstrip("/")
+        self.view.update_status(f"Lade Ordner '{os.path.basename(local_dir)}' rekursiv hoch...")
+
+        def task():
+            ok, fail = self.service.push_dir(self.current_pkg, local_dir, remote_dir, domain=self.current_domain)
+            msg = f"{ok} Datei(en) hochgeladen." + (f" {len(fail)} fehlgeschlagen." if fail else "")
+            self.app.after(0, lambda: messagebox.showinfo("Ordner-Upload", msg))
             self.app.after(0, lambda: self.load_directory(self.current_pkg, self.current_path))
             self.app.after(0, lambda: self.view.update_status("Bereit."))
 
@@ -184,7 +237,7 @@ class DeviceFileManagerController:
 
         def task():
             for item in items:
-                self.service.delete_file(self.current_pkg, self.current_path + item["name"])
+                self.service.delete_file(self.current_pkg, self.current_path + item["name"], domain=self.current_domain)
             self.app.after(0, lambda: self.load_directory(self.current_pkg, self.current_path))
 
         threading.Thread(target=task, daemon=True).start()

@@ -8,6 +8,7 @@ from ui.dialogs.favorite_patches_dialog import FavoritePatchesDialog
 from core.application.event_bus import EventBus
 from core.domain.exceptions import PatchConflictException
 from ui.controllers.workspace_controller import WorkspaceController
+from ui.tabs.lib_forge_tab import LibForgeTab
 
 
 class WorkspaceTab(ttk.Frame):
@@ -115,6 +116,8 @@ class WorkspaceTab(ttk.Frame):
 
         patch_book.add(tab_hex, text="Hex Patcher (Flutter / C++)")
         patch_book.add(tab_libs, text="Native Lib Replacer")
+        self.lib_forge = LibForgeTab(patch_book, self.app)
+        patch_book.add(self.lib_forge, text="🛠 LibForge")
         patch_book.add(self.smali_studio, text="Smali Studio (Java / Kotlin)")
 
         # --- HEX PATCHER UI ---
@@ -241,7 +244,7 @@ class WorkspaceTab(ttk.Frame):
         self.console.bind("<Button-3>", lambda e: self.console_menu.post(e.x_root, e.y_root))
 
         self.launcher_logger_tab = LauncherLoggerTab(self.console_notebook, self)
-        self.console_notebook.add(self.launcher_logger_tab, text="🚀 App Start & Live-Log")
+        self.console_notebook.add(self.launcher_logger_tab, text="🚀 Start & Live-Log (App + Exe)")
 
     def renew_id(self):
         if messagebox.askyesno("Neue ID",

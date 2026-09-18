@@ -23,15 +23,21 @@ class CommandRunner:
         return startupinfo
 
     @classmethod
-    def run_blocking(cls, cmd: str, cwd: str) -> CommandResult:
-        """Führt einen Befehl blockierend aus und liefert das Gesamtergebnis."""
-        res = subprocess.run(
-            cmd, shell=True, cwd=cwd,
-            capture_output=True, text=True,
-            startupinfo=cls._get_startupinfo(),
-            close_fds=True  # FIX: Verhindert, dass Frida USB-Verbindungen an den Subprozess vererbt werden
-        )
-        return CommandResult(res.returncode, res.stdout, res.stderr)
+    def run_blocking(cls, cmd: str, cwd: str, timeout: float = None) -> CommandResult:
+        """Führt einen Befehl blockierend aus und liefert das Gesamtergebnis.
+
+        timeout (Sekunden, optional): verhindert Einfrieren, wenn z.B. kein Gerät
+        angeschlossen ist. Bei Ablauf -> returncode -1, stderr '[timeout]'."""
+        try:
+            res = subprocess.run(
+                cmd, shell=True, cwd=cwd,
+                capture_output=True, text=True, timeout=timeout,
+                startupinfo=cls._get_startupinfo(),
+                close_fds=True  # FIX: Verhindert, dass Frida USB-Verbindungen an den Subprozess vererbt werden
+            )
+            return CommandResult(res.returncode, res.stdout, res.stderr)
+        except subprocess.TimeoutExpired:
+            return CommandResult(-1, "", "[timeout]")
 
     @classmethod
     def run_background(cls, cmd: str, cwd: str, out_file=None) -> Any:
