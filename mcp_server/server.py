@@ -118,22 +118,31 @@ def build_server(ctx, host, port):
         return runtime.run(ctx, "lib.list", lambda: tools.lib_list(ctx))
 
     @mcp.tool(name="lib_create")
-    def lib_create(name: str, description: str = "") -> str:
-        """Neuen LibForge-Lib-Eintrag anlegen (Build spaeter in der GUI)."""
-        return runtime.run(ctx, "lib.create", lambda: tools.lib_create(ctx, name, description), _summ(name=name))
-
+    def lib_create(name: str, version: str, description: str,
+                   source_code: Optional[str] = None, source_file: Optional[str] = None,
+                   output_kind: Optional[str] = None) -> str:
+        """Neue LibForge-Lib anlegen. PFLICHT: version (Freitext, z.B. '1.0') + description (Zweck).
+        NEUE Lib = NEUER Pfad/Ansatz; bestehende NICHT ueberschreiben (dafuer lib.update, Bugfix).
+        Quelle via source_code ODER source_file (lokaler Pfad auf dem PC). Build spaeter in der GUI."""
+        return runtime.run(ctx, "lib.create",
+                           lambda: tools.lib_create(ctx, name, source_code=source_code, version=version,
+                                                    description=description, source_file=source_file,
+                                                    output_kind=output_kind),
+                           _summ(name=name, version=version))
     @mcp.tool(name="lib_update")
     def lib_update(lib_id: str, source_code: Optional[str] = None, abi: Optional[str] = None,
                    api_level: Optional[int] = None, link_libs: Optional[str] = None,
                    output_kind: Optional[str] = None, active: Optional[bool] = None,
-                   name: Optional[str] = None) -> str:
-        """C-Quelle / Build-Felder einer Lib setzen."""
+                   name: Optional[str] = None, version: Optional[str] = None,
+                   description: Optional[str] = None, source_file: Optional[str] = None) -> str:
+        """C-Quelle / Build-Felder einer Lib setzen — nur BUGFIX/selber Pfad. Bei Quell-Aenderung
+        version bumpen + description aktualisieren (sonst WARN). Neuer Pfad -> lib.create."""
         return runtime.run(ctx, "lib.update",
                            lambda: tools.lib_update(ctx, lib_id, source_code, abi, api_level,
-                                                    link_libs, output_kind, active, name),
-                           _summ(lib_id=lib_id, has_source=bool(source_code)))
-
-    # ---------------- D: Patches / Favoriten ----------------
+                                                    link_libs, output_kind, active, name,
+                                                    version=version, description=description,
+                                                    source_file=source_file),
+                           _summ(lib_id=lib_id, version=version))
     @mcp.tool(name="favorites_list")
     def favorites_list() -> str:
         """Favoriten-Patch-Saetze auflisten."""
@@ -146,18 +155,20 @@ def build_server(ctx, host, port):
 
     @mcp.tool(name="favorites_add")
     def favorites_add(favorite_json: str) -> str:
-        """Patch-Satz als Favorit ablegen. favorite_json = JSON-Objekt:
-        {"name":..., "patches":[{"type":"smali","file":..,"orig":..,"edit":..,"scope":"method"},
+        """Patch-Satz als Favorit ablegen. favorite_json = JSON-Objekt mit PFLICHT 'version'
+        (z.B. '1.0') + 'description' (Zweck) auf Top-Ebene, dazu 'name' und 'patches':
+        [{"type":"smali","file":..,"orig":..,"edit":..,"scope":"method"},
         {"type":"hex","file":..,"ram":..,"base":..,"orig":..,"patch":..},
-        {"type":"lib_replace","target":..,"source":..}]}. Einzel-Patch-Kurzform wird akzeptiert."""
+        {"type":"lib_replace","target":..,"source":..},
+        {"type":"new_file","file":..,"edit":..}]. Einzel-Patch-Kurzform ok.
+        NEUER Favorit = neuer Patch-Pfad; Bugfix am selben -> favorites.update mit Version-Bump."""
         return runtime.run(ctx, "favorites.add", lambda: tools.favorites_add(ctx, favorite_json), "favorite")
-
     @mcp.tool(name="favorites_update")
     def favorites_update(ref: str, favorite_json: str) -> str:
-        """Einen Favoriten ersetzen (Index oder Name). Gleiches JSON-Schema wie favorites_add."""
+        """Favoriten ersetzen (Index/Name). Gleiches JSON-Schema wie favorites_add (inkl. PFLICHT
+        'version' + 'description'). Bei Aenderung version bumpen (sonst WARN)."""
         return runtime.run(ctx, "favorites.update",
                            lambda: tools.favorites_update(ctx, ref, favorite_json), _summ(ref=ref))
-
     @mcp.tool(name="favorites_delete")
     def favorites_delete(ref: str, confirm: bool = False) -> str:
         """Einen Favoriten loeschen (Index oder Name). Gated: delete_ops + confirm."""
@@ -171,6 +182,90 @@ def build_server(ctx, host, port):
                            lambda: tools.patch_evaluate(ctx, file, orig, scope), _summ(file=file, scope=scope))
 
     # ---------------- F: File Manager (nur info=O im MVP) ----------------
+    # ---------------- L: Frida ----------------
+    @mcp.tool(name="frida_config_get")
+    def frida_config_get() -> str:
+        """Frida-Config lesen (mode/host/port/script_directory_path/pause_on_load + INJECT_FRIDA)."""
+        return runtime.run(ctx, "frida.config_get", lambda: tools.frida_config_get(ctx))
+
+    @mcp.tool(name="frida_config_set")
+    def frida_config_set(mode: Optional[str] = None, host: Optional[str] = None,
+                         port: Optional[int] = None, script_directory_path: Optional[str] = None,
+                         pause_on_load: Optional[bool] = None) -> str:
+        """Frida-Config setzen. mode: listen|connect|script|script_directory. Merge-sicher."""
+        return runtime.run(ctx, "frida.config_set",
+                           lambda: tools.frida_config_set(ctx, mode, host, port, script_directory_path, pause_on_load),
+                           _summ(mode=mode, host=host, port=port, pause_on_load=pause_on_load))
+
+    @mcp.tool(name="frida_build_toggle")
+    def frida_build_toggle(enabled: bool) -> str:
+        """Frida im Build aktivieren/deaktivieren (INJECT_FRIDA)."""
+        return runtime.run(ctx, "frida.build_toggle", lambda: tools.frida_build_toggle(ctx, enabled), _summ(enabled=enabled))
+
+    @mcp.tool(name="frida_scripts_list")
+    def frida_scripts_list() -> str:
+        """Frida-Skripte auflisten (id/name/version/aktiv)."""
+        return runtime.run(ctx, "frida.scripts_list", lambda: tools.frida_scripts_list(ctx))
+
+    @mcp.tool(name="frida_scripts_get")
+    def frida_scripts_get(ref: str) -> str:
+        """Ein Frida-Skript inkl. Code holen (id oder name)."""
+        return runtime.run(ctx, "frida.scripts_get", lambda: tools.frida_scripts_get(ctx, ref), _summ(ref=ref))
+
+    @mcp.tool(name="frida_scripts_add")
+    def frida_scripts_add(name: str, version: str, description: str, code: Optional[str] = None) -> str:
+        """Frida-Skript anlegen. PFLICHT version+description; code optional."""
+        return runtime.run(ctx, "frida.scripts_add",
+                           lambda: tools.frida_scripts_add(ctx, name, code=code, version=version, description=description),
+                           _summ(name=name, version=version))
+
+    @mcp.tool(name="frida_scripts_update")
+    def frida_scripts_update(ref: str, name: Optional[str] = None, code: Optional[str] = None,
+                             version: Optional[str] = None, description: Optional[str] = None) -> str:
+        """Frida-Skript aendern (Bugfix: version bumpen + description; sonst WARN)."""
+        return runtime.run(ctx, "frida.scripts_update",
+                           lambda: tools.frida_scripts_update(ctx, ref, name, code, version, description),
+                           _summ(ref=ref, version=version))
+
+    @mcp.tool(name="frida_scripts_delete")
+    def frida_scripts_delete(ref: str, confirm: bool = False) -> str:
+        """Frida-Skript loeschen (id/name). Gated: delete_ops + confirm."""
+        return runtime.run(ctx, "frida.scripts_delete", lambda: tools.frida_scripts_delete(ctx, ref), _summ(ref=ref), confirm=confirm)
+
+    @mcp.tool(name="frida_set_active")
+    def frida_set_active(ref: str) -> str:
+        """Aktives Frida-Skript (Build-Ziel) setzen (id/name)."""
+        return runtime.run(ctx, "frida.set_active", lambda: tools.frida_set_active(ctx, ref), _summ(ref=ref))
+
+    @mcp.tool(name="frida_collections_list")
+    def frida_collections_list() -> str:
+        """Frida-Collections auflisten."""
+        return runtime.run(ctx, "frida.collections_list", lambda: tools.frida_collections_list(ctx))
+
+    @mcp.tool(name="frida_collections_add")
+    def frida_collections_add(name: str, version: str, description: str, script_ids: Optional[str] = None) -> str:
+        """Collection anlegen. PFLICHT version+description; script_ids = JSON-Liste ODER Komma-Liste."""
+        return runtime.run(ctx, "frida.collections_add",
+                           lambda: tools.frida_collections_add(ctx, name, script_ids=script_ids, version=version, description=description),
+                           _summ(name=name, version=version))
+
+    @mcp.tool(name="frida_collections_update")
+    def frida_collections_update(ref: str, name: Optional[str] = None, script_ids: Optional[str] = None,
+                                 version: Optional[str] = None, description: Optional[str] = None) -> str:
+        """Collection aendern (name/script_ids/version/description)."""
+        return runtime.run(ctx, "frida.collections_update",
+                           lambda: tools.frida_collections_update(ctx, ref, name, script_ids, version, description), _summ(ref=ref))
+
+    @mcp.tool(name="frida_collections_delete")
+    def frida_collections_delete(ref: str, confirm: bool = False) -> str:
+        """Collection loeschen (id/name). Gated: delete_ops + confirm."""
+        return runtime.run(ctx, "frida.collections_delete", lambda: tools.frida_collections_delete(ctx, ref), _summ(ref=ref), confirm=confirm)
+
+    @mcp.tool(name="frida_push_collection")
+    def frida_push_collection(ref: str, confirm: bool = False) -> str:
+        """Collection aufs Geraet pushen (kompiliert + adb push). Gated: file_manager + confirm."""
+        return runtime.run(ctx, "frida.push_collection", lambda: tools.frida_push_collection(ctx, ref), _summ(ref=ref), confirm=confirm)
+
     @mcp.tool(name="device_info")
     def device_info() -> str:
         """adb-State + 3rd-Party-Paketliste (kein Dateizugriff)."""

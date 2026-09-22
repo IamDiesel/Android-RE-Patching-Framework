@@ -2,7 +2,7 @@
 
 A Python-based automation utility designed for Android reverse engineering workflows.
 
-This application automates the sequential execution of unpacking, binary hex patching, native library replacements, Smali modification, repackaging, cryptographic signing, ADB sideloading, and logcat tracing. It facilitates the local integration of static code analysis, dynamic instrumentation (Frida), and MITM proxying for applications, including native Java/Kotlin builds and Dart AOT-compiled (Flutter) applications.
+This application automates the sequential execution of unpacking, binary hex patching, native library replacements, Smali modification, repackaging, cryptographic signing, ADB sideloading, and logcat tracing. It facilitates the local integration of static code analysis, dynamic instrumentation (Frida), and MITM proxying for applications, including native Java/Kotlin builds and Dart AOT-compiled (Flutter) applications. It additionally exposes an **MCP server** for controlled AI-agent operation (see §4.10).
 
 ⚠️ **Disclaimer:**
 
@@ -206,6 +206,8 @@ A comprehensive IDE-like interface for managing and injecting dynamic instrument
 **The Ghost Protocol (Native File Trace):**
 To bypass strict Android Zygote `stdout` restrictions, Logcat truncation, and UI-blocking timeouts during time-critical loops, the framework provides a "Ghost Log" fallback. By utilizing Frida's C-level File API (`frida_file_comm_extensive.js`) to write logs directly to `/data/data/{APP_PACKAGE}/ghost.log` and establishing a synchronous `adb shell run-as tail -f` background listener, the framework captures analysis data in real-time, completely bypassing the standard Android log buffers.
 
+**MCP-Steuerung:** Betriebsmodi, App-Start-Verhalten (`pause_on_load`), Netzwerk/ScriptDirectory, der Build-Schalter (`INJECT_FRIDA`) sowie Skripte und Collections lassen sich vollständig über den MCP-Server steuern (§4.10); Skripte/Collections tragen dabei `version` + `description` wie die übrigen Artefakte, und der Gerätesync (Collection → Gerät) ist gated.
+
 ### 4.6 Device File Explorer
 
 An integrated graphical file manager leveraging the `run-as` binary wrapper via ADB to bypass Android's Scoped Storage limitations, allowing direct navigation of the application's isolated sandbox (`/data/data/{APP_PACKAGE}/`) on non-rooted devices. Features include threaded downloads/uploads with progress tracking and direct file manipulation.
@@ -223,7 +225,7 @@ Injizieren eigener nativer Bibliotheken**. Reiter im Workspace neben dem Replace
 * **Import:** Fertige `.so` per Filedialog importierbar (ohne Quellcode/Build).
 * **Verwaltung:** Persistenz in `data/native_libs.json` + `data/native_libs/<id>/` (`NativeLibManager`).
   Libs sind **aktiv/inaktiv** schaltbar (ohne Löschen) und per Button/„Entf" **löschbar**; **Recompile
-  überschreibt** die `.so`. Beschreibung + Code stehen parallel zur Lib.
+  überschreibt** die `.so`. Beschreibung + Code stehen parallel zur Lib. Jede Lib führt zusätzlich eine `version` (in die Beschreibung als `[vX]` gespiegelt); die Persistenz ist **konfliktsicher** (atomar + Three-Way-Merge, siehe §4.10), sodass GUI- und MCP-Änderungen sich nicht gegenseitig überschreiben.
 * **Toolchain:** Der `ToolManager` erkennt ein installiertes NDK, lädt es bei Bedarf herunter
   (gepinnt `NDK_FALLBACK_VERSION`), verifiziert `clang` und injiziert das Toolchain-`bin` dynamisch
   in den `PATH`. Neuer Pipeline-Step `inject_added_libs` (in `BUILD_NATIVE`) spielt alle **aktiven**
@@ -264,3 +266,14 @@ Ein `OUTPUT_KIND = executable`-Target wird nicht per `loadLibrary` injiziert, so
   `EXEC_COLOR_PER_EXE`.
 * **Nicht gerootet / Datenschutz:** ausschließlich `adb` + `run-as`, niemals `su`; Capture-Dateien
   bleiben durch geräteinternes Staging auf dem Gerät (Ergebnis-`pull` nur explizit).
+
+### 4.10 MCP-Server (KI-Agent-Steuerung)
+
+Exponiert das Framework über das **Model Context Protocol** (`mcp_server/`), sodass ein KI-Client (z. B. Claude Desktop) Analyse und Vorbereitung fernsteuern kann — im **Prepare-&-Observe-Betriebsmodell**: der Agent bereitet vor und beobachtet, der Nutzer baut/flasht/startet in der GUI.
+
+* **Zwei Transporte:** ein **stdio-Server** (vom Desktop-Client gespawnt) und ein optionaler **HTTP-Server** (`127.0.0.1`, verwaltet über die GUI-Seite „🔌 MCP“). Beide teilen `config.json`.
+* **Gating in drei Stufen (`registry.py` + `gating.py`):** **P** (Prepare) und **O** (Observe) sind frei; **G** (Gated — Bauen/Flashen/Starten, File Manager, Löschen, Gerätesync) braucht Pro-Tool-Schalter **+** Kategorie-Freigabe (`caps`) **+** `confirm=true`. Jeder Aufruf läuft durch `runtime.run` (Gating → Ausführung unter EventBus-Sammler → Audit `data/mcp_audit.jsonl`); GUI-Rechte werden pro Aufruf frisch eingelesen.
+* **Tool-Katalog (Gruppen A–L):** Workspace/Config, Smali-Analyse, LibForge, Patch-Favoriten, Build/Flash, File Manager, Executables (ExeDeploy), Capture/Logs, DAST/API, Historie, Selbstauskunft und **Frida** (14 Tools: Config/Betriebsmodi/App-Start/Netz/ScriptDir, Build-Toggle `INJECT_FRIDA`, Skripte + Collections inkl. Versionierung, Aktiv-Setzen, gated Gerätesync).
+* **Versionierungs-Disziplin (Pflicht):** Libs, Patch-Favoriten **und** Frida-Skripte/Collections tragen `version` + `description` (als `[vX]` in die Beschreibung gespiegelt). Bugfix am selben Pfad → `*.update` mit Versions-Bump; neuer Ansatz → `*.create`/`*.add` (Original bleibt unangetastet). Ohne Bump: Warnung, aber Speichern (warn-but-allow).
+* **Konfliktsichere Persistenz (`core/infrastructure/json_store.py`):** GUI und MCP laufen als getrennte Prozesse. Alle JSON-Stores (`native_libs.json`, `favorite_patches.json`, `frida_scripts.json`) sowie `config.json` schreiben **atomar** (Temp + `os.replace`) und mergen per **Three-Way-Merge** (key = `id`/`name`) gegen die frische Platten-Version — parallele Änderungen gehen nicht verloren. Ein **mtime-gated Reload** (`reload_if_changed`) macht Fremd-Änderungen sofort sichtbar; die GUI hat je einen **„🔄 Aktualisieren“-Button** (LibForge, Favoriten- und Frida-Dialog).
+* **Nicht gerootet / Datenschutz:** dieselben `adb`/`run-as`-Grenzen wie die GUI; personenbezogene Werte/Schlüssel bleiben lokal (Tools liefern Labels/Längen/Booleans statt Klartext).

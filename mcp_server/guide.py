@@ -51,7 +51,14 @@ TIERS & GATING:
   "MCP". Wird ein G-Tool verweigert, liefert es die GUI-Anleitung -> weitergeben, NICHT
   wiederholt versuchen. mcp.capabilities zeigt, was gerade frei ist.
 
-GOTCHAS:
+7. Frida (ueber MCP steuerbar): frida.config_get/set (Betriebsmodi listen|connect|script|
+   script_directory; App-Start via pause_on_load; Netz host/port; script_directory_path),
+   frida.build_toggle (INJECT_FRIDA an/aus). Skripte: frida.scripts_list/get/add/update/delete
+   + frida.set_active (= Build-Ziel). Collections: frida.collections_list/add/update/delete.
+   frida.push_collection = Collection aufs Geraet (gated: file_manager+confirm). Frida-Skripte
+   & Collections tragen wie Patches version+description (Pflicht bei add).
+
+VERSIONIERUNG (Libs, Patch-Favoriten & Frida) — PFLICHT:\n- Jede Lib und jeder Favorit hat version (Freitext, z.B. 1.0) + description (Zweck); die\n  Version wird in die description gespiegelt ([vX] ...). Bei create/add sind beide Pflicht.\n- BUGFIX / selber Pfad -> lib.update / favorites.update, dabei Version bumpen (z.B. 1.0->1.1)\n  UND description aktualisieren. Ohne Bump warnt das Tool, speichert aber (warn-but-allow).\n- NEUER Pfad/Ansatz -> NICHT ueberschreiben, sondern lib.create / favorites.add (neuer Eintrag,\n  eigene Version); das Original bleibt unangetastet.\n\nGOTCHAS:
 - Kein Handy verbunden? adb-Aktionen scheitern ("Geraet offline") — statische Analyse
   (smali.*) geht trotzdem.
 - smali.search hat ein Zeitbudget; bei "Zeitbudget erreicht" praeziser suchen.

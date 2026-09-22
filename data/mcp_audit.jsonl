@@ -26,3 +26,66 @@
 {"ts": "2026-09-22T01:51:28", "tool": "smali.search", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"pattern\": \"addResponseHandler\", \"regex\": false}", "result": "ok", "duration_ms": 3310}
 {"ts": "2026-09-22T01:52:11", "tool": "smali.search", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"pattern\": \"libreview\", \"regex\": false}", "result": "ok", "duration_ms": 3338}
 {"ts": "2026-09-22T01:52:15", "tool": "smali.search", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"pattern\": \"lluapi\", \"regex\": false}", "result": "ok", "duration_ms": 3218}
+{"ts": "2026-09-22T02:31:08", "tool": "workspace.status", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 44}
+{"ts": "2026-09-22T02:31:20", "tool": "smali.search", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"pattern\": \"secure-datastore\", \"regex\": false}", "result": "ok", "duration_ms": 3614}
+{"ts": "2026-09-22T02:31:24", "tool": "smali.search", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"pattern\": \"associatedDataForItem\", \"regex\": false}", "result": "ok", "duration_ms": 3516}
+{"ts": "2026-09-22T02:31:28", "tool": "smali.search", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"pattern\": \"secureApiData\", \"regex\": false}", "result": "ok", "duration_ms": 3549}
+{"ts": "2026-09-22T02:32:10", "tool": "smali.method", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"relpath\": \"smali\\\\com\\\\app\\\\SecureDataStoreModule.smali\", \"signature\": \"associatedDataForItem(Ljava/lang/String;)[B\"}", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T02:33:32", "tool": "lib.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T03:02:05", "tool": "device.ls", "tier": "G", "decision": "denied", "confirm": false, "args": "{\"path\": \"files\", \"domain\": \"runas\"}", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-22T03:02:30", "tool": "mcp.capabilities", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T03:03:03", "tool": "device.info", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 200}
+{"ts": "2026-09-22T03:05:41", "tool": "device.ls", "tier": "G", "decision": "denied", "confirm": false, "args": "{\"path\": \".\", \"domain\": \"runas\"}", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-22T03:08:35", "tool": "device.ls", "tier": "G", "decision": "denied", "confirm": false, "args": "{\"path\": \".\", \"domain\": \"runas\"}", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-22T03:08:47", "tool": "mcp.capabilities", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T03:14:39", "tool": "mcp.capabilities", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T03:15:23", "tool": "mcp.guide", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T03:21:55", "tool": "mcp.capabilities", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 2}
+{"ts": "2026-09-22T03:22:09", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \".\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 315}
+{"ts": "2026-09-22T03:22:48", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \"files\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 214}
+{"ts": "2026-09-22T03:22:54", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \"no_backup\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 147}
+{"ts": "2026-09-22T03:23:01", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \"shared_prefs\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 166}
+{"ts": "2026-09-22T03:23:01", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \"databases\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 183}
+{"ts": "2026-09-22T03:23:16", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \"files/mmkv\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 147}
+{"ts": "2026-09-22T03:23:16", "tool": "device.ls", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"path\": \"files/datastore\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 215}
+{"ts": "2026-09-22T03:26:22", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"files/mmkv/redux-persist-encrypted\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 319}
+{"ts": "2026-09-22T03:26:22", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"files/mmkv/redux-persist\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 117}
+{"ts": "2026-09-22T03:26:23", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"no_backup/secure_datastore_v1.preferences_pb\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 135}
+{"ts": "2026-09-22T03:26:23", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"shared_prefs/secure_preferences.xml\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 157}
+{"ts": "2026-09-22T03:26:24", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"ghost_aes_key.txt\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 195}
+{"ts": "2026-09-22T03:35:19", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"tink_keyset.txt\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 282}
+{"ts": "2026-09-22T03:35:20", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"ghost_evpkeys.txt\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 171}
+{"ts": "2026-09-22T04:19:03", "tool": "lib.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 5}
+{"ts": "2026-09-22T12:12:30", "tool": "device.info", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 45}
+{"ts": "2026-09-22T12:24:04", "tool": "lib.create", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"name\": \"hwkey\", \"version\": \"1.1\"}", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T12:26:06", "tool": "lib.update", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"lib_id\": \"dfcf179e5521441085b6d4e1c50b4d8f\", \"version\": null}", "result": "ok", "duration_ms": 8}
+{"ts": "2026-09-22T12:28:01", "tool": "lib.update", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"lib_id\": \"fa7cf456dba648f8ac6ba93826dc2d05\", \"version\": null}", "result": "ok", "duration_ms": 4}
+{"ts": "2026-09-22T12:28:43", "tool": "lib.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T12:28:50", "tool": "device.info", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 45}
+{"ts": "2026-09-22T12:49:15", "tool": "lib.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 13}
+{"ts": "2026-09-22T12:49:25", "tool": "favorites.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 138}
+{"ts": "2026-09-22T12:50:36", "tool": "favorites.get", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"ref\": \"45\"}", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T13:48:21", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"ghost.log\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 160}
+{"ts": "2026-09-22T13:48:22", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"ghost_evpkeys.txt\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 199}
+{"ts": "2026-09-22T13:48:26", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"ghost_aes_key.txt\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 192}
+{"ts": "2026-09-22T13:48:27", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"files/mmkv/redux-persist-encrypted\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 254}
+{"ts": "2026-09-22T13:48:28", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"no_backup/secure_datastore_v1.preferences_pb\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 223}
+{"ts": "2026-09-22T13:48:29", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "{\"remote_path\": \"tink_keyset.txt\", \"domain\": \"runas\"}", "result": "ok", "duration_ms": 199}
+{"ts": "2026-09-22T13:58:07", "tool": "smali.methods", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"relpath\": \"smali/com/app/SecureDataStoreModule.smali\"}", "result": "ok", "duration_ms": 20}
+{"ts": "2026-09-22T14:02:18", "tool": "smali.methods", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"relpath\": \"smali/com/app/EncryptedSharedPreferencesModule.smali\"}", "result": "ok", "duration_ms": 1}
+{"ts": "2026-09-22T14:20:59", "tool": "smali.method", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"relpath\": \"smali/com/app/SecureDataStoreModule.smali\", \"signature\": \"getOrCreateKeysetWrapperKey\"}", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T14:51:18", "tool": "mcp.guide", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 15}
+{"ts": "2026-09-22T15:13:11", "tool": "lib.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T15:51:16", "tool": "favorites.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 212}
+{"ts": "2026-09-22T15:51:38", "tool": "favorites.add", "tier": "P", "decision": "allowed", "confirm": false, "args": "favorite", "result": "ok", "duration_ms": 531}
+{"ts": "2026-09-22T15:53:53", "tool": "favorites.list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 134}
+{"ts": "2026-09-22T15:54:35", "tool": "favorites.delete", "tier": "G", "decision": "denied", "confirm": true, "args": "{\"ref\": \"ZZ_SYNC_TEST_CHANGED\"}", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-22T16:04:50", "tool": "lib.create", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"name\": \"ZZ_LIB_TEST\", \"version\": \"1.0\"}", "result": "ok", "duration_ms": 186}
+{"ts": "2026-09-22T16:27:59", "tool": "frida.scripts_list", "tier": "P", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 12}
+{"ts": "2026-09-22T16:28:07", "tool": "frida.config_get", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 0}
+{"ts": "2026-09-22T16:28:54", "tool": "frida.config_set", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"mode\": null, \"host\": null, \"port\": null, \"pause_on_load\": false}", "result": "ok", "duration_ms": 17}
+{"ts": "2026-09-22T16:29:01", "tool": "frida.scripts_add", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"name\": \"ZZ_FRIDA_TEST\", \"version\": \"1.0\"}", "result": "ok", "duration_ms": 32}
+{"ts": "2026-09-22T16:29:22", "tool": "frida.config_set", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"mode\": null, \"host\": null, \"port\": null, \"pause_on_load\": true}", "result": "ok", "duration_ms": 12}
+{"ts": "2026-09-22T16:32:02", "tool": "frida.scripts_get", "tier": "O", "decision": "allowed", "confirm": false, "args": "{\"ref\": \"ZZ_FRIDA_TEST\"}", "result": "ok", "duration_ms": 16}
+{"ts": "2026-09-22T16:33:22", "tool": "frida.set_active", "tier": "P", "decision": "allowed", "confirm": false, "args": "{\"ref\": \"108_Survivor\"}", "result": "ok", "duration_ms": 46}
+{"ts": "2026-09-22T16:33:28", "tool": "frida.scripts_delete", "tier": "G", "decision": "denied", "confirm": true, "args": "{\"ref\": \"ZZ_FRIDA_TEST\"}", "result": "blocked", "duration_ms": 0}

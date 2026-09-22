@@ -4,7 +4,7 @@ import difflib
 import re
 import threading
 
-from services.favorite_service import FavoriteService
+from services.favorite_service import FavoriteService, get_shared_favorites
 from ui.controllers.favorite_patches_controller import FavoritePatchesController
 
 
@@ -17,7 +17,7 @@ class FavoritePatchesDialog(tk.Toplevel):
         self.attributes("-topmost", True)
         self.transient(ws.winfo_toplevel())
 
-        fav_service = FavoriteService(self.ws.app.cfg.config.get("BASE_DIR", ""))
+        fav_service = get_shared_favorites(self.ws.app)
         self.controller = FavoritePatchesController(self, ws, fav_service)
 
         self.current_sub_patch_idx = 0
@@ -30,6 +30,7 @@ class FavoritePatchesDialog(tk.Toplevel):
 
         ttk.Button(f_btn, text="💾 Speichern", command=self.controller.save_current).pack(side="left", padx=5)
         ttk.Button(f_btn, text="🗑 Löschen", command=self.controller.delete_current).pack(side="left", padx=5)
+        ttk.Button(f_btn, text="🔄 Aktualisieren", command=self.reload_favs).pack(side="left", padx=5)
         ttk.Button(f_btn, text="▶ Alle anwenden (Batch)", command=self.controller.start_batch_fav).pack(side="right",
                                                                                                         padx=5)
         ttk.Button(f_btn, text="▶ Nur aktuellen anwenden", command=self.controller.start_single_fav).pack(side="right",
@@ -157,6 +158,16 @@ class FavoritePatchesDialog(tk.Toplevel):
             m = re.search(r'^\s*([a-zA-Z0-9_-]+)', line)
             if m and not m.group(1).startswith('.'): txt_widget.tag_add("s_inst", f"{tk_line}.{m.start(1)}",
                                                                         f"{tk_line}.{m.end(1)}")
+
+    def reload_favs(self):
+        """Favoriten neu von der Platte laden (externe/MCP-Aenderungen uebernehmen)."""
+        changed = self.controller.fav_service.reload_if_changed()
+        self.populate_list()
+        try:
+            self.ws.app.log("[Favoriten] aktualisiert"
+                            + (" — externe Aenderungen uebernommen." if changed else " (bereits aktuell)."))
+        except Exception:
+            pass
 
     def populate_list(self):
         for i in self.tree_favs.get_children(): self.tree_favs.delete(i)

@@ -50,8 +50,8 @@ TOOL_CATALOG = [
 
     # --- C: LibForge vorbereiten ---
     ToolSpec("lib.list",               "C", "LibForge", "P", (), "Alle NativeLibs auflisten"),
-    ToolSpec("lib.create",             "C", "LibForge", "P", (), "Lib-Eintrag anlegen"),
-    ToolSpec("lib.update",             "C", "LibForge", "P", (), "C-Quelle + Build-Felder setzen"),
+    ToolSpec("lib.create",             "C", "LibForge", "P", (), "Lib anlegen (PFLICHT version+description; neue Lib=neuer Pfad)"),
+    ToolSpec("lib.update",             "C", "LibForge", "P", (), "C-Quelle/Felder (Bugfix: version bumpen+description; sonst WARN)"),
     ToolSpec("lib.import_so",          "C", "LibForge", "P", (), "Fertige .so eintragen (kein Build)"),
     ToolSpec("lib.build",              "C", "LibForge", "G", ("build",), "NDK-Build (gated)"),
     ToolSpec("lib.set_active",         "C", "LibForge", "P", (), "Lib aktiv/inaktiv setzen"),
@@ -60,8 +60,8 @@ TOOL_CATALOG = [
     # --- D: Patches als Favoriten ---
     ToolSpec("favorites.list",         "D", "Patches / Favoriten", "P", (), "Favoriten auflisten (Name, Anzahl, Typen)"),
     ToolSpec("favorites.get",          "D", "Patches / Favoriten", "O", (), "Einen Favoriten vollstaendig anzeigen (Index/Name)"),
-    ToolSpec("favorites.add",          "D", "Patches / Favoriten", "P", (), "Patch-Satz ablegen (smali/hex/lib_replace, multi-patch)"),
-    ToolSpec("favorites.update",       "D", "Patches / Favoriten", "P", (), "Favoriten ersetzen (Index/Name)"),
+    ToolSpec("favorites.add",          "D", "Patches / Favoriten", "P", (), "Patch-Satz ablegen (PFLICHT version+description; smali/hex/lib_replace/new_file)"),
+    ToolSpec("favorites.update",       "D", "Patches / Favoriten", "P", (), "Favoriten ersetzen (Bugfix: version bumpen; sonst WARN)"),
     ToolSpec("patch.evaluate",         "D", "Patches / Favoriten", "O", (), "Dry-Run gegen den RAM-Index"),
     ToolSpec("favorites.delete",       "D", "Patches / Favoriten", "G", ("delete_ops",), "Favorit loeschen (nur auf Anfrage)"),
 
@@ -109,9 +109,25 @@ TOOL_CATALOG = [
     ToolSpec("mcp.capabilities",       "K", "MCP-Selbstauskunft", "O", (), "Welche Tools/Caps sind frei?"),
     ToolSpec("mcp.audit_tail",         "K", "MCP-Selbstauskunft", "O", (), "Letzte Audit-Eintraege lesen"),
     ToolSpec("mcp.guide",              "K", "MCP-Selbstauskunft", "O", (), "Bedienungsanleitung (Workflow, Tiers, Gotchas)"),
+
+    # --- L: Frida ---
+    ToolSpec("frida.config_get",        "L", "Frida", "O", (), "Frida-Config lesen (Modus/Netz/ScriptDir/Start)"),
+    ToolSpec("frida.config_set",        "L", "Frida", "P", (), "Frida-Config setzen (mode/host/port/script_directory_path/pause_on_load)"),
+    ToolSpec("frida.build_toggle",      "L", "Frida", "P", (), "Frida im Build an/aus (INJECT_FRIDA)"),
+    ToolSpec("frida.scripts_list",      "L", "Frida", "P", (), "Frida-Skripte auflisten"),
+    ToolSpec("frida.scripts_get",       "L", "Frida", "O", (), "Ein Frida-Skript inkl. Code holen"),
+    ToolSpec("frida.scripts_add",       "L", "Frida", "P", (), "Frida-Skript anlegen (PFLICHT version+description)"),
+    ToolSpec("frida.scripts_update",    "L", "Frida", "P", (), "Frida-Skript aendern (Bugfix: version bumpen; sonst WARN)"),
+    ToolSpec("frida.scripts_delete",    "L", "Frida", "G", ("delete_ops",), "Frida-Skript loeschen (nur auf Anfrage)"),
+    ToolSpec("frida.set_active",        "L", "Frida", "P", (), "Aktives Frida-Skript (Build-Ziel) setzen"),
+    ToolSpec("frida.collections_list",  "L", "Frida", "P", (), "Frida-Collections auflisten"),
+    ToolSpec("frida.collections_add",   "L", "Frida", "P", (), "Collection anlegen (PFLICHT version+description)"),
+    ToolSpec("frida.collections_update","L", "Frida", "P", (), "Collection aendern (name/script_ids/version/description)"),
+    ToolSpec("frida.collections_delete","L", "Frida", "G", ("delete_ops",), "Collection loeschen (nur auf Anfrage)"),
+    ToolSpec("frida.push_collection",   "L", "Frida", "G", ("file_manager",), "Collection aufs Geraet pushen (gated)"),
 ]
 
-GROUP_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K"]
+GROUP_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
 GROUP_NAMES = {s.group: s.group_name for s in TOOL_CATALOG}
 CAP_KEYS = ["build", "flash", "app_start", "exec_run", "file_manager", "delete_ops"]
 

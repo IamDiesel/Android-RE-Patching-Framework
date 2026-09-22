@@ -7,6 +7,8 @@ class FridaScript:
     id: str
     name: str
     code: str
+    version: str = "1.0"          # Version (Freitext); wird in description gespiegelt
+    description: str = ""
 
 
 @dataclass
@@ -49,3 +51,5 @@ class FridaCollection:
     id: str
     name: str
     script_ids: List[str] = field(default_factory=list)
+    version: str = "1.0"          # Version (Freitext); wird in description gespiegelt
+    description: str = ""

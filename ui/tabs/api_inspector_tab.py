@@ -237,18 +237,18 @@ class APIInspectorTab(ttk.Frame):
         self._run_bg("Zertifikat installieren", AdbNetworkService.open_cert_install)
 
     def route_usb(self):
-        AdbNetworkService.route_usb()
         self.lbl_tunnel_status.config(text="Tunnel: 🟡 USB")
+        self._run_bg("Route USB", AdbNetworkService.route_usb)
 
     def route_wlan(self):
         ip = simpledialog.askstring("WLAN Proxy", "Lokale IP deines PCs:")
         if ip:
-            AdbNetworkService.route_wlan(ip)
-            self.lbl_tunnel_status.config(text=f"Tunnel: 🔵 WLAN")
+            self.lbl_tunnel_status.config(text="Tunnel: 🔵 WLAN")
+            self._run_bg("Route WLAN", lambda: AdbNetworkService.route_wlan(ip))
 
     def reset_route(self):
-        AdbNetworkService.reset_route()
         self.lbl_tunnel_status.config(text="Tunnel: 🔴 Inaktiv")
+        self._run_bg("Reset Route", AdbNetworkService.reset_route)
 
     def process_row_to_dict(self, r):
         t_str = time.strftime('%H:%M:%S', time.localtime(r[1]))

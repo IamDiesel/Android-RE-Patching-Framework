@@ -36,6 +36,7 @@ class LibForgeTab(ttk.Frame):
         ttk.Button(btns, text="📁 .so importieren", command=self.controller.import_so).pack(side="left", padx=1)
         ttk.Button(btns, text="⏻ Aktiv/Inaktiv", command=self.controller.toggle_active).pack(side="left", padx=1)
         ttk.Button(btns, text="🗑 Löschen", command=self.controller.delete_selected).pack(side="left", padx=1)
+        ttk.Button(btns, text="🔄 Aktualisieren", command=self.controller.reload_from_disk).pack(side="right", padx=1)
 
         cols = ("active", "name", "type", "build", "desc")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=12)

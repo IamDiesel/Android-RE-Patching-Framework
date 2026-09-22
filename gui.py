@@ -8,6 +8,7 @@ from core.infrastructure.config_manager import ConfigManager
 from core.pipeline.engine import PipelineEngine
 from services.history_service import HistoryManager
 from services.callgraph_service import CallGraphManager
+from services.adb_devices import apply_android_serial
 
 # In gui.py ganz oben:
 from ui.tabs.api_inspector_tab import APIInspectorTab
@@ -31,6 +32,12 @@ class ReFrameworkApp(tk.Tk):
 
         # Core Models (State & Logic)
         self.cfg = ConfigManager()
+        # Mehrgeraet: USB-Default (bzw. konfiguriertes Geraet) als ANDROID_SERIAL setzen,
+        # damit adb-Aufrufe bei parallelem WLAN-Geraet nicht mehr scheitern.
+        try:
+            apply_android_serial(self.cfg, self.cfg.paths.get("ADB", "adb"), probe=True)
+        except Exception as _e:
+            print(f"[ADB] Geraeteauswahl beim Start: {_e}")
         self.history = HistoryManager(self.cfg)
         self.cg = CallGraphManager()
 
@@ -70,7 +77,7 @@ class ReFrameworkApp(tk.Tk):
 
         # Tabs initialisieren
         self.app_manager_tab = AppManagerTab(self.notebook, self.cfg.paths.get("SOURCE_DIR", "source"),
-                                             self.handle_app_imported)
+                                             self.handle_app_imported, cfg=self.cfg)
         self.workspace_tab = WorkspaceTab(self.notebook, self)
         self.api_tab = APIInspectorTab(self.notebook, self.cfg)
         self.history_tab = HistoryTab(self.notebook, self)

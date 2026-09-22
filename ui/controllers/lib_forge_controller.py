@@ -16,6 +16,13 @@ class LibForgeController:
         # LibForge und ExeDeploy sich mit veraltetem Stand gegenseitig ueberschreiben.
         self.mgr = get_shared_manager(app)
 
+    def reload_from_disk(self):
+        """Liste neu von der Platte laden (uebernimmt externe Aenderungen, z.B. per MCP)."""
+        changed = self.mgr.reload_if_changed()
+        self.view.refresh_list()
+        self.app.log("[LibForge] Liste aktualisiert"
+                     + (" — externe Aenderungen uebernommen." if changed else " (bereits aktuell)."))
+
     # ---------- CRUD ----------
     def new_lib(self):
         lib = self.mgr.create(name="")

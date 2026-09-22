@@ -8,6 +8,7 @@ class NativeLib:
     id: str = ""
     name: str = ""                 # Basisname ohne "lib"/".so" -> Ausgabe lib<name>.so
     description: str = ""
+    version: str = "1.0"          # Version (Freitext); wird in description gespiegelt
     origin: str = "built"          # "built" (aus Quellcode) | "imported" (fertige .so)
     source_code: str = ""          # C-Quelle (nur bei origin == "built")
     active: bool = False

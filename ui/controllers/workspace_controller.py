@@ -6,9 +6,9 @@ import subprocess
 from tkinter import messagebox, simpledialog
 
 from core.infrastructure.command_runner import CommandRunner
-from services.frida_service import FridaManager
+from services.frida_service import FridaManager, get_shared_frida
 from ui.dialogs.frida_manager_dialog import FridaManagerDialog
-from services.favorite_service import FavoriteService
+from services.favorite_service import FavoriteService, get_shared_favorites
 
 
 class WorkspaceController:
@@ -204,7 +204,7 @@ class WorkspaceController:
         if not active_patches:
             return messagebox.showwarning("Leer", "Es gibt aktuell keine aktiven Patches zum Sichern.")
 
-        fav_service = FavoriteService(self.app.cfg.config.get("BASE_DIR", ""))
+        fav_service = get_shared_favorites(self.app)
         new_fav = {
             "name": name,
             "comment": "Gesichert am " + datetime.datetime.now().strftime('%Y-%m-%d'),
@@ -216,8 +216,7 @@ class WorkspaceController:
         messagebox.showinfo("Gesichert", f"Favorit '{name}' mit {len(active_patches)} Patches erfolgreich hinterlegt!")
 
     def open_frida_manager(self):
-        base_dir = self.app.cfg.config.get("BASE_DIR", "")
-        fm = FridaManager(base_dir)
+        fm = get_shared_frida(self.app)
 
         def on_script_changed():
             self.app.log("[*] Aktives Frida-Skript wurde geändert.")

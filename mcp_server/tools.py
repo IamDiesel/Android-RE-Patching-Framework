@@ -343,30 +343,70 @@ def _xref_fmt(symbol, res, scanned, truncated, timed_out):
 
 
 # ============================================================ C: LibForge
+def _strip_ver(text):
+    import re as _re
+    return _re.sub(r'^\[v[^\]]*\]\s*', '', (text or '')).strip()
+
+
+def _compose_desc(version, text):
+    """Version in die description spiegeln: '[v<version>] <text>'."""
+    return f"[v{version}] {_strip_ver(text)}".strip()
+
+
 def lib_list(ctx):
     mgr = ctx.libs()
     out = [{
-        "id": l.id, "name": l.name, "kind": getattr(l, "output_kind", "shared"),
+        "id": l.id, "name": l.name, "version": getattr(l, "version", "1.0"),
+        "kind": getattr(l, "output_kind", "shared"),
         "abi": l.abi, "active": l.active, "built": l.last_build_ok, "so": l.so_relpath,
+        "description": getattr(l, "description", ""),
     } for l in mgr.get_all()]
     return out or "keine Libs angelegt"
 
 
-def lib_create(ctx, name, description=""):
+def lib_create(ctx, name, source_code=None, version="1.0", description="", source_file=None, output_kind=None):
     mgr = ctx.libs()
+    warn = "" if _strip_ver(description) else " [WARN] ohne description angelegt — Version+Zweck angeben."
+    if source_file and source_code is None:
+        try:
+            with open(source_file, "r", encoding="utf-8") as f:
+                source_code = f.read()
+        except Exception as e:
+            return f"[Fehler] source_file nicht lesbar: {e}"
     lib = mgr.create(name=name, origin="built")
-    if description:
-        lib.description = description
-        mgr.update(lib)
-    return f"angelegt: {name} (id={lib.id}). Quelle via lib.update setzen; Build in der GUI (LibForge)."
+    if source_code is not None:
+        lib.source_code = source_code
+    if output_kind:
+        lib.output_kind = output_kind
+    lib.version = str(version)
+    lib.description = _compose_desc(version, description)
+    mgr.update(lib)
+    return (f"angelegt: {name} v{version} (id={lib.id}) — {lib.description}. "
+            f"Build in der GUI (LibForge).{warn}")
 
 
 def lib_update(ctx, lib_id, source_code=None, abi=None, api_level=None,
-               link_libs=None, output_kind=None, active=None, name=None):
+               link_libs=None, output_kind=None, active=None, name=None,
+               version=None, description=None, source_file=None):
     mgr = ctx.libs()
     lib = mgr.get(lib_id)
     if not lib:
         return f"[Fehler] keine Lib mit id={lib_id}"
+    if source_file and source_code is None:
+        try:
+            with open(source_file, "r", encoding="utf-8") as f:
+                source_code = f.read()
+        except Exception as e:
+            return f"[Fehler] source_file nicht lesbar: {e}"
+    content_change = source_code is not None
+    warn = ""
+    if content_change:
+        old_ver = getattr(lib, "version", "1.0")
+        if version is None or str(version) == str(old_ver):
+            warn += (f" [WARN] Quelle geaendert, aber Version nicht erhoeht (v{old_ver}). "
+                     f"Policy: Bugfix -> Version bumpen; neuer Pfad -> lib.create. Trotzdem gespeichert.")
+        if description is None:
+            warn += " [WARN] description nicht aktualisiert."
     if source_code is not None:
         lib.source_code = source_code
     if abi is not None:
@@ -381,8 +421,14 @@ def lib_update(ctx, lib_id, source_code=None, abi=None, api_level=None,
         lib.name = name
     if active is not None:
         lib.active = bool(active)
+    if version is not None:
+        lib.version = str(version)
+    if version is not None or description is not None:
+        eff_ver = str(version) if version is not None else getattr(lib, "version", "1.0")
+        base = description if description is not None else lib.description
+        lib.description = _compose_desc(eff_ver, base)
     mgr.update(lib)
-    return f"aktualisiert: {lib.name} (id={lib.id})"
+    return f"aktualisiert: {lib.name} v{getattr(lib,'version','?')} (id={lib.id}) — {lib.description}{warn}"
 
 
 # ============================================================ D: Patches/Favoriten
@@ -428,6 +474,8 @@ def _normalize_favorite(favorite):
             p.setdefault("scope", "new_file")
             if not p.get("file") or not p.get("edit"):
                 raise ValueError("new_file patch braucht 'file' und 'edit' (Inhalt)")
+    favorite["version"] = str(favorite.get("version", "1.0"))
+    favorite["description"] = _compose_desc(favorite["version"], favorite.get("description", ""))
     return favorite
 
 
@@ -439,6 +487,8 @@ def favorites_list(ctx):
     for i, f in enumerate(favs):
         patches = f.get("patches", [f])
         out.append({"index": i, "name": f.get("name", "(ohne Name)"),
+                    "version": f.get("version", "1.0"),
+                    "description": f.get("description", ""),
                     "patch_count": len(patches),
                     "types": [p.get("type", "smali") for p in patches]})
     return out
@@ -454,9 +504,10 @@ def favorites_get(ctx, ref):
 
 def favorites_add(ctx, favorite):
     fav = _normalize_favorite(favorite)
+    warn = "" if _strip_ver(fav.get("description", "")) else " [WARN] ohne description — Version+Zweck angeben."
     ctx.favorites().add_favorite(fav)
-    return (f"Favorit '{fav['name']}' hinzugefuegt "
-            f"({len(fav['patches'])} Patch(es): {[p['type'] for p in fav['patches']]}).")
+    return (f"Favorit '{fav['name']}' v{fav['version']} hinzugefuegt "
+            f"({len(fav['patches'])} Patch(es): {[p['type'] for p in fav['patches']]}).{warn}")
 
 
 def favorites_update(ctx, ref, favorite):
@@ -464,10 +515,15 @@ def favorites_update(ctx, ref, favorite):
     i = _fav_index(fs, ref)
     if i < 0:
         return f"[Fehler] Favorit '{ref}' nicht gefunden."
+    old_ver = str((fs.favs[i] or {}).get("version", "1.0"))
     fav = _normalize_favorite(favorite)
+    warn = ""
+    if str(fav["version"]) == old_ver:
+        warn = (f" [WARN] Version nicht erhoeht (v{old_ver}). "
+                f"Policy: Bugfix -> Version bumpen; neuer Pfad -> favorites.add. Trotzdem gespeichert.")
     fs.favs[i] = fav
     fs.save_favs()
-    return f"Favorit [{i}] '{fav['name']}' aktualisiert ({len(fav['patches'])} Patch(es))."
+    return f"Favorit [{i}] '{fav['name']}' v{fav['version']} aktualisiert ({len(fav['patches'])} Patch(es)).{warn}"
 
 
 def favorites_delete(ctx, ref):
@@ -511,11 +567,17 @@ def patch_evaluate(ctx, file, orig, scope="method"):
 
 # ============================================================ F: Device (info=O)
 def device_info(ctx):
-    st = CommandRunner.run_blocking(f'"{_adb(ctx)}" get-state', ".", timeout=6)
-    if st.returncode != 0 or "device" not in (st.stdout or ""):
-        return {"device": "nicht verbunden"}
+    from services.adb_devices import list_devices, resolve_serial, apply_android_serial
+    adb = _adb(ctx)
+    apply_android_serial(ctx.cfg, adb, probe=True)
+    devs = list_devices(adb)
+    online = [d for d in devs if d["state"] == "device"]
+    sel = resolve_serial(ctx.cfg, adb)
+    if not online:
+        return {"device": "nicht verbunden", "devices": devs}
     pkgs = ctx.device_files().list_packages()
-    return {"device": "verbunden", "anzahl_3rd_party": len(pkgs), "pakete": pkgs[:100]}
+    return {"device": "verbunden", "selected": sel, "devices": devs,
+            "anzahl_3rd_party": len(pkgs), "pakete": pkgs[:100]}
 
 
 # ============================================================ H: Logs
@@ -1032,3 +1094,237 @@ def proxy_stop(ctx):
     p = _proxy(ctx)
     p.stop_proxy()
     return {"stopped": True, "running": p.is_running()}
+
+
+# ============================================================ L: Frida (Skripte/Collections/Config)
+from core.domain.frida_models import FridaScript, FridaCollection  # noqa: E402
+import uuid as _uuid  # noqa: E402
+
+_FRIDA_MODES = ("listen", "connect", "script", "script_directory")
+
+
+def _frida_find_script(fm, ref):
+    return next((s for s in fm.scripts if s.id == ref or s.name == ref), None)
+
+
+def _frida_find_col(fm, ref):
+    return next((c for c in fm.collections if c.id == ref or c.name == ref), None)
+
+
+def _parse_script_ids(script_ids):
+    if script_ids is None:
+        return []
+    if isinstance(script_ids, list):
+        return [str(x) for x in script_ids]
+    txt = str(script_ids).strip()
+    if not txt:
+        return []
+    if txt.startswith("["):
+        try:
+            return [str(x) for x in json.loads(txt)]
+        except Exception:
+            pass
+    return [t.strip() for t in txt.split(",") if t.strip()]
+
+
+def frida_config_get(ctx):
+    fc = ctx.cfg.frida_config
+    return {"mode": fc.mode, "host": fc.host, "port": fc.port,
+            "script_directory_path": fc.script_directory_path,
+            "pause_on_load": fc.pause_on_load, "active_script_id": fc.active_script_id,
+            "INJECT_FRIDA": bool(ctx.cfg.config.get("INJECT_FRIDA", False))}
+
+
+def frida_config_set(ctx, mode=None, host=None, port=None, script_directory_path=None, pause_on_load=None):
+    changes = {}
+    if mode is not None:
+        if mode not in _FRIDA_MODES:
+            return f"[Fehler] mode muss eines von {_FRIDA_MODES} sein."
+        changes["mode"] = mode
+    if host is not None:
+        changes["host"] = host
+    if port is not None:
+        try:
+            changes["port"] = int(port)
+        except (ValueError, TypeError):
+            return "[Fehler] port muss eine Zahl sein."
+    if script_directory_path is not None:
+        changes["script_directory_path"] = script_directory_path
+    if pause_on_load is not None:
+        changes["pause_on_load"] = bool(pause_on_load)
+    if not changes:
+        return "[Hinweis] nichts geaendert (keine Felder angegeben)."
+    ctx.cfg.update_keys({"FRIDA_SETTINGS": changes})
+    fc = ctx.cfg.frida_config
+    return {"ok": True, "geaendert": changes,
+            "stand": {"mode": fc.mode, "host": fc.host, "port": fc.port,
+                      "script_directory_path": fc.script_directory_path,
+                      "pause_on_load": fc.pause_on_load}}
+
+
+def frida_build_toggle(ctx, enabled):
+    ctx.cfg.update_keys({"INJECT_FRIDA": bool(enabled)})
+    return f"INJECT_FRIDA = {bool(enabled)} (Frida im Build {'AKTIV' if enabled else 'AUS'})."
+
+
+def frida_scripts_list(ctx):
+    fm = ctx.frida()
+    out = [{"id": s.id, "name": s.name, "version": getattr(s, "version", "1.0"),
+            "description": getattr(s, "description", ""),
+            "active": (s.id == fm.active_script_id), "code_len": len(s.code or "")}
+           for s in fm.scripts]
+    return out or "keine Frida-Skripte"
+
+
+def frida_scripts_get(ctx, ref):
+    fm = ctx.frida()
+    s = _frida_find_script(fm, ref)
+    if not s:
+        return f"[Fehler] Skript '{ref}' nicht gefunden."
+    return {"id": s.id, "name": s.name, "version": getattr(s, "version", "1.0"),
+            "description": getattr(s, "description", ""), "code": s.code}
+
+
+def frida_scripts_add(ctx, name, code=None, version="1.0", description=""):
+    fm = ctx.frida()
+    warn = "" if _strip_ver(description) else " [WARN] ohne description — Version+Zweck angeben."
+    sid = _uuid.uuid4().hex
+    fm.scripts.append(FridaScript(id=sid, name=name, code=code or "",
+                                  version=str(version), description=_compose_desc(version, description)))
+    fm.save()
+    return f"Frida-Skript '{name}' v{version} angelegt (id={sid}).{warn}"
+
+
+def frida_scripts_update(ctx, ref, name=None, code=None, version=None, description=None):
+    fm = ctx.frida()
+    s = _frida_find_script(fm, ref)
+    if not s:
+        return f"[Fehler] Skript '{ref}' nicht gefunden."
+    warn = ""
+    if code is not None:
+        old = getattr(s, "version", "1.0")
+        if version is None or str(version) == str(old):
+            warn += (f" [WARN] Code geaendert, Version nicht erhoeht (v{old}). "
+                     f"Policy: Bugfix -> bumpen; neuer Ansatz -> frida.scripts_add. Trotzdem gespeichert.")
+        if description is None:
+            warn += " [WARN] description nicht aktualisiert."
+        s.code = code
+    if name is not None:
+        s.name = name
+    if version is not None:
+        s.version = str(version)
+    if version is not None or description is not None:
+        eff = str(version) if version is not None else getattr(s, "version", "1.0")
+        base = description if description is not None else getattr(s, "description", "")
+        s.description = _compose_desc(eff, base)
+    fm.save()
+    return f"Frida-Skript '{s.name}' v{getattr(s,'version','?')} aktualisiert (id={s.id}).{warn}"
+
+
+def frida_scripts_delete(ctx, ref):
+    fm = ctx.frida()
+    s = _frida_find_script(fm, ref)
+    if not s:
+        return f"[Fehler] Skript '{ref}' nicht gefunden."
+    fm.scripts = [x for x in fm.scripts if x.id != s.id]
+    if fm.active_script_id == s.id:
+        fm.active_script_id = None
+    fm.save()
+    return f"Frida-Skript '{s.name}' geloescht (id={s.id})."
+
+
+def frida_set_active(ctx, ref):
+    fm = ctx.frida()
+    s = _frida_find_script(fm, ref)
+    if not s:
+        return f"[Fehler] Skript '{ref}' nicht gefunden."
+    fm.active_script_id = s.id
+    fm.save()
+    return f"aktives Frida-Skript: '{s.name}' (id={s.id})."
+
+
+def frida_collections_list(ctx):
+    fm = ctx.frida()
+    out = [{"id": c.id, "name": c.name, "version": getattr(c, "version", "1.0"),
+            "description": getattr(c, "description", ""),
+            "script_ids": list(c.script_ids), "script_count": len(c.script_ids)}
+           for c in fm.collections]
+    return out or "keine Frida-Collections"
+
+
+def frida_collections_add(ctx, name, script_ids=None, version="1.0", description=""):
+    fm = ctx.frida()
+    warn = "" if _strip_ver(description) else " [WARN] ohne description — Version+Zweck angeben."
+    ids = _parse_script_ids(script_ids)
+    unknown = [i for i in ids if not _frida_find_script(fm, i)]
+    if unknown:
+        warn += f" [WARN] unbekannte script_ids: {unknown}."
+    cid = _uuid.uuid4().hex
+    fm.collections.append(FridaCollection(id=cid, name=name, script_ids=ids,
+                                          version=str(version), description=_compose_desc(version, description)))
+    fm.save()
+    return f"Frida-Collection '{name}' v{version} angelegt (id={cid}, {len(ids)} Skripte).{warn}"
+
+
+def frida_collections_update(ctx, ref, name=None, script_ids=None, version=None, description=None):
+    fm = ctx.frida()
+    c = _frida_find_col(fm, ref)
+    if not c:
+        return f"[Fehler] Collection '{ref}' nicht gefunden."
+    if name is not None:
+        c.name = name
+    if script_ids is not None:
+        c.script_ids = _parse_script_ids(script_ids)
+    if version is not None:
+        c.version = str(version)
+    if version is not None or description is not None:
+        eff = str(version) if version is not None else getattr(c, "version", "1.0")
+        base = description if description is not None else getattr(c, "description", "")
+        c.description = _compose_desc(eff, base)
+    fm.save()
+    return f"Frida-Collection '{c.name}' v{getattr(c,'version','?')} aktualisiert (id={c.id})."
+
+
+def frida_collections_delete(ctx, ref):
+    fm = ctx.frida()
+    c = _frida_find_col(fm, ref)
+    if not c:
+        return f"[Fehler] Collection '{ref}' nicht gefunden."
+    fm.collections = [x for x in fm.collections if x.id != c.id]
+    fm.save()
+    return f"Frida-Collection '{c.name}' geloescht (id={c.id})."
+
+
+def frida_push_collection(ctx, ref):
+    """GATED: Collection aufs Geraet pushen (kompiliert je Skript + adb push)."""
+    fm = ctx.frida()
+    c = _frida_find_col(fm, ref)
+    if not c:
+        return f"[Fehler] Collection '{ref}' nicht gefunden."
+    from services.frida_compiler_service import FridaCompilerService
+    from services.frida_sync_service import FridaSyncService
+    import os as _os
+    adb = ctx.cfg.paths.get("ADB", "adb")
+    pkg = ctx.cfg.config.get("APP_PACKAGE", "")
+    arch = ctx.cfg.paths.get("ARCHIVE_DIR", ".")
+    pushed, failed = [], []
+    for sid in c.script_ids:
+        s = fm.get_script_by_id(sid)
+        if not s:
+            failed.append(f"{sid} (unbekannt)")
+            continue
+        try:
+            compiled = FridaCompilerService.compile_script(s.code, arch)
+            if not compiled:
+                failed.append(f"{s.name} (compile)")
+                continue
+            filename = s.name.replace(" ", "_").lower()
+            if not filename.endswith(".js"):
+                filename += ".js"
+            target = _os.path.join(_os.path.dirname(compiled), filename)
+            _os.replace(compiled, target)
+            ok = FridaSyncService.push_script(adb, pkg, target, ctx.cfg.frida_config)
+            (pushed if ok else failed).append(s.name)
+        except Exception as e:
+            failed.append(f"{s.name} ({e})")
+    return {"collection": c.name, "gepusht": pushed, "fehlgeschlagen": failed}

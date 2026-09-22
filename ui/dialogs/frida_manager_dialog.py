@@ -96,6 +96,7 @@ class FridaManagerDialog(tk.Toplevel):
         t_bar.pack(fill="x", pady=2)
         ttk.Button(t_bar, text="➕ Neu", command=self.add_script).pack(side="left", padx=1)
         ttk.Button(t_bar, text="🗑 Löschen", command=self.delete_script).pack(side="left", padx=1)
+        ttk.Button(t_bar, text="🔄 Aktualisieren", command=self.reload_store).pack(side="left", padx=1)
 
         self.tree_scripts = ttk.Treeview(f_left, columns=("Status", "Name"), show="headings")
         self.tree_scripts.heading("Status", text="Aktiv")
@@ -374,6 +375,20 @@ class FridaManagerDialog(tk.Toplevel):
     # =========================================================================
     # SKRIPT & SYNTAX HIGHLIGHTING
     # =========================================================================
+    def reload_store(self):
+        """Skripte/Collections neu von der Platte laden (externe/MCP-Aenderungen uebernehmen)."""
+        try:
+            changed = self.controller.manager.reload_if_changed()
+        except Exception:
+            changed = False
+        self.populate_scripts()
+        self.populate_collections()
+        try:
+            self.app.log("[Frida] Liste aktualisiert"
+                         + (" — externe Aenderungen uebernommen." if changed else " (bereits aktuell)."))
+        except Exception:
+            pass
+
     def populate_scripts(self):
         for i in self.tree_scripts.get_children(): self.tree_scripts.delete(i)
         # Feature 1B: Umgekehrte Sortierung (neu zu alt) durch reversed()

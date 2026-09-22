@@ -1,5 +1,6 @@
 import os
 import json
+from core.infrastructure import json_store
 from core.domain.frida_models import FridaConfig
 
 CURRENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -8,6 +9,7 @@ DEFAULT_CONFIG = {
     "BASE_DIR": CURRENT_DIR,
     "SPLIT_NAME": "split_config.arm64_v8a",
     "APP_PACKAGE": "com.datamars.kippynew",
+    "ADB_DEVICE_SERIAL": "",   # leer = Auto (USB-Default); sonst gewaehltes Geraet (ANDROID_SERIAL)
     "SIGNER_JAR": os.path.join("tools", "uber-apk-signer.jar"),
     "APKEDITOR_JAR": os.path.join("tools", "APKEditor.jar"),
     "LSPATCH_JAR": os.path.join("tools", "lspatch.jar"),
@@ -147,12 +149,36 @@ class ConfigManager:
         # NEU: Synchronisiere das Objekt zurück in das Dict vor dem Speichern
         self.config["FRIDA_SETTINGS"] = self.frida_config.to_dict()
 
-        with open(target, "w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=4)
+        json_store.atomic_write_text(target, json.dumps(self.config, indent=4))
 
         if file_path:
             self.config_file = target
 
+        self._update_paths()
+
+    def update_keys(self, partial: dict):
+        """Merge-sicheres Setzen einzelner Top-Level-Config-Keys: frische Platte lesen,
+        nur die genannten Keys anwenden (dict-Werte sub-key-tief mergen), atomar schreiben.
+        Verhindert, dass MCP-Config-Writes gleichzeitige GUI-Aenderungen ueberschreiben."""
+        disk = {}
+        if os.path.exists(self.config_file):
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    disk = json.load(f)
+            except Exception:
+                disk = {}
+        if not isinstance(disk, dict):
+            disk = {}
+        for k, v in (partial or {}).items():
+            if isinstance(v, dict) and isinstance(disk.get(k), dict):
+                merged = dict(disk[k]); merged.update(v); disk[k] = merged
+            else:
+                disk[k] = v
+        disk["BASE_DIR"] = CURRENT_DIR
+        json_store.atomic_write_text(self.config_file, json.dumps(disk, indent=4))
+        self.config = disk
+        if "FRIDA_SETTINGS" in disk:
+            self.frida_config = FridaConfig.from_dict(disk["FRIDA_SETTINGS"])
         self._update_paths()
 
     def restore_defaults(self):

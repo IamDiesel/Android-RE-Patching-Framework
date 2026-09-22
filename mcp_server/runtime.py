@@ -17,6 +17,25 @@ def run(ctx, tool_id, fn, args_summary="", confirm=False, capture_events=("LOG_I
     tier = spec.tier if spec else "?"
     t0 = time.time()
 
+    # Fix: GUI-Aenderungen an den MCP-Rechten sofort wirksam machen.
+    # Ohne dies liest der Server die config.json nur beim Start -> gated
+    # Freigaben aus der GUI kommen erst nach Server-Neustart an.
+    try:
+        ctx.reload_config()
+    except Exception:
+        pass
+
+    # GUI-Aenderungen an Libs/Favoriten fuer den MCP-Server sichtbar machen.
+    # Nur bereits instanziierte Manager reloaden (mtime-gated -> billig); eine
+    # Neu-Instanziierung durch das jeweilige Tool laedt ohnehin den frischen Stand.
+    for _attr in ("native_lib_mgr", "_favorites", "favorite_svc", "frida_manager"):
+        try:
+            _m = getattr(ctx, _attr, None)
+            if _m is not None and hasattr(_m, "reload_if_changed"):
+                _m.reload_if_changed()
+        except Exception:
+            pass
+
     dec = gating.check(ctx.cfg, tool_id, confirm)
     if not dec.allowed:
         audit.log(ctx.cfg, tool_id, tier, "denied", confirm, args_summary,

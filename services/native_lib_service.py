@@ -5,6 +5,7 @@ import shutil
 from typing import List, Optional
 
 from core.domain.native_models import NativeLib
+from core.infrastructure import json_store
 
 # Starter-Vorlage fuer neue Libs (baubar out-of-the-box mit link_libs="log dl")
 DEFAULT_TEMPLATE = '''#include <android/log.h>
@@ -38,20 +39,45 @@ class NativeLibManager:
         self.load()
 
     # ---------- Persistenz ----------
-    def load(self) -> None:
-        self.libs = []
+    def _read_disk_dicts(self) -> list:
+        """Frische Lib-Dicts von der Platte (leer bei fehlender/kaputter Datei)."""
         if os.path.exists(self.json_file):
             try:
                 with open(self.json_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self.libs = [NativeLib.from_dict(d) for d in data.get("libs", [])]
+                    return json.load(f).get("libs", [])
             except Exception:
-                self.libs = []
+                return []
+        return []
+
+    def load(self) -> None:
+        dicts = self._read_disk_dicts()
+        self.libs = [NativeLib.from_dict(d) for d in dicts]
+        self._baseline = json_store.snapshot_fingerprints(dicts, lambda d: d.get("id"))
+        self._mtime = json_store.file_mtime(self.json_file)
+
+    def reload_if_changed(self) -> bool:
+        """Nur neu laden, wenn ein anderer Prozess die Datei geaendert hat (mtime-gated)."""
+        if json_store.file_mtime(self.json_file) != getattr(self, "_mtime", None):
+            self.load()
+            return True
+        return False
 
     def save(self) -> None:
-        data = {"libs": [l.to_dict() for l in self.libs]}
-        with open(self.json_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4)
+        """Konfliktsicher speichern: frische Platten-Version lesen, eigene Deltas
+        (ggue. Baseline, key=id) mergen, atomar zurueckschreiben. So gehen parallele
+        Aenderungen (GUI vs. MCP) nicht verloren."""
+        disk = self._read_disk_dicts()
+        mem = [l.to_dict() for l in self.libs]
+        merged, conflicts = json_store.three_way_merge(
+            disk, getattr(self, "_baseline", {}), mem, lambda d: d.get("id"))
+        json_store.atomic_write_text(
+            self.json_file, json.dumps({"libs": merged}, indent=4))
+        self.libs = [NativeLib.from_dict(d) for d in merged]
+        self._baseline = json_store.snapshot_fingerprints(merged, lambda d: d.get("id"))
+        self._mtime = json_store.file_mtime(self.json_file)
+        if conflicts:
+            print(f"[native_lib_service] WARN gleichzeitige Aenderung an id(s) "
+                  f"{conflicts} — eigene Version gewann, fremde Feldwerte evtl. ueberschrieben.")
 
     # ---------- Pfade ----------
     def lib_dir(self, lib: NativeLib) -> str:

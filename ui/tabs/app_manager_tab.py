@@ -9,14 +9,17 @@ from core.infrastructure.command_runner import CommandRunner
 
 
 class AppManagerTab(ttk.Frame):
-    def __init__(self, parent, source_dir, on_app_imported_callback):
+    def __init__(self, parent, source_dir, on_app_imported_callback, cfg=None):
         super().__init__(parent)
         self.source_dir = source_dir
         self.on_app_imported = on_app_imported_callback
+        self.cfg = cfg
         self.packages = []
+        self._dev_map = {}
 
         os.makedirs(self.source_dir, exist_ok=True)
         self.create_widgets()
+        self._load_devices()
         self.load_packages()
 
     def log(self, msg: str) -> None:
@@ -25,6 +28,14 @@ class AppManagerTab(ttk.Frame):
     def create_widgets(self):
         left_frame = ttk.LabelFrame(self, text="1. APK vom Gerät extrahieren")
         left_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+        dev_frame = ttk.Frame(left_frame)
+        dev_frame.pack(fill="x", padx=5, pady=(5, 0))
+        ttk.Label(dev_frame, text="Ger\u00e4t:").pack(side="left")
+        self.cmb_device = ttk.Combobox(dev_frame, state="readonly", width=42)
+        self.cmb_device.pack(side="left", fill="x", expand=True, padx=5)
+        self.cmb_device.bind("<<ComboboxSelected>>", self._on_device_change)
+        ttk.Button(dev_frame, text="\U0001f504", width=3, command=self._load_devices).pack(side="left")
 
         search_frame = ttk.Frame(left_frame)
         search_frame.pack(fill="x", padx=5, pady=5)
@@ -56,6 +67,66 @@ class AppManagerTab(ttk.Frame):
         self.stat_logcat.pack(anchor="w", padx=20, pady=5)
         self.stat_api = ttk.Label(right_frame, text="⚪ API Profile (Spalten/Regeln) geladen")
         self.stat_api.pack(anchor="w", padx=20, pady=5)
+
+    def _adb_path(self):
+        try:
+            return self.cfg.paths.get("ADB", "adb") if self.cfg else "adb"
+        except Exception:
+            return "adb"
+
+    def _load_devices(self):
+        """Geraeteliste fuellen (USB als Default). Setzt ANDROID_SERIAL entsprechend."""
+        from services.adb_devices import list_devices, apply_android_serial
+        try:
+            devs = [d for d in list_devices(self._adb_path()) if d["state"] == "device"]
+        except Exception as e:
+            devs = []
+            self.log(f"[!] Geraeteliste: {e}")
+        self._dev_map = {}
+        values = ["Auto (USB-Default)"]
+        for d in devs:
+            label = f"{d['serial']}  ({d['kind']})"
+            values.append(label)
+            self._dev_map[label] = d["serial"]
+        if hasattr(self, "cmb_device"):
+            self.cmb_device["values"] = values
+            want = ""
+            if self.cfg:
+                want = (self.cfg.config.get("ADB_DEVICE_SERIAL", "") or "").strip()
+            sel_label = "Auto (USB-Default)"
+            if want:
+                for lbl, ser in self._dev_map.items():
+                    if ser == want:
+                        sel_label = lbl
+                        break
+            self.cmb_device.set(sel_label)
+        try:
+            if self.cfg:
+                apply_android_serial(self.cfg, self._adb_path(), probe=True)
+        except Exception:
+            pass
+
+    def _on_device_change(self, event=None):
+        import os as _os
+        label = self.cmb_device.get()
+        serial = self._dev_map.get(label, "")  # "" = Auto (USB-Default)
+        if self.cfg:
+            self.cfg.config["ADB_DEVICE_SERIAL"] = serial
+            try:
+                self.cfg.save()
+            except Exception:
+                pass
+        if serial:
+            _os.environ["ANDROID_SERIAL"] = serial
+        else:
+            try:
+                from services.adb_devices import apply_android_serial
+                if self.cfg:
+                    apply_android_serial(self.cfg, self._adb_path(), probe=True)
+            except Exception:
+                pass
+        self.log(f"[*] ADB-Geraet gewaehlt: {serial or 'Auto (USB)'}")
+        self.load_packages()
 
     def load_packages(self):
         self.listbox.delete(0, tk.END)

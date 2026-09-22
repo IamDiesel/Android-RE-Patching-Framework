@@ -95,17 +95,52 @@ class AdbNetworkService:
                 "Sicherheits-Einstellungen geoeffnet. Weiter:\n" + cls.INSTALL_PATH
                 + f"\n→ Datei „Download/{cls.cert_dst_name()}“ waehlen.")
 
-    # ---------- Proxy-Routing ----------
-    @staticmethod
-    def route_usb():
-        CommandRunner.run_blocking("adb reverse tcp:8080 tcp:8080", ".", timeout=15)
-        CommandRunner.run_blocking("adb shell settings put global http_proxy 127.0.0.1:8080", ".", timeout=15)
+    # ---------- Proxy-Routing (robust, timeout-tolerant, (ok,msg)) ----------
+    @classmethod
+    def _adb(cls, args: str, timeout: float):
+        """adb-Aufruf, der NIE wirft. Rueckgabe (ok, out). run_blocking liefert bei
+        Timeout returncode=-1/stderr='[timeout]' (kein Raise)."""
+        r = CommandRunner.run_blocking(f"adb {args}", ".", timeout=timeout)
+        return (r.returncode == 0), (r.stderr or r.stdout or "").strip()
 
-    @staticmethod
-    def route_wlan(ip: str):
-        CommandRunner.run_blocking(f"adb shell settings put global http_proxy {ip}:8080", ".", timeout=15)
+    @classmethod
+    def _kick_adb(cls):
+        """Entspricht 'alle adb-Prozesse killen' + Neustart — loest den verklemmten
+        adb-Server (Grund fuers GUI-Haengen beim Route-Reset)."""
+        if os.name == "nt":
+            CommandRunner.run_blocking("taskkill /F /IM adb.exe", ".", timeout=10)
+        else:
+            CommandRunner.run_blocking("adb kill-server", ".", timeout=10)
+        CommandRunner.run_blocking("adb start-server", ".", timeout=15)
 
-    @staticmethod
-    def reset_route():
-        CommandRunner.run_blocking("adb reverse --remove-all", ".", timeout=15)
-        CommandRunner.run_blocking("adb shell settings put global http_proxy :0", ".", timeout=15)
+    @classmethod
+    def route_usb(cls):
+        ok, out = cls._adb("reverse tcp:8080 tcp:8080", 12)
+        if not ok:
+            cls._kick_adb()
+            cls._adb("reverse tcp:8080 tcp:8080", 12)
+        ok2, out2 = cls._adb('shell settings put global http_proxy 127.0.0.1:8080', 12)
+        return (ok2, "USB-Route aktiv (127.0.0.1:8080)." if ok2 else f"USB-Route fehlgeschlagen: {out2}")
+
+    @classmethod
+    def route_wlan(cls, ip: str):
+        ok, out = cls._adb(f'shell settings put global http_proxy {ip}:8080', 12)
+        return (ok, f"WLAN-Route aktiv ({ip}:8080)." if ok else f"WLAN-Route fehlgeschlagen: {out}")
+
+    @classmethod
+    def reset_route(cls):
+        """Wichtig zuerst: Geraete-Proxy AUS (stellt Internet wieder her). Reverse-Tunnel
+        best-effort; bei verklemmtem adb-Server automatischer Kick (kill+start), danach
+        ist der Reverse-Tunnel ohnehin weg."""
+        ok, out = cls._adb('shell settings put global http_proxy :0', 8)
+        if not ok:
+            cls._kick_adb()
+            ok, out = cls._adb('shell settings put global http_proxy :0', 12)
+            note = " (adb-Server neu gestartet)"
+        else:
+            cls._adb("reverse --remove-all", 6)
+            note = ""
+        if ok:
+            return (True, "Route zurueckgesetzt: Geraete-Proxy AUS" + note + ".")
+        return (False, f"Konnte Proxy nicht abschalten ({out}). Manuell: "
+                       f"adb shell settings put global http_proxy :0")
