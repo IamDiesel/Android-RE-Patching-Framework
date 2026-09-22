@@ -36,6 +36,13 @@ class PatchService:
         Prüft einen Smali-Patch gegen den RAM-Cache (Exakter Match, Fuzzy-Match oder Append).
         Gibt ein Status-Dictionary zurück.
         """
+        # NEUE DATEI (new_file): kein Match im Index noetig
+        if patch.get("type") == "new_file" or patch.get("scope") == "new_file":
+            _f = patch.get("file", "")
+            if any(p.get("file") == _f and p.get("scope") == "new_file" for p in existing_patches):
+                return {"success": True, "type": "already_applied"}
+            return {"success": True, "type": "new_file", "file": _f, "orig": ""}
+
         target_norm = cls.normalize_path(patch.get("file", ""))
         orig_code = patch.get("orig", "").replace("\r\n", "\n").strip()
 

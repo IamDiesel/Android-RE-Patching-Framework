@@ -96,6 +96,11 @@ class FavoritePatchesController:
                 success_count += 1
                 continue
 
+            elif ptype == "new_file":
+                if studio.controller.add_new_file_patch(current_patch.get("file", ""), current_patch.get("edit", "")):
+                    success_count += 1
+                continue
+
             res = PatchService.evaluate_smali_patch(current_patch, studio.search_engine.ram_cache, studio.smali_patches)
 
             if res["success"]:
@@ -154,6 +159,11 @@ class FavoritePatchesController:
             last_row["patch"].delete(0, tk.END)
             last_row["patch"].insert(0, current_patch.get("patch", ""))
             messagebox.showinfo("Erfolg", "Hex-Patch erfolgreich geladen!", parent=self.view)
+            return
+
+        elif ptype == "new_file":
+            if studio.controller.add_new_file_patch(current_patch.get("file", ""), current_patch.get("edit", "")):
+                messagebox.showinfo("Erfolg", "Neue-Datei-Patch als aktiver Patch hinzugefuegt!", parent=self.view)
             return
 
         res = PatchService.evaluate_smali_patch(current_patch, studio.search_engine.ram_cache, studio.smali_patches)

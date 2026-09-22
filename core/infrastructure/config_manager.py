@@ -26,6 +26,15 @@ DEFAULT_CONFIG = {
     "INJECT_LSPATCH": False,
     "INJECT_NSC": True,
     "INJECT_DEBUGGABLE": False,
+    "MCP_SETTINGS": {
+        "server": {"enabled": False, "autostart": False, "host": "127.0.0.1", "port": 8765, "transport": "http"},
+        "require_confirm_each_call": True,
+        "log_export_dir": os.path.join("Claude outputs", "logs"),
+        "audit": {"enabled": True, "file": os.path.join("data", "mcp_audit.jsonl"), "log_args": True},
+        "tools": {},
+        "caps": {"build": False, "flash": False, "app_start": False, "exec_run": False, "file_manager": False, "delete_ops": False},
+        "console": {"max_bytes": 20971520, "clear_on_app_start": True},
+    },
     "FRIDA_SETTINGS": FridaConfig().to_dict(),  # NEU: Integration der Frida-Modi
     "PIPELINES": {
         # ... (Pipeline-Konfigurationen bleiben exakt wie vorher)
@@ -151,7 +160,24 @@ class ConfigManager:
         self.frida_config = FridaConfig()
         self.save()
 
+    def _ensure_mcp_settings(self):
+        """Stellt sicher, dass MCP_SETTINGS + alle Unterkeys vorhanden sind (tiefe Merge, ohne Nutzerwerte zu ueberschreiben)."""
+        import copy
+        defaults = copy.deepcopy(DEFAULT_CONFIG.get("MCP_SETTINGS", {}))
+        cur = self.config.get("MCP_SETTINGS")
+        if not isinstance(cur, dict):
+            self.config["MCP_SETTINGS"] = defaults
+            return
+        def _merge(d, dd):
+            for k, v in dd.items():
+                if k not in d:
+                    d[k] = v
+                elif isinstance(v, dict) and isinstance(d.get(k), dict):
+                    _merge(d[k], v)
+        _merge(cur, defaults)
+
     def _update_paths(self):
+        self._ensure_mcp_settings()
         b_dir = self.config.get("BASE_DIR", CURRENT_DIR)
         app_pkg = self.config.get("APP_PACKAGE", "")
         split = self.config.get("SPLIT_NAME", "")

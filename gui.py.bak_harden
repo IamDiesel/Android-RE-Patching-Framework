@@ -87,32 +87,6 @@ class ReFrameworkApp(tk.Tk):
         self.notebook.add(self.settings_tab, text="⚙️ Einstellungen")
         self.notebook.add(self.mcp_settings_tab, text="🔌 MCP")
 
-        # MCP-Server-Autostart (HTTP) — nur wenn in den MCP-Settings aktiviert.
-        # Deferred, damit die GUI zuerst vollstaendig steht; nutzt denselben
-        # Service wie die MCP-Seite (app.mcp_server_svc), damit der Status passt.
-        try:
-            _srv = (self.cfg.config.get("MCP_SETTINGS", {}) or {}).get("server", {}) or {}
-            _svc = getattr(self, "mcp_server_svc", None)
-            if _srv.get("autostart") and _svc is not None and not _svc.is_running():
-                self.after(1200, self._mcp_autostart)
-        except Exception as _e:
-            print(f"[MCP autostart] uebersprungen: {_e}")
-
-    def _mcp_autostart(self):
-        svc = getattr(self, "mcp_server_svc", None)
-        if svc is None:
-            return
-        try:
-            ok, msg = svc.start()
-            self.log(f"[MCP] Autostart: {msg}")
-            if hasattr(self, "mcp_settings_tab") and hasattr(self.mcp_settings_tab, "_refresh_status"):
-                try:
-                    self.mcp_settings_tab._refresh_status()
-                except Exception:
-                    pass
-        except Exception as e:
-            self.log(f"[MCP] Autostart-Fehler: {e}")
-
     def handle_app_imported(self, session_data):
         pkg = session_data["package_name"]
         arch = session_data["architecture"]

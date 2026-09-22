@@ -330,6 +330,29 @@ class SmaliStudioController:
         for tree in [self.view.tree_outgoing, self.view.tree_datagraph, self.view.tree_outline]:
             for i in tree.get_children(): tree.delete(i)
 
+    def add_new_file_patch(self, default_path, content):
+        """Zeigt einen vorbelegten (topmost) Pfad-Dialog und legt einen new_file-Patch
+        in die AKTIVE Patch-Liste (keine Datei auf der Platte). Gleicher Pfad -> ueberschreiben."""
+        from ui.dialogs.new_file_patch_dialog import NewFilePatchDialog
+        dlg = NewFilePatchDialog(self.view.winfo_toplevel(), default_path=default_path or "")
+        rel = dlg.result_path
+        if not rel:
+            return False
+        rel = rel.replace("\\", "/")
+        if not rel.endswith(".smali"):
+            rel += ".smali"
+        for p in self.smali_patches:
+            if p.get("scope") == "new_file" and p.get("file", "").replace("\\", "/") == rel:
+                p["edit"] = content
+                p["file"] = rel
+                self.view.refresh_smali_tree()
+                self.app.log(f"[+] Neue-Datei-Patch aktualisiert: {rel}")
+                return True
+        self.smali_patches.append({"type": "new_file", "scope": "new_file", "file": rel, "orig": "", "edit": content})
+        self.view.refresh_smali_tree()
+        self.app.log(f"[+] Neue-Datei-Patch hinzugefuegt: {rel}")
+        return True
+
     def add_smali_patch(self):
         f = self.current_smali_file
         orig = self.view.editor.get_orig_text()
@@ -337,6 +360,21 @@ class SmaliStudioController:
 
         if self.current_method_name == "<Eigene Struktur>":
             self.struct_manager.save_existing_structure(f, edit)
+            return
+
+        # Bearbeiten eines bestehenden new_file-Patches (kein orig noetig)
+        if (self.editing_patch_idx is not None
+                and 0 <= self.editing_patch_idx < len(self.smali_patches)
+                and self.smali_patches[self.editing_patch_idx].get("scope") == "new_file"):
+            if not edit.strip():
+                return messagebox.showwarning("Fehlt", "Inhalt (Edit) ist leer!")
+            p = self.smali_patches[self.editing_patch_idx]
+            p["edit"] = edit
+            if f:
+                p["file"] = f
+            self.editing_patch_idx = None
+            self.view.refresh_smali_tree()
+            self.view.editor.clear_edit()
             return
 
         if not f or not orig or not edit:

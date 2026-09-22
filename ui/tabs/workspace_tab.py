@@ -228,6 +228,10 @@ class WorkspaceTab(ttk.Frame):
                 self.lib_rows.remove(row)
                 break
 
+    def clear_main_console(self):
+        self.console.delete("1.0", tk.END)
+        EventBus.publish("CONSOLE_CLEARED", "main")
+
     def build_console(self, parent):
         self.console_notebook = ttk.Notebook(parent)
         self.console_notebook.pack(fill="both", expand=True, padx=5, pady=5)
@@ -239,7 +243,7 @@ class WorkspaceTab(ttk.Frame):
         self.console.pack(side="bottom", fill="both", expand=True, padx=5, pady=5)
 
         self.console_menu = tk.Menu(f_main_console, tearoff=0)
-        self.console_menu.add_command(label="Konsole leeren", command=lambda: self.console.delete("1.0", tk.END))
+        self.console_menu.add_command(label="Konsole leeren", command=self.clear_main_console)
 
         self.console.bind("<Button-3>", lambda e: self.console_menu.post(e.x_root, e.y_root))
 

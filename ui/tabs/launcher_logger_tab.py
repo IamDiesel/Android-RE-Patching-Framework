@@ -341,6 +341,8 @@ class LauncherLoggerTab(ttk.Frame):
             self.console.insert(tk.END, f"[!] Fehler beim Starten von Logcat: {e}\n", "error_log")
 
     def _launch_app(self, adb, intent_cmd, base_dir):
+        if (self.app.cfg.config.get("MCP_SETTINGS", {}).get("console", {}) or {}).get("clear_on_app_start", True):
+            EventBus.publish("CONSOLE_CLEAR_HARD", "live")
         full_intent_cmd = f'"{adb}" shell {intent_cmd}'
         self.console.insert(tk.END, f"\n[*] Starte App: {full_intent_cmd}\n")
         self.console.see(tk.END)
@@ -585,6 +587,7 @@ class LauncherLoggerTab(ttk.Frame):
     def clear_console(self):
         self.raw_logs.clear()
         self.console.delete("1.0", tk.END)
+        EventBus.publish("CONSOLE_CLEARED", "live")
 
     def open_archive(self):
         archive_dir = getattr(self.app, 'current_archive_path', self.app.cfg.paths.get("ARCHIVE_DIR", ""))

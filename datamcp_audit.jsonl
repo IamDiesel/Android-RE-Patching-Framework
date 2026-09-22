@@ -1,0 +1,6 @@
+{"ts": "2026-09-21T16:46:29", "tool": "smali.index_status", "tier": "O", "decision": "allowed", "confirm": false, "args": "", "result": "ok", "duration_ms": 22}
+{"ts": "2026-09-21T16:46:29", "tool": "device.pull", "tier": "G", "decision": "denied", "confirm": false, "args": "test", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-21T16:46:29", "tool": "device.pull", "tier": "G", "decision": "denied", "confirm": true, "args": "test", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-21T16:46:48", "tool": "device.pull", "tier": "G", "decision": "denied", "confirm": true, "args": "t", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-21T16:46:48", "tool": "device.pull", "tier": "G", "decision": "denied", "confirm": false, "args": "t", "result": "blocked", "duration_ms": 0}
+{"ts": "2026-09-21T16:46:48", "tool": "device.pull", "tier": "G", "decision": "allowed", "confirm": true, "args": "t", "result": "ok", "duration_ms": 0}

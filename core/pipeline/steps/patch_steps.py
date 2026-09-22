@@ -140,6 +140,19 @@ class SmartPatchStep(PipelineStep):
             src_file = os.path.join(src_dir, actual_rel_file)
             dst_file = os.path.join(dst_dir, actual_rel_file)
 
+            # NEUE DATEI (new_file): direkt in Destination schreiben, keine Source noetig
+            _nf = next((pp for _i, pp in file_patches if pp.get("scope") == "new_file"), None)
+            if _nf is not None:
+                try:
+                    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+                    with open(dst_file, "w", encoding="utf-8") as _f:
+                        _f.write(_nf.get("edit", "").replace("\r", ""))
+                    engine_context.log(f"[+] Neue Datei erstellt: '{actual_rel_file}'")
+                except Exception as _e:
+                    engine_context.log(f"[!] Fehler beim Erstellen der neuen Datei '{actual_rel_file}': {_e}")
+                    return False
+                continue
+
             if not os.path.exists(src_file):
                 engine_context.log(f"[!] Originaldatei nicht in Source gefunden: {actual_rel_file}")
                 return False

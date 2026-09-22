@@ -163,5 +163,34 @@
     "INJECT_NSC": true,
     "EXEC_RUN_DIR_DEFAULT": "/data/local/tmp",
     "EXEC_BACKUP_KEEP": 10,
-    "EXEC_COLOR_PER_EXE": true
+    "EXEC_COLOR_PER_EXE": true,
+    "MCP_SETTINGS": {
+        "server": {
+            "enabled": false,
+            "autostart": false,
+            "host": "127.0.0.1",
+            "port": 8765,
+            "transport": "http"
+        },
+        "require_confirm_each_call": true,
+        "log_export_dir": "Claude outputs\\logs",
+        "audit": {
+            "enabled": true,
+            "file": "data\\mcp_audit.jsonl",
+            "log_args": true
+        },
+        "tools": {},
+        "caps": {
+            "build": false,
+            "flash": false,
+            "app_start": false,
+            "exec_run": false,
+            "file_manager": false,
+            "delete_ops": false
+        },
+        "console": {
+            "max_bytes": 20971520,
+            "clear_on_app_start": true
+        }
+    }
 }
