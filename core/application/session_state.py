@@ -27,3 +27,27 @@ class SessionState:
         cls.active_hex_patches.clear()
         cls.active_lib_replacements.clear()
         cls.active_smali_patches.clear()
+
+    # ---- Persistenz-Bruecke (prozessuebergreifende „Active Session") ----
+    @classmethod
+    def to_patch_list(cls) -> List[Dict[str, Any]]:
+        """Aggregierte, serialisierbare Patch-Liste (= get_all_patches).
+        Wird von active_session_service.save() persistiert."""
+        return cls.get_all_patches()
+
+    @classmethod
+    def load_patches(cls, patches: List[Dict[str, Any]]) -> None:
+        """Setzt die aktiven Listen aus einer flachen Patch-Liste (aus active_session.json).
+        Aufteilung nach 'type': hex -> hex, lib_replace -> lib, sonst (smali/new_file) -> smali.
+        In-place-Clear erhaelt die Listen-Identitaet (GUI-Property zeigt weiter darauf)."""
+        cls.active_hex_patches.clear()
+        cls.active_lib_replacements.clear()
+        cls.active_smali_patches.clear()
+        for p in (patches or []):
+            t = p.get("type", "smali")
+            if t == "hex":
+                cls.active_hex_patches.append(p)
+            elif t == "lib_replace":
+                cls.active_lib_replacements.append(p)
+            else:  # smali, new_file
+                cls.active_smali_patches.append(p)

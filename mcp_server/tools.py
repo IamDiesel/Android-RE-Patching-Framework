@@ -13,6 +13,7 @@ import shutil
 
 from core.infrastructure.command_runner import CommandRunner
 from services.patch_service import PatchService
+from core.application.session_state import SessionState
 from mcp_server import registry
 
 
@@ -565,6 +566,178 @@ def patch_evaluate(ctx, file, orig, scope="method"):
     return PatchService.evaluate_smali_patch(patch, cache, [])
 
 
+# ---- Aktive Session-Patches (headless Apply/Remove) ----------------------------
+# SessionState.active_* sind prozesslokal; die Pipeline-Steps (SmartPatchStep,
+# AnchorPatchStep, InjectCustomLibsStep) lesen sie beim BUILD_NATIVE direkt aus.
+# Da pipeline.run die Engine IM MCP-Prozess ausfuehrt, ist das Fuellen dieser
+# Listen das headless-Aequivalent zu „Favoriten anwenden" in der GUI
+# (vgl. ui/controllers/favorite_patches_controller.start_batch_fav).
+
+def _apply_one_patch(ctx, p, ram_cache):
+    """Wendet EINEN Patch auf die aktive Session an und liefert ein Status-dict.
+    Smali/new_file werden gegen den Baum evaluiert (orig kommt aus dem Treffer),
+    hex/lib_replace werden direkt uebernommen. Idempotent (already_active)."""
+    ptype = p.get("type", "smali")
+
+    if ptype == "lib_replace":
+        target = (p.get("target") or "").strip()
+        source = (p.get("source") or "").strip()
+        if not target or not source:
+            return {"ok": False, "kind": "lib_replace", "reason": "target/source fehlt"}
+        entry = {"type": "lib_replace", "target": target, "source": source}
+        if any(e.get("target") == target and e.get("source") == source
+               for e in SessionState.active_lib_replacements):
+            return {"ok": True, "kind": "lib_replace", "status": "already_active", "ref": target}
+        SessionState.active_lib_replacements.append(entry)
+        return {"ok": True, "kind": "lib_replace", "status": "applied", "ref": target}
+
+    if ptype == "hex":
+        entry = {"type": "hex"}
+        for k in ("file", "ram", "base", "orig", "patch"):
+            entry[k] = p.get(k, "")
+        if not (entry.get("patch") or "").strip():
+            return {"ok": False, "kind": "hex", "reason": "hex-bytes ('patch') fehlt"}
+        if any(e.get("ram") == entry["ram"] and e.get("patch") == entry["patch"]
+               and e.get("file") == entry["file"] for e in SessionState.active_hex_patches):
+            return {"ok": True, "kind": "hex", "status": "already_active", "ref": entry.get("ram", "")}
+        SessionState.active_hex_patches.append(entry)
+        return {"ok": True, "kind": "hex", "status": "applied", "ref": entry.get("ram", "")}
+
+    # smali / new_file -> gegen den (pristinen) Source-Baum evaluieren
+    res = PatchService.evaluate_smali_patch(p, ram_cache, SessionState.active_smali_patches)
+    if not res.get("success"):
+        return {"ok": False, "kind": ptype, "reason": res.get("reason", "unbekannt"),
+                "file": p.get("file", "")}
+    rtype = res.get("type")
+    if rtype == "already_applied":
+        return {"ok": True, "kind": ptype, "status": "already_active", "file": p.get("file", "")}
+    cp = dict(p)
+    if res.get("file"):
+        cp["file"] = res["file"]
+    if "orig" in res:
+        cp["orig"] = res["orig"]
+    if ptype == "new_file" or rtype == "new_file":
+        cp["type"] = "new_file"
+        cp.setdefault("scope", "new_file")
+    else:
+        cp["type"] = "smali"
+        cp.setdefault("scope", "method")
+    SessionState.active_smali_patches.append(cp)
+    return {"ok": True, "kind": cp["type"], "status": "applied",
+            "match": rtype, "file": cp.get("file", "")}
+
+
+def _active_view():
+    """Kombinierte, stabil indizierte Sicht auf die aktive Patch-Liste.
+    Reihenfolge = SessionState.get_all_patches(): hex, lib_replace, smali."""
+    view = []
+    gi = 0
+    for e in SessionState.active_hex_patches:
+        view.append((gi, "hex", SessionState.active_hex_patches, e)); gi += 1
+    for e in SessionState.active_lib_replacements:
+        view.append((gi, "lib_replace", SessionState.active_lib_replacements, e)); gi += 1
+    for e in SessionState.active_smali_patches:
+        kind = "new_file" if (e.get("scope") == "new_file" or e.get("type") == "new_file") else "smali"
+        view.append((gi, kind, SessionState.active_smali_patches, e)); gi += 1
+    return view
+
+
+def _persist_active(ctx) -> bool:
+    """Aktive Liste in data/active_session.json schreiben (konfliktsicher), damit
+    der GUI-Prozess sie im Fenster 'aktive Patches' spiegeln kann und sie Neustarts
+    ueberlebt. True bei Erfolg."""
+    try:
+        ctx.active_session().save(SessionState.to_patch_list())
+        return True
+    except Exception as e:
+        print(f"[tools] active_session.save fehlgeschlagen: {e}")
+        return False
+
+
+def patch_active_list(ctx):
+    """Aktive Session-Patches auflisten (globaler Index -> patch.remove)."""
+    out = []
+    for gi, kind, _lst, e in _active_view():
+        item = {"index": gi, "kind": kind}
+        if kind == "lib_replace":
+            item["target"] = e.get("target", "")
+            item["source"] = e.get("source", "")
+        elif kind == "hex":
+            item["file"] = e.get("file", "")
+            item["ram"] = e.get("ram", "")
+            item["patch"] = e.get("patch", "")
+        else:
+            item["file"] = e.get("file", "")
+            item["scope"] = e.get("scope", "method")
+        out.append(item)
+    return {"active_count": len(out),
+            "counts": {"hex": len(SessionState.active_hex_patches),
+                       "lib_replace": len(SessionState.active_lib_replacements),
+                       "smali": len(SessionState.active_smali_patches)},
+            "patches": out}
+
+
+def patch_apply(ctx, patch_json):
+    """Patch(es) auf die aktive Session anwenden. patch_json = EIN Patch ODER {patches:[...]}."""
+    try:
+        fav = _normalize_favorite(patch_json)
+    except Exception as e:
+        return f"[Fehler] Patch ungueltig: {e}"
+    ram_cache = _smali_ram_cache(ctx)
+    results = [_apply_one_patch(ctx, p, ram_cache) for p in fav["patches"]]
+    ok = sum(1 for r in results if r.get("ok"))
+    persisted = _persist_active(ctx)
+    return {"applied_ok": ok, "failed": sum(1 for r in results if not r.get("ok")),
+            "results": results, "active_count": len(SessionState.get_all_patches()),
+            "persisted": persisted}
+
+
+def patch_apply_favorite(ctx, ref):
+    """Kompletten Favoriten/Bundle (Index oder Name) auf die aktive Session anwenden."""
+    fs = ctx.favorites()
+    i = _fav_index(fs, ref)
+    if i < 0:
+        return f"[Fehler] Favorit '{ref}' nicht gefunden."
+    fav = fs.favs[i]
+    patches = fav.get("patches", [fav])
+    ram_cache = _smali_ram_cache(ctx)
+    results = [_apply_one_patch(ctx, p, ram_cache) for p in patches]
+    ok = sum(1 for r in results if r.get("ok"))
+    persisted = _persist_active(ctx)
+    return {"favorite": fav.get("name", "(ohne Name)"), "version": fav.get("version", "1.0"),
+            "applied_ok": ok, "failed": sum(1 for r in results if not r.get("ok")),
+            "results": results, "active_count": len(SessionState.get_all_patches()),
+            "persisted": persisted}
+
+
+def patch_remove(ctx, index):
+    """Einen angewendeten Patch aus der aktiven Liste streichen (NICHT aus den Favoriten)."""
+    try:
+        gi = int(index)
+    except (ValueError, TypeError):
+        return "[Fehler] index muss eine Zahl sein (siehe patch.active_list)."
+    for cur_gi, kind, lst, e in _active_view():
+        if cur_gi == gi:
+            for j, item in enumerate(lst):
+                if item is e:
+                    del lst[j]
+                    break
+            ref = e.get("target") if kind == "lib_replace" else e.get("file", "")
+            persisted = _persist_active(ctx)
+            return {"removed": True, "index": gi, "kind": kind, "ref": ref,
+                    "active_count": len(SessionState.get_all_patches()),
+                    "persisted": persisted}
+    return f"[Fehler] Kein aktiver Patch mit index={gi} (siehe patch.active_list)."
+
+
+def patch_clear_active(ctx):
+    """Alle aktiven Session-Patches verwerfen (Favoriten bleiben unberuehrt)."""
+    n = len(SessionState.get_all_patches())
+    SessionState.clear_session()
+    persisted = _persist_active(ctx)
+    return {"cleared": n, "active_count": 0, "persisted": persisted}
+
+
 # ============================================================ F: Device (info=O)
 def device_info(ctx):
     from services.adb_devices import list_devices, resolve_serial, apply_android_serial
@@ -848,6 +1021,14 @@ def pipeline_run(ctx, name):
     if name not in _VALID_PIPELINES:
         return f"[Fehler] Unbekannte Pipeline '{name}'. Gueltig: {', '.join(_VALID_PIPELINES)}"
     ctx.reload_config()
+    # Vor dem Build die geteilte aktive Liste laden, damit ein MCP-Build genau das
+    # baut, was in data/active_session.json steht (leer -> RAM-Stand behalten).
+    try:
+        _shared = ctx.active_session().patches()
+        if _shared:
+            SessionState.load_patches(_shared)
+    except Exception as e:
+        print(f"[tools] pipeline_run: active_session load: {e}")
     ok = ctx.engine.run_pipeline(name)
     return {"pipeline": name, "success": bool(ok)}
 

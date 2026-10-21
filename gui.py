@@ -62,6 +62,9 @@ class ReFrameworkApp(tk.Tk):
         self.create_widgets()
         self.generate_new_id()
 
+        # Persistierte aktive Patch-Liste (MCP <-> GUI) laden + periodisch spiegeln
+        self._init_active_session_reflection()
+
         if os.name == 'nt':
             self.state('zoomed')
         else:
@@ -119,6 +122,40 @@ class ReFrameworkApp(tk.Tk):
                     pass
         except Exception as e:
             self.log(f"[MCP] Autostart-Fehler: {e}")
+
+    # ---- Active-Session-Reflektion (MCP-seitige Patches im GUI sichtbar machen) ----
+    def _init_active_session_reflection(self):
+        """Aktive Patch-Liste aus data/active_session.json laden, in die Workspace-View
+        spiegeln und periodisch auf Aenderungen durch den MCP-Prozess pollen."""
+        try:
+            from services.active_session_service import get_shared_active_session
+            self.active_session_svc = get_shared_active_session(self)
+            self._reflect_active_session(initial=True)
+        except Exception as e:
+            print(f"[ActiveSession] Init uebersprungen: {e}")
+        self.after(1500, self._poll_active_session)
+
+    def _poll_active_session(self):
+        try:
+            svc = getattr(self, "active_session_svc", None)
+            if svc is not None and svc.reload_if_changed():
+                self._reflect_active_session(initial=False)
+        except Exception as e:
+            print(f"[ActiveSession] Poll-Fehler: {e}")
+        finally:
+            self.after(1500, self._poll_active_session)
+
+    def _reflect_active_session(self, initial=False):
+        svc = getattr(self, "active_session_svc", None)
+        if svc is None or not hasattr(self, "workspace_tab"):
+            return
+        patches = svc.patches()
+        # append=False -> View wird komplett auf den Datei-Stand gesetzt; select_tab=False
+        # -> kein Fokus-Klau beim periodischen Poll.
+        self.workspace_tab.load_patches_from_record(
+            {"patches": patches}, append=False, select_tab=False)
+        if not initial:
+            self.log(f"[MCP] Aktive Patch-Liste aktualisiert ({len(patches)} Patch(es)).")
 
     def handle_app_imported(self, session_data):
         pkg = session_data["package_name"]

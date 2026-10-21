@@ -36,6 +36,19 @@ def run(ctx, tool_id, fn, args_summary="", confirm=False, capture_events=("LOG_I
         except Exception:
             pass
 
+    # Aktive Patch-Liste mit data/active_session.json synchronisieren: einmalig beim
+    # ersten Aufruf (evtl. Stand aus einer frueheren Session/GUI uebernehmen) und immer
+    # dann, wenn ein anderer Prozess (GUI) die Datei geaendert hat. Eigene Speicherungen
+    # aktualisieren die mtime selbst -> kein Selbst-Reload/Clobber.
+    try:
+        _as = ctx.active_session()
+        if _as.reload_if_changed() or not getattr(ctx, "_active_synced", False):
+            from core.application.session_state import SessionState
+            SessionState.load_patches(_as.patches())
+            ctx._active_synced = True
+    except Exception:
+        pass
+
     dec = gating.check(ctx.cfg, tool_id, confirm)
     if not dec.allowed:
         audit.log(ctx.cfg, tool_id, tier, "denied", confirm, args_summary,

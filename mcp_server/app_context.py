@@ -11,6 +11,7 @@ from core.infrastructure.config_manager import ConfigManager
 from core.pipeline.engine import PipelineEngine
 from services.native_lib_service import get_shared_manager
 from services.favorite_service import FavoriteService, get_shared_favorites
+from services.active_session_service import get_shared_active_session
 from services.frida_service import get_shared_frida
 from services.device_file_service import DeviceFileService
 from services.history_service import HistoryManager
@@ -29,6 +30,7 @@ class AppContext:
         self.engine = PipelineEngine(self.cfg, self.get_archive_path)
         self.native_lib_mgr = None       # von get_shared_manager(self) gesetzt
         self._favorites = None
+        self.active_session_svc = None   # von get_shared_active_session(self) gesetzt
         self.frida_manager = None
         self._device_files = None
         self._history = None
@@ -42,6 +44,9 @@ class AppContext:
 
     def favorites(self) -> FavoriteService:
         return get_shared_favorites(self)   # setzt self.favorite_svc
+
+    def active_session(self):
+        return get_shared_active_session(self)   # setzt self.active_session_svc
 
     def frida(self):
         return get_shared_frida(self)       # setzt self.frida_manager

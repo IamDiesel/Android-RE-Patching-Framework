@@ -429,7 +429,7 @@ class WorkspaceTab(ttk.Frame):
             all_patches.extend(self.smali_studio.smali_patches)
         return all_patches
 
-    def load_patches_from_record(self, record, append=False):
+    def load_patches_from_record(self, record, append=False, select_tab=True):
         if not append:
             for p in list(self.patch_rows): self.remove_patch_row(p["frame"])
             for p in list(self.lib_rows): self.remove_lib_row(p["frame"])
@@ -464,7 +464,8 @@ class WorkspaceTab(ttk.Frame):
         if "app_version" in record:
             self.ent_version.delete(0, tk.END)
             self.ent_version.insert(0, record.get("app_version", ""))
-        self.app.notebook.select(self)
+        if select_tab:
+            self.app.notebook.select(self)
 
     def handle_patch_conflict(self, pce: PatchConflictException):
         def _show_dialog():

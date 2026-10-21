@@ -63,6 +63,11 @@ TOOL_CATALOG = [
     ToolSpec("favorites.add",          "D", "Patches / Favoriten", "P", (), "Patch-Satz ablegen (PFLICHT version+description; smali/hex/lib_replace/new_file)"),
     ToolSpec("favorites.update",       "D", "Patches / Favoriten", "P", (), "Favoriten ersetzen (Bugfix: version bumpen; sonst WARN)"),
     ToolSpec("patch.evaluate",         "D", "Patches / Favoriten", "O", (), "Dry-Run gegen den RAM-Index"),
+    ToolSpec("patch.active_list",      "D", "Patches / Favoriten", "O", (), "Aktive Session-Patches auflisten (Index fuer patch.remove)"),
+    ToolSpec("patch.apply",            "D", "Patches / Favoriten", "P", (), "Patch(es) auf die aktive Session anwenden (headless 'Favoriten anwenden')"),
+    ToolSpec("patch.apply_favorite",   "D", "Patches / Favoriten", "P", (), "Kompletten Favoriten/Bundle auf die aktive Session anwenden"),
+    ToolSpec("patch.remove",           "D", "Patches / Favoriten", "P", (), "Angewendeten Patch aus der aktiven Liste streichen (nicht aus Favoriten)"),
+    ToolSpec("patch.clear_active",     "D", "Patches / Favoriten", "P", (), "Alle aktiven Session-Patches verwerfen"),
     ToolSpec("favorites.delete",       "D", "Patches / Favoriten", "G", ("delete_ops",), "Favorit loeschen (nur auf Anfrage)"),
 
     # --- E: Bauen & Flashen ---

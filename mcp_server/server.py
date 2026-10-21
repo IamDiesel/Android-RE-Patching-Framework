@@ -181,6 +181,43 @@ def build_server(ctx, host, port):
         return runtime.run(ctx, "patch.evaluate",
                            lambda: tools.patch_evaluate(ctx, file, orig, scope), _summ(file=file, scope=scope))
 
+    @mcp.tool(name="patch_active_list")
+    def patch_active_list() -> str:
+        """Aktive Session-Patch-Liste anzeigen (hex/lib_replace/smali/new_file) mit stabilem
+        globalem Index als Eingabe fuer patch_remove. Genau diese Patches baut pipeline_run('BUILD_NATIVE')."""
+        return runtime.run(ctx, "patch.active_list", lambda: tools.patch_active_list(ctx))
+
+    @mcp.tool(name="patch_apply")
+    def patch_apply(patch_json: str) -> str:
+        """Patch(es) auf die aktive Session anwenden — headless-Aequivalent zu 'Favoriten anwenden'.
+        patch_json = EIN Patch-Objekt ODER {"patches":[...]}. Typen:
+        {"type":"smali","file":..,"orig":..,"edit":..,"scope":"method"|"file"},
+        {"type":"hex","file":..,"ram":..,"base":..,"orig":..,"patch":..},
+        {"type":"lib_replace","target":..,"source":..},
+        {"type":"new_file","file":..,"edit":..}. Smali wird gegen den Baum evaluiert
+        (exact/structural/append); 'orig' wird aus dem Treffer gesetzt. Idempotent (already_active).
+        Danach: pipeline_run('BUILD_NATIVE') (gated) baut genau diese aktive Liste."""
+        return runtime.run(ctx, "patch.apply", lambda: tools.patch_apply(ctx, patch_json), "patch")
+
+    @mcp.tool(name="patch_apply_favorite")
+    def patch_apply_favorite(ref: str) -> str:
+        """Kompletten Favoriten/Bundle (Index ODER Name) auf die aktive Session anwenden
+        (wie 'Favoriten anwenden' in der GUI, nur headless). Ergebnis je Sub-Patch:
+        applied / already_active / failed (mit Grund)."""
+        return runtime.run(ctx, "patch.apply_favorite",
+                           lambda: tools.patch_apply_favorite(ctx, ref), _summ(ref=ref))
+
+    @mcp.tool(name="patch_remove")
+    def patch_remove(index: int) -> str:
+        """Einen angewendeten Patch aus der AKTIVEN Liste streichen (NICHT aus den Favoriten loeschen).
+        index = globaler Index aus patch_active_list."""
+        return runtime.run(ctx, "patch.remove", lambda: tools.patch_remove(ctx, index), _summ(index=index))
+
+    @mcp.tool(name="patch_clear_active")
+    def patch_clear_active() -> str:
+        """Alle aktiven Session-Patches verwerfen (Favoriten bleiben unberuehrt)."""
+        return runtime.run(ctx, "patch.clear_active", lambda: tools.patch_clear_active(ctx))
+
     # ---------------- F: File Manager (nur info=O im MVP) ----------------
     # ---------------- L: Frida ----------------
     @mcp.tool(name="frida_config_get")
