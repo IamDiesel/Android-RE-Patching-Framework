@@ -48,7 +48,7 @@ The framework is organized into a strictly modular directory structure, separati
 │   │   ├── config_manager.py           # Loads JSON configs and builds dynamic workspace paths[cite: 62]
 │   │   └── tool_manager.py             # Auto-downloader for Apktool, Node.js, Graphviz, Frida, etc.[cite: 60]
 │   │
-│   └── pipeline/                       # Build process orchestration
+│   ├── pipeline/                       # Build process orchestration
 │       ├── engine.py                   # Translates JSON pipelines into sequential step execution[cite: 53]
 │       ├── step_interface.py           # Abstract base class (ABC) for all pipeline steps[cite: 54]
 │       └── steps/                      # Modular pipeline step implementations
@@ -57,6 +57,13 @@ The framework is organized into a strictly modular directory structure, separati
 │           ├── hook_steps.py           # Injectors for Frida Gadget and LSPosed/TrustMeAlready[cite: 56]
 │           ├── patch_steps.py          # Appliers for Smali, Hex offsets, and custom native libs[cite: 57]
 │           └── trace_steps.py          # Background starters for ADB logcat tracing[cite: 58]
+│   │
+│   └── native/                         # Native AArch64 static analysis + emulation (Native Studio)
+│       ├── loader.py                   # ELF parser (segments, dynsyms, relocs, AArch64 detection)
+│       ├── nindex.py                   # NativeIndex: XREF/CallGraph index (capstone, SHA-gated cache)
+│       ├── unpack.py                   # UnpackRegistry: discover/decrypt packed libs via plugins
+│       ├── engine_arm64.py             # Arm64Engine/Decoder: in-process AArch64 emulation
+│       └── arm64mini.py                # Frozen CPU/Mem contract (shared with lipy 'ale_pure')
 │
 ├── services/                           # Stateless background services
 │   ├── adb_network_service.py          # ADB proxy routing and mitmproxy certificate pushing[cite: 30]
@@ -81,7 +88,11 @@ The framework is organized into a strictly modular directory structure, separati
 │   ├── smali_parser.py                 # Regex-based extraction of methods, fields, and data flows[cite: 42]
 │   ├── smali_search_service.py         # Threaded RAM caching, pickling, and text indexing[cite: 43]
 │   ├── smali_struct_service.py         # Physical creation and injection of predefined Smali templates[cite: 44]
-│   └── xref_service.py                 # Cross-Reference resolution for incoming method calls[cite: 45]
+│   ├── xref_service.py                 # Cross-Reference resolution for incoming method calls[cite: 45]
+│   ├── ghidra_service.py               # Ghidra headless decompile (Java scripts, stream+cancel+cache)
+│   ├── native_emu_service.py           # Emulation service wrapping core/native (events, run/snapshot)
+│   ├── native_bridge/                  # On-device native helper bridge (README_native_bridge.md)
+│   └── ghidra_scripts/                 # GhidraScripts: DecompileOne.java, SpeedAnalysis.java
 │
 ├── ui/                                 # Graphical User Interface (MVC Implementation)
 │   ├── utils.py                        # Global UI utilities (e.g., Treeview copy-to-clipboard formatting)[cite: 23]
@@ -93,7 +104,8 @@ The framework is organized into a strictly modular directory structure, separati
 │   │   ├── fuzzy_match_controller.py         # Fuzzy search execution and side-by-side diffing[cite: 9]
 │   │   ├── smali_cg_controller.py            # Treeview manipulation and live-filtering for Callgraphs[cite: 11]
 │   │   ├── smali_studio_controller.py        # Central hub for static analysis and XREF delegation[cite: 12]
-│   │   └── workspace_controller.py           # Main pipeline executor (Build, Flash, Uninstall)[cite: 13]
+│   │   ├── workspace_controller.py           # Main pipeline executor (Build, Flash, Uninstall)[cite: 13]
+│   │   └── native_studio_controller.py       # Native Studio: disasm/emulation/Ghidra-decompile coordinator
 │   │
 │   ├── dialogs/                        # Popup windows and configuration dialogs
 │   │   ├── column_dialogs.py           # Customization dialogs for API columns and visibility[cite: 4]
@@ -101,7 +113,8 @@ The framework is organized into a strictly modular directory structure, separati
 │   │   ├── frida_manager_dialog.py     # IDE-like editor with Drawer-Pattern for Frida scripts[cite: 6]
 │   │   ├── fuzzy_matcher_dialog.py     # Conflict resolution UI for structural Smali deviations[cite: 1]
 │   │   ├── global_search_dialog.py     # Standalone real-time search window for the RAM index[cite: 2]
-│   │   └── struct_dialog.py            # Generator UI for creating new Smali classes from templates[cite: 3]
+│   │   ├── struct_dialog.py            # Generator UI for creating new Smali classes from templates[cite: 3]
+│   │   └── native_search_dialog.py     # Global search window over the NativeIndex (symbol/string/addr)
 │   │
 │   ├── tabs/                           # Main notebook sections
 │   │   ├── api_inspector_tab.py        # HTTP traffic table, proxy controls, and ADB network routing[cite: 21]
@@ -111,7 +124,9 @@ The framework is organized into a strictly modular directory structure, separati
 │   │   ├── launcher_logger_tab.py      # App launch intent controls and live color-coded console[cite: 16]
 │   │   ├── settings_tab.py             # Form for base paths and JSON-based pipeline customization[cite: 17]
 │   │   ├── smali_studio_tab.py         # Static analyzer interface (Editor, Outline, Callgraph, Data flows)[cite: 18]
-│   │   └── workspace_tab.py            # Pipeline controls, Hex/Lib patches, and strategy configuration[cite: 19]
+│   │   ├── workspace_tab.py            # Pipeline controls, Hex/Lib patches, and strategy configuration[cite: 19]
+│   │   ├── analyse_tab.py              # "Analyse" container hosting API Inspector + Native Studio
+│   │   └── native_studio_tab.py        # Native Studio UI: Outline, Disasm table, Run-Panel, C-tabs
 │   │
 │   └── widgets/                        # Reusable custom UI components
 │       └── smali_editor_widget.py      # Editor with viewport-based (debounced) regex syntax highlighting[cite: 22]
@@ -273,7 +288,18 @@ Exponiert das Framework über das **Model Context Protocol** (`mcp_server/`), so
 
 * **Zwei Transporte:** ein **stdio-Server** (vom Desktop-Client gespawnt) und ein optionaler **HTTP-Server** (`127.0.0.1`, verwaltet über die GUI-Seite „🔌 MCP“). Beide teilen `config.json`.
 * **Gating in drei Stufen (`registry.py` + `gating.py`):** **P** (Prepare) und **O** (Observe) sind frei; **G** (Gated — Bauen/Flashen/Starten, File Manager, Löschen, Gerätesync) braucht Pro-Tool-Schalter **+** Kategorie-Freigabe (`caps`) **+** `confirm=true`. Jeder Aufruf läuft durch `runtime.run` (Gating → Ausführung unter EventBus-Sammler → Audit `data/mcp_audit.jsonl`); GUI-Rechte werden pro Aufruf frisch eingelesen.
-* **Tool-Katalog (Gruppen A–L):** Workspace/Config, Smali-Analyse, LibForge, Patch-Favoriten, Build/Flash, File Manager, Executables (ExeDeploy), Capture/Logs, DAST/API, Historie, Selbstauskunft und **Frida** (14 Tools: Config/Betriebsmodi/App-Start/Netz/ScriptDir, Build-Toggle `INJECT_FRIDA`, Skripte + Collections inkl. Versionierung, Aktiv-Setzen, gated Gerätesync).
+* **Tool-Katalog (Gruppen A–M):** Workspace/Config, Smali-Analyse, LibForge, Patch-Favoriten, Build/Flash, File Manager, Executables (ExeDeploy), Capture/Logs, DAST/API, Historie, Selbstauskunft und **Frida** (14 Tools: Config/Betriebsmodi/App-Start/Netz/ScriptDir, Build-Toggle `INJECT_FRIDA`, Skripte + Collections inkl. Versionierung, Aktiv-Setzen, gated Gerätesync).
+* **Gruppe M — Native (`native.*`, 11 Tools):** statische Analyse nativer AArch64-`.so`: `targets`/`unpack` (P, entschlüsseln via Plugin)/`status`, dann `load`/`index` (XREF/CallGraph, SHA-gegateter Cache)/`search`/`xref`/`disasm`/`read_bytes`/`callgraph`/`decompile` (Ghidra-C, gecacht). Rein statisch (Laufzeit/Hooking → `frida.*`); zielspezifische Entschlüsselung lebt in git-ignorierten `native_plugins/` + `data/native/`.
 * **Versionierungs-Disziplin (Pflicht):** Libs, Patch-Favoriten **und** Frida-Skripte/Collections tragen `version` + `description` (als `[vX]` in die Beschreibung gespiegelt). Bugfix am selben Pfad → `*.update` mit Versions-Bump; neuer Ansatz → `*.create`/`*.add` (Original bleibt unangetastet). Ohne Bump: Warnung, aber Speichern (warn-but-allow).
 * **Konfliktsichere Persistenz (`core/infrastructure/json_store.py`):** GUI und MCP laufen als getrennte Prozesse. Alle JSON-Stores (`native_libs.json`, `favorite_patches.json`, `frida_scripts.json`) sowie `config.json` schreiben **atomar** (Temp + `os.replace`) und mergen per **Three-Way-Merge** (key = `id`/`name`) gegen die frische Platten-Version — parallele Änderungen gehen nicht verloren. Ein **mtime-gated Reload** (`reload_if_changed`) macht Fremd-Änderungen sofort sichtbar; die GUI hat je einen **„🔄 Aktualisieren“-Button** (LibForge, Favoriten- und Frida-Dialog).
 * **Nicht gerootet / Datenschutz:** dieselben `adb`/`run-as`-Grenzen wie die GUI; personenbezogene Werte/Schlüssel bleiben lokal (Tools liefern Labels/Längen/Booleans statt Klartext).
+
+### 4.11 Native Studio (AArch64-Analyse & Emulation)
+
+Statische Analyse **und** In-Process-Emulation nativer AArch64-Bibliotheken (`.so`) — Ziel: White-Box-Krypto verstehen und als Pure-Python reproduzieren (Interoperabilität ohne die native Lib). Teil des Reiters **Analyse** (neben dem API Inspector).
+
+* **Kern (`core/native/`):** `loader.py` parst ELF (Segmente, Dynsyms, Relocs); `nindex.py` baut einen **XREF/CallGraph-Index** (capstone, SHA-gegateter Cache unter `data/native/<plugin>/index/`); `engine_arm64.py` + `arm64mini.py` emulieren AArch64 in-process (eingefrorener CPU/Mem-Kontrakt, **rückwärtskompatibel zu lipy `ale_pure`**); `unpack.py` entschlüsselt gepackte Libs über zielspezifische Plugins (git-ignoriert).
+* **GUI (`native_studio_tab.py` + `native_studio_controller.py`):** 3-Spalten-Layout — **Outline** (benannte Dynsym-Funktionen + per Index entdeckte `sub_<addr>` + graue Daten-Symbole) · **Disassembly** als Tabelle (▶/Adresse/Rohbytes/Mnemonic/Operanden, Branch-/Daten-Tags, STRG+A/C) · **Run-Panel** (Entry/Args/SP) → Register/Flags/Memory/Coverage via Emulation. Daten- vs. Code-Symbole werden per `st_info` getrennt; Daten liefern einen Hexdump statt Code.
+* **Ghidra-Decompile (`services/ghidra_service.py` + `ghidra_scripts/*.java`):** Headless-Decompile einzelner Funktionen als **native Java-GhidraScripts** (Jython ist in Ghidra 12.x entfernt), mit Live-Streaming, **⏹ Abbrechen** und per-Funktion-Cache (`func_<vaddr>.c`). Das C öffnet als **Tabs** (ein Tab je Funktion) mit klickbaren `FUN_`/`LAB_`/`DAT_`-Sprüngen, C-Syntax-Highlighting und Mouseover-Tooltip (vollqualifizierte Signatur).
+* **MCP:** dieselben statischen Fähigkeiten über **Gruppe M (`native.*`)** fernsteuerbar (siehe 4.10).
+* **IP-Trennung:** zielspezifische Entschlüsselung/Daten bleiben in git-ignorierten `native_plugins/` + `data/native/`; das Framework selbst bleibt generisch.
