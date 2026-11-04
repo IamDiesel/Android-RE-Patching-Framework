@@ -59,11 +59,7 @@ class WorkspaceTab(ttk.Frame):
         self.build_dock_header(f_right_side, "📝 Patch Editor", f_right_side, self.top_paned, 3)
         self.build_editor(f_right_side)
 
-        f_console_side = tk.Frame(self.main_paned)
-        self.main_paned.add(f_console_side, weight=2)
-        self.build_dock_header(f_console_side, "🖥️ Konsole & Live-Logging", f_console_side, self.main_paned, 2)
-        self.build_console(f_console_side)
-
+        # Konsole lebt jetzt global unten (gui._build_global_console baut sie via build_console).
         self.load_current_workspace_meta()
 
     def build_dock_header(self, parent, title, widget_to_dock, target_paned, weight):
@@ -275,6 +271,8 @@ class WorkspaceTab(ttk.Frame):
                                                                                                     pady=5)
         ttk.Button(f_favs, text="Aktuellen Stand als Favorit sichern",
                    command=self.controller.save_current_as_favorite).pack(fill="x", padx=10, pady=2)
+        ttk.Button(f_favs, text="🗑 Aktive Session leeren",
+                   command=self.controller.clear_active_session).pack(fill="x", padx=10, pady=2)
 
         f_actions = ttk.LabelFrame(parent, text="Pipeline Steuerung")
         f_actions.pack(side="top", fill="x", padx=5, pady=5)
@@ -474,7 +472,7 @@ class WorkspaceTab(ttk.Frame):
                 self.app.log(f"[*] Öffne Konflikt-Löser für Patch {pce.patch_index + 1}...")
 
                 if self.smali_studio:
-                    patch_data = self.smali_studio.controller.smali_patches[pce.patch_index]
+                    patch_data = dict(self.smali_studio.controller.smali_patches[pce.patch_index])  # S5: Kopie -> kein _workspace_index-Leak in den Live-Patch
                     # Index injizieren, damit der Fuzzer weiß, dass er updaten muss
                     patch_data["_workspace_index"] = pce.patch_index
 

@@ -44,7 +44,8 @@ class InjectCustomLibsStep(PipelineStep):
                     target_lib_path = os.path.join(arch_path, target_name)
                     if os.path.exists(target_lib_path):
                         try:
-                            shutil.copy2(source_path, target_lib_path)
+                            shutil.copyfile(source_path, target_lib_path)
+                            os.utime(target_lib_path, None)  # Fix 1.9: frische mtime
                             engine_context.log(
                                 f"[+] '{target_name}' in Architektur '{arch}' erfolgreich durch Custom-Lib überschrieben!")
                             replaced_count += 1
@@ -93,6 +94,44 @@ class AnchorPatchStep(PipelineStep):
 
 
 class SmartPatchStep(PipelineStep):
+    @staticmethod
+    def _is_super_stub(edit_block: str) -> bool:
+        """True, wenn das Edit ein reiner Super-Delegations-Stub ist (nur
+        invoke-super + return/move-result/nop/goto, plus Metadaten). Nur dann
+        darf bei Body-Drift ohne Rueckfrage der komplette Methoden-Body ersetzt
+        werden (Group-A Lifecycle-Neutralisierung). Chirurgische Edits enthalten
+        andere Instruktionen -> bleiben ein Konflikt (Mensch entscheidet)."""
+        e = edit_block.strip()
+        if not e.startswith(".method"):
+            return False
+        if e.count(".end method") != 1 or not e.rstrip().endswith(".end method"):
+            return False
+        has_super = False
+        in_ann = False
+        for ln in e.split("\n"):
+            s = ln.strip()
+            if not s:
+                continue
+            if s.startswith(".annotation"):
+                in_ann = True
+                continue
+            if s.startswith(".end annotation"):
+                in_ann = False
+                continue
+            if in_ann:
+                continue
+            if s.startswith(".method") or s.startswith(".end method"):
+                continue
+            if s.startswith((".locals", ".registers", ".param", ".prologue", ".line", "#", ":")):
+                continue
+            if s.startswith("invoke-super"):
+                has_super = True
+                continue
+            if s.startswith(("return", "move-result", "nop", "goto", "move-object/from16", "move/from16")):
+                continue
+            return False
+        return has_super
+
     def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
         patches = SessionState.active_smali_patches
         if not patches:
@@ -194,14 +233,18 @@ class SmartPatchStep(PipelineStep):
 
                             if actual_match:
                                 actual_block = actual_match.group(0)
-                                norm_orig = FuzzingEngine._normalize_smali(orig_block)
-                                norm_actual = FuzzingEngine._normalize_smali(actual_block)
-
-                                if norm_orig == norm_actual:
+                                if SmartPatchStep._is_super_stub(edit_block):
                                     content = content.replace(actual_block, edit_block)
-                                    engine_context.log(f"[*] Smali-Patch {idx + 1} per Auto-Fix in '{actual_rel_file}' angewendet.")
+                                    engine_context.log(f"[*] Smali-Patch {idx + 1} per Super-Stub-Anchor in '{actual_rel_file}' angewendet (Body-Drift ignoriert).")
                                 else:
-                                    raise PatchConflictException(idx, actual_rel_file, method_sig, orig_code=orig_block, actual_block=actual_block, edit_block=edit_block)
+                                    norm_orig = FuzzingEngine._normalize_smali(orig_block)
+                                    norm_actual = FuzzingEngine._normalize_smali(actual_block)
+
+                                    if norm_orig == norm_actual:
+                                        content = content.replace(actual_block, edit_block)
+                                        engine_context.log(f"[*] Smali-Patch {idx + 1} per Auto-Fix in '{actual_rel_file}' angewendet.")
+                                    else:
+                                        raise PatchConflictException(idx, actual_rel_file, method_sig, orig_code=orig_block, actual_block=actual_block, edit_block=edit_block)
                             else:
                                 # SMART APPEND: Methode existiert nicht -> ans Dateiende hängen
                                 engine_context.log(f"[*] Methode '{method_sig}' (Patch {idx + 1}) nicht gefunden. Führe Smart Append aus.")

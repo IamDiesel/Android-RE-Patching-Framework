@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "_hinweis": "Projekt-/pluginspezifische JNI-Transformregeln. Gehört NICHT ins Framework, sondern nach native_plugins/<plugin>/ bzw. data/native/<plugin>/ (git-ignoriert). Erste passende Regel mit Treffer gewinnt; höhere confidence schlägt Standard-Mangling nicht automatisch (das liegt bei 0.95).",
+  "rules": [
+    {
+      "_kommentar": "Beispiel: obfuskiertes Paket, aber konsistentes Mangling-Schema",
+      "match": { "class": "^Lcom/abbott/(.*);$", "method": ".*" },
+      "to_symbol": "Java_com_abbott_{1}_{method}",
+      "confidence": 0.9
+    },
+    {
+      "_kommentar": "Beispiel: native_-Präfix abstreifen und auf njni_ abbilden",
+      "match": { "class": ".*", "method": "^native_.*$" },
+      "transform": { "method": "strip_prefix:native_" },
+      "to_symbol": "njni_{method}",
+      "confidence": 0.6
+    },
+    {
+      "_kommentar": "Beispiel: harte Hand-Zuordnung auf eine Adresse (sub_/0x) oder ein Symbol",
+      "alias": {
+        "Lx/y/Z;->decrypt": "sub_1A2B0"
+      }
+    }
+  ]
+}

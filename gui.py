@@ -11,7 +11,7 @@ from services.callgraph_service import CallGraphManager
 from services.adb_devices import apply_android_serial
 
 # In gui.py ganz oben:
-from ui.tabs.api_inspector_tab import APIInspectorTab
+from ui.tabs.analyse_tab import AnalyseTab
 from ui.tabs.app_manager_tab import AppManagerTab
 from ui.tabs.workspace_tab import WorkspaceTab
 from ui.tabs.history_tab import HistoryTab
@@ -40,6 +40,13 @@ class ReFrameworkApp(tk.Tk):
             print(f"[ADB] Geraeteauswahl beim Start: {_e}")
         self.history = HistoryManager(self.cfg)
         self.cg = CallGraphManager()
+        # Native-Bridge (Smali->Native JNI-Resolver, Strategie-Kette)
+        self.native_bridge = None
+        try:
+            from services.native_bridge import build_chain
+            self.native_bridge = build_chain(include_plugins=True)
+        except Exception as _e:
+            print(f"[NativeBridge] nicht initialisiert: {_e}")
 
         # Konsolen-Spiegel: schreibt beide EventBus-Konsolen zusaetzlich nach data/console_*.log
         try:
@@ -74,15 +81,42 @@ class ReFrameworkApp(tk.Tk):
         base_dir = self.cfg.config.get("BASE_DIR", os.getcwd())
         threading.Thread(target=lambda: ToolManager.setup_tools(base_dir), daemon=True).start()
 
+    def get_loaded_native_images(self):
+        """{lib_name: ElfImage} der aktuell im Native Studio geladenen Lib(s)."""
+        try:
+            ctrl = self.native_studio.controller
+            img = getattr(ctrl, "image", None)
+            if img is None:
+                return {}
+            lib = os.path.basename(getattr(ctrl, "image_path", "") or "lib.so")
+            return {lib: img}
+        except Exception:
+            return {}
+
+    def focus_native_studio(self, lib=None):
+        """Selektiert den Analyse-Tab und darin das Native Studio."""
+        try:
+            self.notebook.select(self.analyse_tab)
+            self.analyse_tab._nb.select(self.analyse_tab.native_studio_tab)
+        except Exception as _e:
+            print(f"[NativeBridge] focus_native_studio: {_e}")
+
     def create_widgets(self):
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        self.root_paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        self.root_paned.pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        self.notebook = ttk.Notebook(self.root_paned)
+        self.root_paned.add(self.notebook, weight=6)
+        self.console_host = ttk.Frame(self.root_paned)
+        self.root_paned.add(self.console_host, weight=1)
 
         # Tabs initialisieren
         self.app_manager_tab = AppManagerTab(self.notebook, self.cfg.paths.get("SOURCE_DIR", "source"),
                                              self.handle_app_imported, cfg=self.cfg)
         self.workspace_tab = WorkspaceTab(self.notebook, self)
-        self.api_tab = APIInspectorTab(self.notebook, self.cfg)
+        self._build_global_console()   # geteilte Konsole global unten (vor uebrigen Tabs -> deren Startup-Logs sichtbar)
+        self.analyse_tab = AnalyseTab(self.notebook, self)
+        self.api_tab = self.analyse_tab.api_tab  # Alias: bestehende app.api_tab-Referenzen bleiben gueltig
+        self.native_studio = self.analyse_tab.native_studio_tab  # Alias: Smali->Native-Bruecke
         self.history_tab = HistoryTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
         self.device_file_tab = DeviceFileManagerTab(self.notebook, self)
@@ -91,7 +125,7 @@ class ReFrameworkApp(tk.Tk):
         # Tabs zum Notebook hinzufügen
         self.notebook.add(self.app_manager_tab, text="📱 App Manager")
         self.notebook.add(self.workspace_tab, text="🔧 Workspace")
-        self.notebook.add(self.api_tab, text="🌐 API Inspector")
+        self.notebook.add(self.analyse_tab, text="🔬 Analyse")
         self.notebook.add(self.device_file_tab, text="📂 File Explorer")
         self.notebook.add(self.history_tab, text="📊 Test Management")
         self.notebook.add(self.settings_tab, text="⚙️ Einstellungen")
@@ -130,6 +164,20 @@ class ReFrameworkApp(tk.Tk):
         try:
             from services.active_session_service import get_shared_active_session
             self.active_session_svc = get_shared_active_session(self)
+            # T4: Start-Reconciliation statt stiller Uebernahme
+            if self.cfg.config.get("CLEAR_ACTIVE_ON_START", False):
+                try:
+                    from core.application.session_state import SessionState
+                    SessionState.clear_session()
+                    self.active_session_svc.clear()
+                    self.log("[ActiveSession] Aktive Session beim Start geleert (CLEAR_ACTIVE_ON_START).")
+                except Exception as _e:
+                    print(f"[ActiveSession] Start-Clear fehlgeschlagen: {_e}")
+            else:
+                _n = len(self.active_session_svc.patches())
+                if _n:
+                    self.log(f"[ActiveSession] {_n} Patch(es) aus vorheriger Session uebernommen "
+                             f"- Button 'Aktive Session leeren' entfernt sie.")
             self._reflect_active_session(initial=True)
         except Exception as e:
             print(f"[ActiveSession] Init uebersprungen: {e}")
@@ -156,6 +204,18 @@ class ReFrameworkApp(tk.Tk):
             {"patches": patches}, append=False, select_tab=False)
         if not initial:
             self.log(f"[MCP] Aktive Patch-Liste aktualisiert ({len(patches)} Patch(es)).")
+
+    def persist_active_session(self):
+        """T1: Schreibt die aktive Patch-Liste (SessionState) konfliktsicher nach
+        data/active_session.json zurueck -> GUI wird Write-Client (Single Source
+        of Truth), damit Add/Remove/Apply Neustarts ueberleben."""
+        try:
+            svc = getattr(self, "active_session_svc", None)
+            if svc is not None:
+                from core.application.session_state import SessionState
+                svc.save(SessionState.to_patch_list())
+        except Exception as e:
+            print(f"[ActiveSession] Persist-Fehler: {e}")
 
     def handle_app_imported(self, session_data):
         pkg = session_data["package_name"]
@@ -195,6 +255,42 @@ class ReFrameworkApp(tk.Tk):
 
         if hasattr(self, 'workspace_tab'):
             self.workspace_tab.lbl_id.config(text=self.current_id)
+
+    def _build_global_console(self):
+        """Geteilte Konsole (Main Console + Start & Live-Log) als globales Boden-Panel.
+        EINZEILIGE Kopfzeile: Notebook-Tabs links, Buttons (Abdocken/ausblenden) als Overlay
+        oben rechts in DERSELBEN Zeile -> spart die separate Titelzeile (Hoehe)."""
+        host = self.console_host
+        # Notebook fuellt den Host direkt (keine eigene Titelzeile mehr).
+        try:
+            self.workspace_tab.build_console(host)
+            self.console = self.workspace_tab.console
+            self.console_notebook = self.workspace_tab.console_notebook
+        except Exception as e:
+            print(f"[Console] Aufbau fehlgeschlagen: {e}"); return
+        nb = self.console_notebook
+        self._console_visible = True
+        # Schmaler Platzhalter fuer den eingeklappten Zustand (haelt die Button-Zeile sichtbar).
+        spacer = ttk.Frame(host, height=26)
+
+        def _toggle_vis():
+            if getattr(self, "_console_visible", True):
+                nb.pack_forget(); spacer.pack(side="top", fill="x")
+                btn_vis.config(text="▸ einblenden"); self._console_visible = False
+            else:
+                spacer.pack_forget(); nb.pack(fill="both", expand=True, padx=5, pady=5)
+                btn_vis.config(text="▾ ausblenden"); self._console_visible = True
+
+        # Buttons in EINER Zeile mit den Tabs: Overlay oben rechts ueber dem Tab-Streifen.
+        btns = ttk.Frame(host)
+        btn_dock = ttk.Button(btns, text="⧉ Abdocken", width=11)
+        btn_dock.config(command=lambda: self.workspace_tab.toggle_dock(
+            host, "\U0001f5a5️ Konsole & Live-Logging", host, self.root_paned, 1, btn_dock))
+        btn_vis = ttk.Button(btns, text="▾ ausblenden", width=11, command=_toggle_vis)
+        btn_dock.pack(side="left", padx=2)
+        btn_vis.pack(side="left", padx=2)
+        btns.place(relx=1.0, x=-6, y=4, anchor="ne")
+        btns.lift()
 
     def log(self, msg):
         def _append():

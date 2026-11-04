@@ -71,3 +71,13 @@ data/Kippy_RE_Log.md
 *.bak
 *.bak_*
 _bak_archive/
+*.bak-*
+_baks
+
+# Private, zielspezifische Native-Plugins (Decrypter etc.) + deren Daten
+native_plugins/
+
+# Session-Tooling & Probe-Ausgaben (Deploy-Skripte, Logs)
+secrets/
+data/active_session.json
+data/mcp_audit.jsonl

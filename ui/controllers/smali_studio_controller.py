@@ -346,10 +346,12 @@ class SmaliStudioController:
                 p["edit"] = content
                 p["file"] = rel
                 self.view.refresh_smali_tree()
+                self.app.persist_active_session()  # T1
                 self.app.log(f"[+] Neue-Datei-Patch aktualisiert: {rel}")
                 return True
         self.smali_patches.append({"type": "new_file", "scope": "new_file", "file": rel, "orig": "", "edit": content})
         self.view.refresh_smali_tree()
+        self.app.persist_active_session()  # T1
         self.app.log(f"[+] Neue-Datei-Patch hinzugefuegt: {rel}")
         return True
 
@@ -375,6 +377,7 @@ class SmaliStudioController:
             self.editing_patch_idx = None
             self.view.refresh_smali_tree()
             self.view.editor.clear_edit()
+            self.app.persist_active_session()  # T1
             return
 
         if not f or not orig or not edit:
@@ -397,6 +400,7 @@ class SmaliStudioController:
 
         self.view.refresh_smali_tree()
         self.view.editor.clear_edit()
+        self.app.persist_active_session()  # T1
 
     def remove_smali_patch(self, idx):
         del self.smali_patches[idx]
@@ -411,6 +415,7 @@ class SmaliStudioController:
             self.editing_patch_idx -= 1
 
         self.view.refresh_smali_tree()
+        self.app.persist_active_session()  # T1: Loeschung persistent machen
 
     def open_global_search(self):
         if not self.view._ensure_index_loaded(): return
@@ -484,3 +489,223 @@ class SmaliStudioController:
         self.view.ent_cg_filter.delete(0, 'end')
         self.cg_controller.clear_filter()
         EventBus.publish("LOG_INFO", "[*] Call Graph vollständig geleert.")
+
+    # --- Smali -> Native Bruecke (JNI, Stufe 1) ---
+    def _dalvik_class_of(self, rel_path):
+        """Dateipfad (smali/.../Foo.smali) -> Dalvik-Klasse 'Lpkg/Foo;'."""
+        rel_path = (rel_path or "").replace("\\", "/")
+        parts = rel_path.split("/")
+        if parts and parts[0] == "smali" and len(parts) > 1 and parts[1].startswith("classes"):
+            pure = "/".join(parts[2:])
+        elif parts and parts[0].startswith("smali_classes"):
+            pure = "/".join(parts[1:])
+        elif parts and parts[0] == "smali":
+            pure = "/".join(parts[1:])
+        else:
+            pure = rel_path
+        return "L" + pure.replace(".smali", "") + ";"
+
+    def _callee_is_native(self, callee_path, meth_name):
+        """True, wenn die Methode meth_name in callee_path als 'native' deklariert ist."""
+        try:
+            content, _ = self.fs_service.extract_full_file(callee_path)
+        except Exception:
+            return False
+        if not content:
+            return False
+        needle = " " + meth_name + "("
+        for line in content.splitlines():
+            ls = line.strip()
+            if ls.startswith(".method") and needle in (" " + ls):
+                mods = ls.replace(".method ", "").split("(")[0].split()
+                if "native" in mods:
+                    return True
+        return False
+
+    def jump_to_native_from_sig(self, sig):
+        """Aus einer Outline-/Datei-Methode (volle .method-Signatur) nach nativ springen."""
+        clean = SmaliStudioParser.clean_signature(sig)
+        head = clean.split("(")[0].strip()
+        name = head.split()[-1] if head else clean
+        argdesc = sig[sig.find("(") + 1:sig.rfind(")")] if "(" in sig and ")" in sig else None
+        self.jump_to_native(self._dalvik_class_of(self.current_smali_file), name, argdesc)
+
+    def jump_to_native(self, dalvik_class, method, arg_desc=None):
+        """Loest eine native Java-Methode via Resolver-Kette auf und springt ins Native Studio."""
+        app = self.app
+        bridge = getattr(app, "native_bridge", None)
+        if bridge is None:
+            messagebox.showinfo("Native-Bruecke", "Native-Bridge ist nicht verfuegbar (services.native_bridge fehlt).")
+            return
+        images = app.get_loaded_native_images() if hasattr(app, "get_loaded_native_images") else {}
+        if not images:
+            return self._offer_bridge_load(dalvik_class, method, arg_desc)
+        try:
+            from services.native_bridge import JniTarget, SymbolIndex, find_library_names
+        except Exception as e:
+            messagebox.showerror("Native-Bruecke", f"Import fehlgeschlagen: {e}")
+            return
+        prefer = []
+        try:
+            content, _ = self.fs_service.extract_full_file(self.current_smali_file)
+            if content:
+                prefer = find_library_names(content)
+        except Exception:
+            prefer = []
+        target = JniTarget(dalvik_class, str(method).split("(")[0], arg_desc)
+        try:
+            hits = bridge.resolve(target, SymbolIndex(images), prefer_libs=prefer)
+        except Exception as e:
+            messagebox.showerror("Native-Bruecke", f"Aufloesung fehlgeschlagen: {e}")
+            return
+        if not hits:
+            if messagebox.askyesno("Native-Bruecke",
+                                   f"Kein Symbol fuer {dalvik_class}->{method} in der geladenen Lib.\n"
+                                   f"Andere native Lib aus dem APK laden und erneut versuchen?"):
+                return self._offer_bridge_load(dalvik_class, method, arg_desc)
+            return
+        pick = hits[0]
+        if len(hits) > 1 and (hits[0].confidence - hits[1].confidence) <= 0.1:
+            chosen = self._choose_native_hit(hits)
+            if chosen is None:
+                return
+            pick = chosen
+        try:
+            if hasattr(app, "focus_native_studio"):
+                app.focus_native_studio(pick.lib)
+            app.native_studio.controller.navigate(pick.addr)
+            self.app.log(f"[Native-Bruecke] {dalvik_class}->{method} -> {pick.lib}@0x{pick.addr:x} "
+                         f"({pick.symbol}, {pick.by}, conf {pick.confidence:.2f})")
+        except Exception as e:
+            messagebox.showerror("Native-Bruecke", f"Sprung fehlgeschlagen: {e}")
+
+    def _choose_native_hit(self, hits):
+        """Kleiner modaler Auswahldialog bei mehrdeutigen Treffern."""
+        import tkinter as tk
+        from tkinter import ttk
+        win = tk.Toplevel(self.view.winfo_toplevel())
+        win.title("Native-Ziel waehlen")
+        win.transient(self.view.winfo_toplevel())
+        win.grab_set()
+        ttk.Label(win, text="Mehrere moegliche native Ziele:").pack(padx=10, pady=(10, 4), anchor="w")
+        lb = tk.Listbox(win, width=76, height=min(10, len(hits)))
+        for h in hits:
+            lb.insert("end", f"{h.lib} @ 0x{h.addr:x}  {h.symbol}  [{h.by}, conf {h.confidence:.2f}]")
+        lb.selection_set(0)
+        lb.pack(padx=10, pady=4, fill="both", expand=True)
+        result = {"idx": None}
+        def _ok():
+            sel = lb.curselection()
+            result["idx"] = sel[0] if sel else 0
+            win.destroy()
+        def _cancel():
+            result["idx"] = None
+            win.destroy()
+        bf = ttk.Frame(win)
+        bf.pack(pady=8)
+        ttk.Button(bf, text="Springen", command=_ok).pack(side="left", padx=5)
+        ttk.Button(bf, text="Abbrechen", command=_cancel).pack(side="left", padx=5)
+        win.wait_window()
+        idx = result["idx"]
+        return hits[idx] if idx is not None else None
+
+    # --- Auto-Load einer Lib auf Nachfrage (Bridge Stufe 2) ---
+    def _offer_bridge_load(self, dalvik_class, method, arg_desc):
+        import os, glob, zipfile
+        from tkinter import messagebox
+        app = self.app
+        src = app.cfg.paths.get("APP_SOURCE_DIR", "") if hasattr(app, "cfg") else ""
+        apks = sorted(glob.glob(os.path.join(src, "*arm64*.apk"))) if src else []
+        if not apks:
+            messagebox.showinfo("Native-Bruecke",
+                                "Keine arm64-APK im Source-Ordner gefunden.\nBitte Lib im Native Studio manuell laden.")
+            return
+        apk = apks[0]
+        try:
+            with zipfile.ZipFile(apk) as z:
+                libs = [n for n in z.namelist() if n.startswith("lib/arm64") and n.endswith(".so")]
+        except Exception as e:
+            messagebox.showerror("Native-Bruecke", f"APK nicht lesbar: {e}")
+            return
+        if not libs:
+            messagebox.showinfo("Native-Bruecke", "Keine .so in der APK gefunden.")
+            return
+        names = [l.split("/")[-1] for l in libs]
+        pick = self._choose_one(f"Native Lib fuer {method} laden", names)
+        if pick is None:
+            return
+        entry = libs[names.index(pick)]
+        base = app.cfg.config.get("BASE_DIR", os.getcwd())
+        outdir = os.path.join(base, "data", "native", "_bridge")
+        os.makedirs(outdir, exist_ok=True)
+        outp = os.path.join(outdir, pick)
+        try:
+            with zipfile.ZipFile(apk) as z, open(outp, "wb") as f:
+                f.write(z.read(entry))
+        except Exception as e:
+            messagebox.showerror("Native-Bruecke", f"Extrahieren fehlgeschlagen: {e}")
+            return
+        if hasattr(app, "focus_native_studio"):
+            app.focus_native_studio(pick)
+        try:
+            app.native_studio.controller._load_so(outp)
+        except Exception as e:
+            messagebox.showerror("Native-Bruecke", f"Laden fehlgeschlagen: {e}")
+            return
+        self.app.log(f"[Native-Bruecke] lade {pick} … danach Auto-Retry des Sprungs.")
+        self._schedule_bridge_retry(dalvik_class, method, arg_desc, 10)
+
+    def _schedule_bridge_retry(self, dalvik_class, method, arg_desc, attempts):
+        app = self.app
+        def _try():
+            images = app.get_loaded_native_images() if hasattr(app, "get_loaded_native_images") else {}
+            hits = []
+            if images:
+                try:
+                    from services.native_bridge import JniTarget, SymbolIndex
+                    hits = app.native_bridge.resolve(
+                        JniTarget(dalvik_class, str(method).split("(")[0], arg_desc),
+                        SymbolIndex(images))
+                except Exception:
+                    hits = []
+            if hits:
+                pick = hits[0]
+                if hasattr(app, "focus_native_studio"):
+                    app.focus_native_studio(pick.lib)
+                try:
+                    app.native_studio.controller.navigate(pick.addr)
+                    self.app.log(f"[Native-Bruecke] (nach Laden) {method} -> {pick.lib}@0x{pick.addr:x} ({pick.by}, conf {pick.confidence:.2f})")
+                except Exception as e:
+                    self.app.log(f"[Native-Bruecke] Sprung nach Laden fehlgeschlagen: {e}")
+                return
+            if attempts > 1:
+                app.after(1500, lambda: self._schedule_bridge_retry(dalvik_class, method, arg_desc, attempts - 1))
+            else:
+                from tkinter import messagebox
+                messagebox.showinfo("Native-Bruecke",
+                                    f"Lib geladen, aber kein Symbol fuer {method} gefunden.\n"
+                                    f"Evtl. andere Lib oder RegisterNatives woanders.")
+        app.after(1500, _try)
+
+    def _choose_one(self, title, items):
+        import tkinter as tk
+        from tkinter import ttk
+        win = tk.Toplevel(self.view.winfo_toplevel())
+        win.title(title); win.transient(self.view.winfo_toplevel()); win.grab_set()
+        ttk.Label(win, text=title).pack(padx=10, pady=(10, 4), anchor="w")
+        lb = tk.Listbox(win, width=52, height=min(18, len(items)))
+        for it in items:
+            lb.insert("end", it)
+        lb.selection_set(0)
+        lb.pack(padx=10, pady=4, fill="both", expand=True)
+        res = {"v": None}
+        def _ok():
+            s = lb.curselection(); res["v"] = items[s[0]] if s else items[0]; win.destroy()
+        def _cancel():
+            res["v"] = None; win.destroy()
+        bf = ttk.Frame(win); bf.pack(pady=8)
+        ttk.Button(bf, text="Laden", command=_ok).pack(side="left", padx=5)
+        ttk.Button(bf, text="Abbrechen", command=_cancel).pack(side="left", padx=5)
+        win.wait_window()
+        return res["v"]
+

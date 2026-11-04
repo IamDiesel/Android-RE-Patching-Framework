@@ -356,11 +356,24 @@ def _compose_desc(version, text):
 
 def lib_list(ctx):
     mgr = ctx.libs()
+    import os as _os, hashlib as _hl
+    def _meta(l):
+        sp = mgr.abspath(l.so_relpath) if l.so_relpath else ""
+        if sp and _os.path.exists(sp):
+            try:
+                b = open(sp, "rb").read()
+                return {"so_exists": True, "size": len(b),
+                        "sha256": _hl.sha256(b).hexdigest()[:12],
+                        "so_mtime": int(_os.path.getmtime(sp))}
+            except Exception:
+                pass
+        return {"so_exists": False, "size": 0, "sha256": "", "so_mtime": 0}
     out = [{
         "id": l.id, "name": l.name, "version": getattr(l, "version", "1.0"),
         "kind": getattr(l, "output_kind", "shared"),
         "abi": l.abi, "active": l.active, "built": l.last_build_ok, "so": l.so_relpath,
         "description": getattr(l, "description", ""),
+        **_meta(l),
     } for l in mgr.get_all()]
     return out or "keine Libs angelegt"
 
@@ -420,8 +433,6 @@ def lib_update(ctx, lib_id, source_code=None, abi=None, api_level=None,
         lib.output_kind = output_kind
     if name is not None:
         lib.name = name
-    if active is not None:
-        lib.active = bool(active)
     if version is not None:
         lib.version = str(version)
     if version is not None or description is not None:
@@ -429,7 +440,14 @@ def lib_update(ctx, lib_id, source_code=None, abi=None, api_level=None,
         base = description if description is not None else lib.description
         lib.description = _compose_desc(eff_ver, base)
     mgr.update(lib)
-    return f"aktualisiert: {lib.name} v{getattr(lib,'version','?')} (id={lib.id}) — {lib.description}{warn}"
+    _auto = []
+    if active is not None:
+        if bool(active) and not (lib.so_relpath and os.path.exists(mgr.abspath(lib.so_relpath))):
+            warn += " [WARN] active=True ignoriert: keine kompilierte .so vorhanden (Fix 1.9)."
+        else:
+            _auto = mgr.set_active(lib.id, bool(active))
+    _tail = f" (auto-deaktiviert: {len(_auto)})" if _auto else ""
+    return f"aktualisiert: {lib.name} v{getattr(lib,'version','?')} (id={lib.id}) — {lib.description}{warn}{_tail}"
 
 
 # ============================================================ D: Patches/Favoriten
@@ -1046,13 +1064,17 @@ def _find_lib(ctx, ref, only_exec=False):
     for l in libs:
         if getattr(l, "id", None) == ref:
             return mgr, l
-    for l in libs:
-        if (getattr(l, "name", "") or "") == ref:
-            return mgr, l
+    # Fix 1.9: bei Namens-Mehrdeutigkeit die AKTIVE Variante bevorzugen
+    def _pick(matches):
+        act = [m for m in matches if getattr(m, "active", False)]
+        return act[0] if len(act) == 1 else matches[0]
+    exact = [l for l in libs if (getattr(l, "name", "") or "") == ref]
+    if exact:
+        return mgr, _pick(exact)
     rl = ref.lower()
-    for l in libs:
-        if (getattr(l, "name", "") or "").lower() == rl:
-            return mgr, l
+    ci = [l for l in libs if (getattr(l, "name", "") or "").lower() == rl]
+    if ci:
+        return mgr, _pick(ci)
     return mgr, None
 
 
@@ -1071,8 +1093,16 @@ def lib_build(ctx, ref):
         lib.active = True
         mgr.update(lib)
         activated = True
+    _sha = ""; _sz = 0
+    if ok and so_path:
+        try:
+            import os as _os, hashlib as _hl
+            _b = open(so_path, "rb").read(); _sz = len(_b); _sha = _hl.sha256(_b).hexdigest()[:12]
+        except Exception:
+            pass
     return {"lib": lib.name, "success": bool(ok),
             "output": so_path if ok else "",
+            "sha256": _sha, "size": _sz,
             "auto_activated_executable": activated,
             "error": "" if ok else (err or "")[:800]}
 
@@ -1509,3 +1539,620 @@ def frida_push_collection(ctx, ref):
         except Exception as e:
             failed.append(f"{s.name} ({e})")
     return {"collection": c.name, "gepusht": pushed, "fehlgeschlagen": failed}
+
+
+# ============================================================ M: Native Studio
+# native.* — statische Analyse nativer AArch64-Libs (Native Studio) als MCP-Tools.
+# Rein lesend (O) bzw. lokal vorbereitend (P). Nutzt core.native (loader/nindex/unpack)
+# und die per Ordner-Scan entdeckten Decrypter-Plugins (native_plugins/, git-ignoriert).
+# Schreibpfade ausschliesslich data/native/<plugin>/  (Zonen-Policy A1/A2) — identisch
+# zu den Pfaden des GUI-Controllers, damit Index-/Ghidra-Cache GUI<->MCP geteilt werden.
+#
+# IP-neutral: kein LLU-Name hier; die Spezifik lebt im privaten Plugin.
+
+_NATIVE_IMG_CACHE = {}   # abspath -> (mtime, ElfImage)
+_NATIVE_IDX_CACHE = {}   # (abspath, fast) -> (sha, NativeIndex)
+_NATIVE_REG = {"reg": None}   # Prozess-weite UnpackRegistry (lazy)
+
+
+def _native_base(ctx):
+    try:
+        return ctx.cfg.config.get("BASE_DIR") or os.getcwd()
+    except Exception:
+        return os.getcwd()
+
+
+def _native_appsrc(ctx):
+    try:
+        p = ctx.cfg.paths.get("APP_SOURCE_DIR")
+        if p:
+            return p
+    except Exception:
+        pass
+    pkg = ""
+    try:
+        pkg = ctx.cfg.config.get("APP_PACKAGE", "")
+    except Exception:
+        pass
+    return os.path.join(_native_base(ctx), "source", pkg)
+
+
+def _native_registry(ctx):
+    """Lazy UnpackRegistry (Ordner-Scan native_plugins/). Prozess-weit gecacht."""
+    reg = _NATIVE_REG.get("reg")
+    if reg is None:
+        from core.native.unpack import UnpackRegistry
+        reg = UnpackRegistry()
+        try:
+            reg.discover(os.path.join(_native_base(ctx), "native_plugins"))
+        except Exception:
+            pass
+        _NATIVE_REG["reg"] = reg
+    return reg
+
+
+def _native_plugin_name(ctx):
+    """Plugin-Bucket im Arbeitsbereich (erstes Plugin, sonst 'native') — wie der GUI-Controller."""
+    try:
+        names = _native_registry(ctx).names()
+    except Exception:
+        names = []
+    return names[0] if names else "native"
+
+
+def _native_resolve_path(ctx, path):
+    """Akzeptiert absoluten Pfad, relativen Pfad oder blossen Basenamen einer .dec.so/.so.
+    Sucht Basenamen im Analyse-Arbeitsbereich data/native/*/ (lib/*/, _bridge/, _apktmp/*/)."""
+    if not path:
+        return None
+    if os.path.isabs(path) and os.path.isfile(path):
+        return os.path.abspath(path)
+    if os.path.isfile(path):
+        return os.path.abspath(path)
+    base = _native_base(ctx)
+    root = os.path.join(base, "data", "native")
+    bn = os.path.basename(path)
+    hits = []
+    for pat in (os.path.join(root, "*", "lib", "*", bn),
+                os.path.join(root, "*", bn),
+                os.path.join(root, "*", "_apktmp", "*", bn)):
+        hits += glob.glob(pat)
+    return os.path.abspath(hits[0]) if hits else path
+
+
+def _native_load_image(ctx, path):
+    from core.native.loader import ElfImage
+    rp = _native_resolve_path(ctx, path)
+    if not rp or not os.path.isfile(rp):
+        raise FileNotFoundError(f"Datei nicht gefunden: {path}")
+    try:
+        mt = os.path.getmtime(rp)
+    except OSError:
+        mt = 0
+    c = _NATIVE_IMG_CACHE.get(rp)
+    if c and c[0] == mt:
+        return rp, c[1]
+    img = ElfImage.from_file(rp)
+    _NATIVE_IMG_CACHE[rp] = (mt, img)
+    return rp, img
+
+
+def _native_build_index(ctx, rp, img, fast=True):
+    from core.native.nindex import NativeIndex
+    from core.native import unpack as _u
+    import hashlib
+    sha = hashlib.sha256(img.data).hexdigest()[:12]
+    key = (rp, bool(fast))
+    c = _NATIVE_IDX_CACHE.get(key)
+    if c and c[0] == sha:
+        return c[1]
+    cache = os.path.join(_u.plugin_root(_native_base(ctx), _native_plugin_name(ctx)), "index")
+    idx = NativeIndex().build(img, cache_dir=cache, fast=fast)
+    _NATIVE_IDX_CACHE[key] = (sha, idx)
+    return idx
+
+
+def _native_v2o(img, v):
+    """virtuelle Adresse -> Datei-Offset (innerhalb filesz)."""
+    for s in img.segments:
+        if s.vaddr <= v < s.vaddr + s.filesz:
+            return s.offset + (v - s.vaddr)
+    return None
+
+
+def _native_o2v(img, off):
+    """Datei-Offset -> virtuelle Adresse."""
+    for s in img.segments:
+        if s.offset <= off < s.offset + s.filesz:
+            return s.vaddr + (off - s.offset)
+    return None
+
+
+def _native_resolve_addr(img, idx, ref):
+    """ref = Symbolname | 0xADDR | sub_ADDR | dezimal -> int vaddr (oder None)."""
+    if ref is None:
+        return None
+    r = str(ref).strip()
+    if not r:
+        return None
+    # exaktes Symbol zuerst
+    sym = img.dynsyms.get(r)
+    if sym is not None:
+        return sym.value
+    low = r.lower()
+    try:
+        if low.startswith("0x"):
+            return int(low, 16)
+        if low.startswith("sub_"):
+            return int(low[4:], 16)
+        if r.isdigit():
+            return int(r)
+    except ValueError:
+        pass
+    # Symbol per Index (falls vorhanden)
+    if idx is not None:
+        for a, nm in idx.syms:
+            if nm == r:
+                return a
+    return None
+
+
+def _native_hexdump(data, base_vaddr):
+    """Kompakter Hexdump: 16 Bytes/Zeile, Adresse + Hex + ASCII."""
+    out = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hx = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.append(f"0x{base_vaddr + i:08x}  {hx:<47}  {asc}")
+    return "\n".join(out)
+
+
+# ---- M.1 native.targets (O) -------------------------------------------------
+def _native_apk_candidates(ctx, apk):
+    if apk:
+        return [apk]
+    appsrc = _native_appsrc(ctx)
+    pref = ["merged_base.apk", "split_config.arm64_v8a.apk", "base.apk"]
+    found = []
+    for nm in pref:
+        p = os.path.join(appsrc, nm)
+        if os.path.isfile(p):
+            found.append(p)
+    for p in sorted(glob.glob(os.path.join(appsrc, "*.apk"))):
+        if p not in found:
+            found.append(p)
+    return found
+
+
+def native_targets(ctx, apk=None, abi="arm64-v8a"):
+    from core.native import unpack as _u
+    import zipfile
+    cands = _native_apk_candidates(ctx, apk)
+    if not cands:
+        return {"ok": False,
+                "hinweis": "Kein APK gefunden. 'apk' angeben oder in der GUI importieren. "
+                           "APK-Pfad siehe workspace.status -> APP_SOURCE_DIR (source/<pkg>/*.apk)."}
+    chosen = None
+    packed = []
+    allso = []
+    for c in cands:
+        if not _u.is_zip(c):
+            continue
+        try:
+            with zipfile.ZipFile(c) as z:
+                libs = [n for n in z.namelist()
+                        if n.startswith("lib/" + abi + "/") and n.endswith(".so")]
+        except Exception:
+            continue
+        if libs:
+            p = _u.list_packed_libs(c, abi)
+            if p or chosen is None:
+                chosen, allso, packed = c, libs, p
+            if p:
+                break
+    if chosen is None:
+        return {"ok": False, "geprüfte_apks": [os.path.basename(x) for x in cands],
+                "hinweis": f"Keine lib/{abi}/*.so in den gefundenen APKs."}
+    return {
+        "ok": True,
+        "apk": chosen,
+        "abi": abi,
+        "alle_libs": [n.split("/")[-1] for n in allso],
+        "gepackt_verschluesselt": [n.split("/")[-1] for n in packed],
+        "entries": packed,
+        "hinweis": ("Gepackte Libs via native.unpack entschluesseln "
+                    "(apk=<apk> entry=<lib/...>), dann native.load/native.index auf der .dec.so."
+                    if packed else
+                    "Keine gepackt/verschluesselt wirkende Lib erkannt (Attrappen-Heuristik). "
+                    "Evtl. bereits normale ELFs — native.load direkt auf die entpackte .so."),
+    }
+
+
+# ---- M.2 native.status (O) --------------------------------------------------
+def native_status(ctx):
+    from core.native import unpack as _u
+    base = _native_base(ctx)
+    plug = _native_plugin_name(ctx)
+    root = _u.plugin_root(base, plug)
+
+    decs = []
+    for p in sorted(glob.glob(os.path.join(root, "lib", "*", "*.dec.so"))):
+        try:
+            decs.append({"name": os.path.basename(p),
+                         "sha_dir": os.path.basename(os.path.dirname(p)),
+                         "size": os.path.getsize(p), "path": p})
+        except OSError:
+            pass
+
+    idxs = []
+    for p in sorted(glob.glob(os.path.join(root, "index", ".nidx_*.pkl.xz"))):
+        idxs.append(os.path.basename(p))
+
+    ghidra = {}
+    for p in sorted(glob.glob(os.path.join(root, "ghidra", "*", "func_*.c"))):
+        sha = os.path.basename(os.path.dirname(p))
+        fn = os.path.basename(p)
+        ghidra.setdefault(sha, []).append(fn)
+
+    return {
+        "ok": True,
+        "plugin_bucket": plug,
+        "arbeitsbereich": root,
+        "entschluesselte_libs": decs or "(keine)",
+        "index_cache": idxs or "(keiner)",
+        "ghidra_c_cache": ghidra or "(keiner)",
+        "hinweis": ("Analyse mit path=<pfad einer .dec.so>. native.decompile liest NUR "
+                    "gecachtes Ghidra-C (oben unter ghidra_c_cache); fehlt es, in der GUI "
+                    "'🧊 C' erzeugen (langer Ghidra-Lauf, bewusst nicht ueber MCP)."),
+    }
+
+
+# ---- M.3 native.unpack (P) --------------------------------------------------
+def native_unpack(ctx, entry=None, apk=None, so_path=None, smali_loader=None,
+                  sig=None, smali_root=None):
+    reg = _native_registry(ctx)
+    if not reg.plugins():
+        return {"ok": False, "why": "no_plugin",
+                "hinweis": "Kein Decrypter-Plugin in native_plugins/ gefunden "
+                           "(privat, git-ignoriert). Framework ist dann entpack-frei."}
+    packed = so_path or apk
+    if not packed:
+        cands = _native_apk_candidates(ctx, None)
+        packed = cands[0] if cands else None
+    if not packed or not os.path.isfile(packed):
+        return {"ok": False, "why": "input",
+                "hinweis": "Eingabe fehlt: 'so_path' (gepackte .so) ODER 'apk' (+optional 'entry'). "
+                           "Entries via native.targets."}
+    plugins = reg.find_for(packed) or reg.plugins()
+    plugin = plugins[0]
+    kw = {}
+    if entry:
+        kw["apk_entry"] = entry
+    if smali_loader:
+        kw["smali_loader"] = smali_loader
+    if sig:
+        kw["sig"] = sig
+    if smali_root:
+        kw["smali_root"] = smali_root
+    try:
+        res = plugin.unpack(packed, **kw)
+    except TypeError:
+        res = plugin.unpack(packed)
+    except Exception as e:
+        return {"ok": False, "why": "exception", "hinweis": repr(e)}
+    if isinstance(res, dict) and res.get("ok"):
+        return {"ok": True, "plugin": plugin.name, "out_path": res.get("out_path"),
+                "loader": res.get("loader"), "sig": res.get("sig"),
+                "info": res.get("info"),
+                "hinweis": "Entschluesselte .dec.so im Analyse-Arbeitsbereich (git-ignoriert). "
+                           "Jetzt native.load / native.index mit path=<out_path>."}
+    return {"ok": False, "plugin": plugin.name,
+            "why": (res or {}).get("why") if isinstance(res, dict) else "fail",
+            "hinweis": (res or {}).get("hint") if isinstance(res, dict) else str(res)}
+
+
+# ---- M.4 native.load (O) ----------------------------------------------------
+def native_load(ctx, path):
+    from core.native import unpack as _u
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    head = img.data[:8192]
+    segs = [{"vaddr": f"0x{s.vaddr:x}", "memsz": f"0x{s.memsz:x}",
+             "filesz": f"0x{s.filesz:x}", "perms": s.perm_str()} for s in img.segments]
+    syms = [{"name": n, "addr": f"0x{s.value:x}", "size": s.size}
+            for n, s in list(img.dynsyms.items())[:80]]
+    return {
+        "ok": True,
+        "path": rp,
+        "is_aarch64": img.is_aarch64,
+        "entry": f"0x{img.entry:x}",
+        "sieht_gepackt_aus": _u.looks_packed(head),
+        "segmente": segs,
+        "symbole_gesamt": len(img.dynsyms),
+        "symbole_auszug": syms,
+        "relocs": len(getattr(img, "relocs", []) or []),
+        "hinweis": ("Kein AArch64-ELF (evtl. noch gepackt) — zuerst native.unpack."
+                    if not img.is_aarch64 else
+                    "native.index fuer XREF/CallGraph, dann native.search/xref/disasm."),
+    }
+
+
+# ---- M.5 native.index (O) ---------------------------------------------------
+def native_index(ctx, path, fast=True):
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not img.is_aarch64:
+        return {"ok": False, "hinweis": "Kein AArch64-ELF — Index nicht sinnvoll. Erst native.unpack."}
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=fast)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Indexbau fehlgeschlagen: {e!r}"}
+    return {
+        "ok": True,
+        "path": rp,
+        "modus": "fast (Branch/Call+Reloc)" if fast else "x (zusaetzl. adrp/add/ldr-Daten-Refs)",
+        "instruktionen": idx.count,
+        "kanten": len(idx.edges),
+        "symbole": len(idx.syms),
+        "sha": idx.sha,
+        "hinweis": "Index im RAM + SHA-gegatetem Cache (data/native/<plugin>/index/). "
+                   "Suche/XREF/CallGraph jetzt verfuegbar.",
+    }
+
+
+# ---- M.6 native.search (O) --------------------------------------------------
+def native_search(ctx, path, query, max_results=100):
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    q = (query or "").strip()
+    if not q:
+        return {"ok": False, "hinweis": "Leere Suche. query = Symbol-Substring, String oder 0xAddr."}
+    out = {"ok": True, "path": rp, "query": q}
+
+    # (a) Adresse? -> Funktion aufloesen
+    addr = None
+    low = q.lower()
+    try:
+        if low.startswith("0x"):
+            addr = int(low, 16)
+        elif low.startswith("sub_"):
+            addr = int(low[4:], 16)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        idx = None
+        try:
+            idx = _native_build_index(ctx, rp, img, fast=True)
+        except Exception:
+            pass
+        fn = idx.func_at(addr) if idx else None
+        exact = next((n for n, s in img.dynsyms.items() if s.value == addr), None)
+        out["adresse"] = {"addr": f"0x{addr:x}", "funktion": fn, "exaktes_symbol": exact}
+
+    # (b) Symbol-Substring (case-insensitive)
+    ql = q.lower()
+    syms = []
+    for n, s in img.dynsyms.items():
+        if ql in n.lower():
+            syms.append({"name": n, "addr": f"0x{s.value:x}", "size": s.size})
+            if len(syms) >= max_results:
+                break
+    out["symbole"] = syms
+
+    # (c) String-Suche (ASCII) in geladenen Daten, nur bei len(q)>=3
+    strings = []
+    if len(q) >= 3:
+        needle = q.encode("utf-8", "ignore")
+        data = img.data
+        start = 0
+        while len(strings) < min(max_results, 50):
+            i = data.find(needle, start)
+            if i < 0:
+                break
+            v = _native_o2v(img, i)
+            # Kontext: ASCII um den Treffer bis NUL
+            lo = i
+            while lo > 0 and 32 <= data[lo - 1] < 127 and i - lo < 80:
+                lo -= 1
+            hi = i
+            while hi < len(data) and 32 <= data[hi] < 127 and hi - i < 80:
+                hi += 1
+            strings.append({"offset": f"0x{i:x}",
+                            "vaddr": (f"0x{v:x}" if v is not None else None),
+                            "text": data[lo:hi].decode("ascii", "replace")})
+            start = i + max(1, len(needle))
+    out["strings"] = strings
+    out["hinweis"] = "symbole = Symbolnamen (Substring); strings = ASCII-Fundstellen; adresse = Funktion zu 0xAddr."
+    return out
+
+
+# ---- M.7 native.xref (O) ----------------------------------------------------
+def native_xref(ctx, path, ref, max_results=200):
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Index noetig, Bau fehlgeschlagen: {e!r}"}
+    addr = _native_resolve_addr(img, idx, ref)
+    if addr is None:
+        return {"ok": False, "hinweis": f"Ziel nicht aufloesbar: {ref!r} (Symbolname oder 0xAddr)."}
+    refs = idx.xrefs_to(addr, limit=max_results)
+    rows = []
+    for src, mnem in refs:
+        rows.append({"von": f"0x{src:x}", "mnemonic": mnem,
+                     "in_funktion": idx.func_at(src)})
+    return {
+        "ok": True, "path": rp,
+        "ziel": f"0x{addr:x}", "ziel_funktion": idx.func_at(addr),
+        "treffer": len(rows), "refs": rows,
+        "hinweis": "Eingehende Branch-/Call-/Reloc-Referenzen auf die Zieladresse.",
+    }
+
+
+# ---- M.8 native.disasm (O) --------------------------------------------------
+def native_disasm(ctx, path, at=None, count=48):
+    from core.native.engine_arm64 import Arm64Decoder
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        count = max(1, min(int(count), 400))
+    except (TypeError, ValueError):
+        count = 48
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    # Startadresse bestimmen
+    if at:
+        addr = _native_resolve_addr(img, idx, at)
+        if addr is None:
+            return {"ok": False, "hinweis": f"Start nicht aufloesbar: {at!r}."}
+    else:
+        addr = img.entry
+        if not addr and idx is not None and idx.syms:
+            addr = idx.syms[0][0]
+        if not addr:
+            xseg = [s for s in img.segments if s.flags & 0x1]
+            addr = xseg[0].vaddr if xseg else 0
+    off = _native_v2o(img, addr)
+    if off is None:
+        return {"ok": False, "hinweis": f"Adresse 0x{addr:x} liegt in keinem Datei-Segment (filesz)."}
+    code = img.data[off:off + count * 4]
+    md = Arm64Decoder()._md
+    lines = []
+    produced = 0
+    for a, size, mnem, ops in md.disasm_lite(code, addr):
+        lines.append(f"0x{a:08x}:  {mnem:<8} {ops}")
+        produced += 1
+        if produced >= count:
+            break
+    func = idx.func_at(addr) if idx else None
+    return {
+        "ok": True, "path": rp, "start": f"0x{addr:x}", "funktion": func,
+        "instruktionen": produced, "disasm": "\n".join(lines),
+        "hinweis": "Lineares Disassembly ab Start (capstone). Fuer Funktionsgrenzen native.callgraph/xref.",
+    }
+
+
+# ---- M.9 native.read_bytes (O) ----------------------------------------------
+def native_read_bytes(ctx, path, addr=None, offset=None, length=64):
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        length = max(1, min(int(length), 4096))
+    except (TypeError, ValueError):
+        length = 64
+    foff = None
+    base_v = 0
+    if addr is not None and str(addr).strip() != "":
+        a = str(addr).strip().lower()
+        try:
+            v = int(a, 16) if a.startswith("0x") else int(a)
+        except ValueError:
+            return {"ok": False, "hinweis": f"addr unlesbar: {addr!r}"}
+        foff = _native_v2o(img, v)
+        base_v = v
+        if foff is None:
+            return {"ok": False, "hinweis": f"vaddr 0x{v:x} in keinem Datei-Segment (filesz)."}
+    elif offset is not None and str(offset).strip() != "":
+        o = str(offset).strip().lower()
+        try:
+            foff = int(o, 16) if o.startswith("0x") else int(o)
+        except ValueError:
+            return {"ok": False, "hinweis": f"offset unlesbar: {offset!r}"}
+        v = _native_o2v(img, foff)
+        base_v = v if v is not None else 0
+    else:
+        return {"ok": False, "hinweis": "addr=0x.. (virtuell) ODER offset=0x.. (Datei) angeben."}
+    data = img.data[foff:foff + length]
+    if not data:
+        return {"ok": False, "hinweis": "Nichts gelesen (Offset ausserhalb der Datei)."}
+    return {
+        "ok": True, "path": rp,
+        "start_vaddr": f"0x{base_v:x}", "file_offset": f"0x{foff:x}", "laenge": len(data),
+        "hexdump": _native_hexdump(data, base_v),
+    }
+
+
+# ---- M.10 native.callgraph (O) ----------------------------------------------
+def native_callgraph(ctx, path, func):
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Index noetig, Bau fehlgeschlagen: {e!r}"}
+    name = None
+    if func in img.dynsyms:
+        name = func
+    else:
+        addr = _native_resolve_addr(img, idx, func)
+        if addr is not None:
+            name = idx.func_at(addr)
+    if not name:
+        return {"ok": False,
+                "hinweis": f"Funktion nicht aufloesbar: {func!r}. Symbolname oder 0xAddr; "
+                           "bei stripped/obfuskierten Libs ist der symbolbasierte CallGraph duenn."}
+    edges = idx.callgraph_edges()
+    callers = sorted({cf for cf, tf in edges if tf == name})
+    callees = sorted({tf for cf, tf in edges if cf == name})
+    return {
+        "ok": True, "path": rp, "funktion": name,
+        "aufgerufen_von": callers or "(keine bekannt)",
+        "ruft_auf": callees or "(keine bekannt)",
+        "hinweis": "Symbolbasiert (bl-Ziele). Instruktions-XREF: native.xref.",
+    }
+
+
+# ---- M.11 native.decompile (O, nur Cache) -----------------------------------
+def native_decompile(ctx, path, func):
+    from core.native import unpack as _u
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, func)
+    if addr is None:
+        return {"ok": False, "hinweis": f"Funktion nicht aufloesbar: {func!r} (Symbolname oder 0xAddr)."}
+    ws = _u.plugin_root(_native_base(ctx), _native_plugin_name(ctx))
+    sha = _u.sha8(rp)
+    cfile = os.path.join(ws, "ghidra", sha, "func_%x.c" % addr)
+    name = idx.func_at(addr) if idx else None
+    if os.path.isfile(cfile):
+        try:
+            with open(cfile, "r", encoding="utf-8", errors="replace") as f:
+                c = f.read()
+        except Exception as e:
+            return {"ok": False, "hinweis": f"C-Cache nicht lesbar: {e!r}"}
+        return {"ok": True, "path": rp, "funktion": name or func,
+                "addr": f"0x{addr:x}", "cached": True, "c": c}
+    return {
+        "ok": False, "cached": False, "path": rp,
+        "funktion": name or func, "addr": f"0x{addr:x}",
+        "why": "not_cached",
+        "hinweis": ("Kein gecachtes Ghidra-C fuer diese Funktion. native.decompile ist O "
+                    "(liest nur Cache) — den langen Ghidra-Lauf in der GUI ausloesen: Native "
+                    "Studio -> Funktion waehlen -> '🧊 C'. Danach liefert dieses Tool das C sofort."),
+    }

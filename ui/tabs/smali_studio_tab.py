@@ -184,6 +184,7 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_outline.tag_configure("system_api", foreground="gray")
         self.tree_outline.tag_configure("field", foreground="#007ACC")
         self.tree_outline.tag_configure("method", foreground="#A31515")
+        self.tree_outline.tag_configure("native_method", foreground="#C586C0")
         self.left_nb.add(f_outline, text="Outline")
 
         # Callgraph
@@ -308,6 +309,7 @@ class SmaliStudioTab(ttk.Frame):
         self.tree_file.tag_configure("system_api", foreground="gray")
         self.tree_file.tag_configure("field", foreground="#007ACC")
         self.tree_file.tag_configure("method", foreground="#A31515")
+        self.tree_file.tag_configure("native_method", foreground="#C586C0")
         self.right_nb.add(f_file, text="Datei")
 
         f_incoming = ttk.Frame(self.right_nb)
@@ -350,6 +352,10 @@ class SmaliStudioTab(ttk.Frame):
                                             method_signature="<Klassen-Header & Felder>", add_as_root=False)
                 self.controller._ignore_mode_change = False
                 return
+            if "native_method" in tags:
+                sig = tags[1] if len(tags) > 1 else tags[0]
+                self.controller.jump_to_native_from_sig(sig)
+                return
             if "method" in tags or "system_api" in tags:
                 self.controller._ignore_mode_change = True
                 self.editor.var_view_mode.set("method")
@@ -362,6 +368,10 @@ class SmaliStudioTab(ttk.Frame):
         if sel:
             tags = self.tree_file.item(sel[0], "tags")
             if "system_api" in tags: return "break"
+            if "native_method" in tags:
+                sig = tags[1] if len(tags) > 1 else tags[0]
+                self.controller.jump_to_native_from_sig(sig)
+                return "break"
             if "file_root" in tags:
                 self.controller._ignore_mode_change = True
                 self.editor.var_view_mode.set("file")
@@ -404,6 +414,11 @@ class SmaliStudioTab(ttk.Frame):
         if ";->" in target:
             cls, meth = target.split(";->")
             callee_path = self.controller.fs_service.resolve_smali_path(cls[1:] + ".smali")
+            meth_name = meth.split("(")[0]
+            argdesc = meth[meth.find("(") + 1:meth.rfind(")")] if "(" in meth and ")" in meth else None
+            if callee_path and self.controller._callee_is_native(callee_path, meth_name):
+                self.controller.jump_to_native(cls + ";", meth_name, argdesc)
+                return "break"
             if callee_path:
                 self.controller.load_method(callee_path, method_signature=meth)
 

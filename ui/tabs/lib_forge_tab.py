@@ -38,18 +38,24 @@ class LibForgeTab(ttk.Frame):
         ttk.Button(btns, text="🗑 Löschen", command=self.controller.delete_selected).pack(side="left", padx=1)
         ttk.Button(btns, text="🔄 Aktualisieren", command=self.controller.reload_from_disk).pack(side="right", padx=1)
 
-        cols = ("active", "name", "type", "build", "desc")
+        cols = ("active", "id", "name", "version", "type", "build", "somt", "desc")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=12)
         self.tree.heading("active", text="Aktiv")
         self.tree.heading("name", text="Lib")
         self.tree.heading("type", text="Typ")
         self.tree.heading("build", text="Letzter Build")
         self.tree.heading("desc", text="Beschreibung")
+        self.tree.heading("id", text="ID")
+        self.tree.heading("version", text="Ver")
+        self.tree.heading("somt", text=".so-Stand")
         self.tree.column("active", width=45, anchor="center")
         self.tree.column("name", width=140)
         self.tree.column("type", width=70, anchor="center")
         self.tree.column("build", width=130, anchor="center")
         self.tree.column("desc", width=180)
+        self.tree.column("id", width=72, anchor="center")
+        self.tree.column("version", width=50, anchor="center")
+        self.tree.column("somt", width=120, anchor="center")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.bind("<Delete>", lambda e: self.controller.delete_selected())
@@ -66,6 +72,9 @@ class LibForgeTab(ttk.Frame):
         self.ent_name.bind("<KeyRelease>", lambda e: self._update_so_preview())
         self.lbl_so = ttk.Label(head, text="→ lib<name>.so", foreground="#888")
         self.lbl_so.grid(row=0, column=2, sticky="w", padx=8)
+        ttk.Label(head, text="Version:").grid(row=0, column=3, sticky="e", padx=2)
+        self.ent_ver = ttk.Entry(head, width=10)
+        self.ent_ver.grid(row=0, column=4, sticky="w", padx=2)
 
         ttk.Label(head, text="Beschreibung:").grid(row=1, column=0, sticky="w", padx=2, pady=(2, 0))
         self.ent_desc = ttk.Entry(head, width=60)
@@ -132,8 +141,19 @@ class LibForgeTab(ttk.Frame):
         first_iid = None
         for lib in self.mgr.get_all():
             mark = "✓" if lib.active else "–"
-            iid = self.tree.insert("", "end", values=(mark, lib.name or "(unbenannt)", lib.origin,
-                                                       lib.last_build_at or "-", lib.description or ""))
+            _somt = "-"
+            try:
+                import os as _os, time as _tm
+                _sp = self.mgr.abspath(lib.so_relpath) if lib.so_relpath else ""
+                if _sp and _os.path.exists(_sp):
+                    _somt = _tm.strftime("%Y-%m-%d %H:%M", _tm.localtime(_os.path.getmtime(_sp)))
+                elif lib.so_relpath:
+                    _somt = "(fehlt)"
+            except Exception:
+                _somt = "?"
+            iid = self.tree.insert("", "end", values=(mark, (lib.id or "")[:8], lib.name or "(unbenannt)",
+                                                       getattr(lib, "version", "") or "-", lib.origin,
+                                                       lib.last_build_at or "-", _somt, lib.description or ""))
             self._iid_to_id[iid] = lib.id
             if first_iid is None:
                 first_iid = iid
@@ -176,6 +196,7 @@ class LibForgeTab(ttk.Frame):
             return
         self.ent_name.delete(0, "end"); self.ent_name.insert(0, lib.name)
         self.ent_desc.delete(0, "end"); self.ent_desc.insert(0, lib.description)
+        self.ent_ver.delete(0, "end"); self.ent_ver.insert(0, getattr(lib, "version", "") or "")
         self.cmb_abi.set(lib.abi or self.app.cfg.config.get("DEFAULT_ABI", "arm64-v8a"))
         self.ent_api.delete(0, "end"); self.ent_api.insert(0, str(lib.api_level or self.app.cfg.config.get("DEFAULT_API_LEVEL", 30)))
         self.ent_links.delete(0, "end"); self.ent_links.insert(0, lib.link_libs)
@@ -194,7 +215,7 @@ class LibForgeTab(ttk.Frame):
         self.show_load_hint(lib.name)
 
     def _clear_editor(self):
-        for e in (self.ent_name, self.ent_desc, self.ent_api, self.ent_links, self.ent_extra):
+        for e in (self.ent_name, self.ent_desc, self.ent_ver, self.ent_api, self.ent_links, self.ent_extra):
             e.delete(0, "end")
         self.cmb_kind.set("shared")
         self.editor.set_readonly(False)
@@ -205,6 +226,7 @@ class LibForgeTab(ttk.Frame):
     def sync_editor_into(self, lib):
         lib.name = self.ent_name.get().strip()
         lib.description = self.ent_desc.get().strip()
+        lib.version = self.ent_ver.get().strip() or "1.0"
         lib.abi = self.cmb_abi.get() or "arm64-v8a"
         try:
             lib.api_level = int(self.ent_api.get().strip())

@@ -130,9 +130,20 @@ TOOL_CATALOG = [
     ToolSpec("frida.collections_update","L", "Frida", "P", (), "Collection aendern (name/script_ids/version/description)"),
     ToolSpec("frida.collections_delete","L", "Frida", "G", ("delete_ops",), "Collection loeschen (nur auf Anfrage)"),
     ToolSpec("frida.push_collection",   "L", "Frida", "G", ("file_manager",), "Collection aufs Geraet pushen (gated)"),
+    ToolSpec("native.targets",    "M", "Native Studio", "O", (), "Gepackte/verschluesselte Libs in einem APK listen (lib/arm64-v8a/*.so)"),
+    ToolSpec("native.status",     "M", "Native Studio", "O", (), "Arbeitsbereich-Status: entschluesselte .dec.so, Index-Cache, gecachtes Ghidra-C"),
+    ToolSpec("native.unpack",     "M", "Native Studio", "P", (), "Gepackte Lib (APK/.so) via entdecktem Plugin entschluesseln -> .dec.so (lokal)"),
+    ToolSpec("native.load",       "M", "Native Studio", "O", (), "ELF-Kurzinfo einer .so (AArch64?, Segmente, Symbole, Entry)"),
+    ToolSpec("native.index",      "M", "Native Studio", "O", (), "XREF/CallGraph-Index bauen/auffrischen (SHA-gegateter Cache)"),
+    ToolSpec("native.search",     "M", "Native Studio", "O", (), "In .so suchen: Symbol, String, Adresse"),
+    ToolSpec("native.xref",       "M", "Native Studio", "O", (), "Wer referenziert 0xADDR? (Instruktions-/Reloc-Refs + Caller-Funktion)"),
+    ToolSpec("native.disasm",     "M", "Native Studio", "O", (), "Funktion/Bereich disassemblieren (ab Adresse/Symbol)"),
+    ToolSpec("native.read_bytes", "M", "Native Studio", "O", (), "Rohbytes/Hex an virtueller Adresse oder Datei-Offset lesen"),
+    ToolSpec("native.callgraph",  "M", "Native Studio", "O", (), "Caller/Callees einer Funktion (symbolbasiert)"),
+    ToolSpec("native.decompile",  "M", "Native Studio", "O", (), "Gecachtes Ghidra-C einer Funktion (sonst Hinweis: in GUI erzeugen)"),
 ]
 
-GROUP_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"]
+GROUP_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]
 GROUP_NAMES = {s.group: s.group_name for s in TOOL_CATALOG}
 CAP_KEYS = ["build", "flash", "app_start", "exec_run", "file_manager", "delete_ops"]
 

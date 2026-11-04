@@ -35,11 +35,31 @@ class SmaliSearchEngine:
                 os.makedirs(cache_dir, exist_ok=True)
                 index_file = os.path.join(cache_dir, f".{pkg_name}_index.pkl")
 
+                _fresh = False
                 if os.path.exists(index_file):
+                    try:
+                        _idx_m = os.path.getmtime(index_file)
+                        _newest = 0.0
+                        for _r, _, _fs in os.walk(source_smali_dir):
+                            for _f in _fs:
+                                if _f.endswith((".smali", ".xml")):
+                                    try:
+                                        _m = os.path.getmtime(os.path.join(_r, _f))
+                                        if _m > _newest:
+                                            _newest = _m
+                                    except OSError:
+                                        pass
+                        _fresh = _newest <= _idx_m
+                    except OSError:
+                        _fresh = False
+
+                if _fresh:
                     self.log(f"[*] Lade Cache aus {index_file}...")
                     with open(index_file, "rb") as f:
                         self.ram_cache = pickle.load(f)
                 else:
+                    if os.path.exists(index_file):
+                        self.log("[*] Quelle neuer als Index -> baue RAM-Index neu auf...")
                     self.log("[*] Sammle Dateipfade aus Source...")
                     filepaths = [os.path.join(r, f) for r, _, fs in os.walk(source_smali_dir) for f in fs if
                                  f.endswith((".smali", ".xml"))]

@@ -9,11 +9,27 @@ class FuzzingEngine:
     @staticmethod
     def _normalize_smali(code: str) -> str:
         """Entfernt Zeilennummern, Register und Kommentare für den reinen Opcode-Vergleich."""
-        code = re.sub(r'^\s*\.line\s+\d+', '', code, flags=re.MULTILINE)
+        out = []
+        for _raw in code.split('\n'):
+            _h = _raw.find('#')
+            if _h != -1:
+                _raw = _raw[:_h]
+            _s = _raw.strip()
+            if not _s:
+                continue
+            if _s.startswith('.line') or _s.startswith('.prologue'):
+                continue
+            out.append(_s)
+        code = '\n'.join(out)
         code = re.sub(r'\b[vp]\d+\b', 'REG', code)
-        code = re.sub(r'#.*', '', code)
-        lines = [l.strip() for l in code.split('\n') if l.strip()]
-        return '\n'.join(lines)
+        _label_map = {}
+        def _canon_label(m):
+            tok = m.group(0)
+            if tok not in _label_map:
+                _label_map[tok] = ':L%d' % len(_label_map)
+            return _label_map[tok]
+        code = re.sub(r':[A-Za-z_][A-Za-z0-9_]*', _canon_label, code)
+        return code
 
     @staticmethod
     def _extract_methods_from_content(path: str, content: str, pattern: re.Pattern,

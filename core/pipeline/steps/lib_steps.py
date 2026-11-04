@@ -24,6 +24,11 @@ class InjectAddedLibsStep(PipelineStep):
 
         # Executables werden NIE in die APK injiziert (sie laufen standalone via ExeDeploy).
         active = [l for l in mgr.get_active() if _is_shared(l)]
+        # Fix 1.9: aktive-aber-.so-fehlt nicht still schlucken
+        for _l in mgr.get_all():
+            if getattr(_l, "active", False) and _is_shared(_l) \
+                    and not (_l.so_relpath and os.path.exists(mgr.abspath(_l.so_relpath))):
+                engine_context.log(f"[!] WARNUNG: aktive Lib '{_l.name}' (id={_l.id[:8]}) hat keine kompilierte .so ({_l.so_relpath}) -> wird NICHT injiziert!")
         managed_names = {mgr.so_output_name(l) for l in mgr.get_all() if _is_shared(l)}
         active_names = {mgr.so_output_name(l) for l in active}
 
@@ -44,7 +49,8 @@ class InjectAddedLibsStep(PipelineStep):
         for arch in arch_dirs:
             arch_path = os.path.join(apk_lib_dir, arch)
             for fn in os.listdir(arch_path):
-                if fn in managed_names and fn not in active_names:
+                _src_orig = os.path.join(engine_context.cfg.paths.get("APP_SOURCE_DIR", ""), folder_name, "lib", arch, fn)
+                if fn in managed_names and fn not in active_names and not os.path.exists(_src_orig):
                     try:
                         os.remove(os.path.join(arch_path, fn))
                         removed += 1
@@ -70,15 +76,24 @@ class InjectAddedLibsStep(PipelineStep):
             targets = [lib.abi] if lib.abi in arch_dirs else arch_dirs
             for arch in targets:
                 dst = os.path.join(apk_lib_dir, arch, so_name)
-                if os.path.exists(dst) and so_name not in managed_names:
+                _src_orig = os.path.join(engine_context.cfg.paths.get("APP_SOURCE_DIR", ""), folder_name, "lib", arch, so_name)
+                if os.path.exists(_src_orig):
                     engine_context.log(
-                        f"[!] LibForge: '{so_name}' existiert in lib/{arch}/ als echte App-Lib "
-                        f"-> Skip (kein Ueberschreiben).")
+                        f"[!] LibForge: '{so_name}' ist eine echte App-Lib (im Source vorhanden) "
+                        f"-> Skip (kein Ueberschreiben, nutze lib_replace).")
                     continue
                 try:
-                    shutil.copy2(so_src, dst)
+                    shutil.copyfile(so_src, dst)
+                    os.utime(dst, None)  # Fix 1.9: frische mtime -> schlaegt apktool-Cache
                     added += 1
-                    engine_context.log(f"[+] LibForge: '{so_name}' -> lib/{arch}/ (neu/ueberschrieben)")
+                    try:
+                        import hashlib as _hl
+                        _sz = os.path.getsize(dst)
+                        with open(dst, "rb") as _f:
+                            _sha = _hl.sha256(_f.read()).hexdigest()[:8]
+                        engine_context.log(f"[+] LibForge: '{so_name}' -> lib/{arch}/ (id={lib.id[:8]}, v={getattr(lib,'version','?')}, {_sz} B, sha256={_sha})")
+                    except Exception:
+                        engine_context.log(f"[+] LibForge: '{so_name}' -> lib/{arch}/ (neu/ueberschrieben)")
                 except Exception as e:
                     engine_context.log(f"[!] LibForge: Fehler beim Kopieren von '{so_name}': {e}")
                     return False

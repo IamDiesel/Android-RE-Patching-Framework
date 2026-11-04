@@ -408,6 +408,13 @@ class ManifestBuildStep(PipelineStep):
                 f.writelines(lines)
             engine_context.log("[+] Hermes-Fix: Kompression für React Native Bundles deaktiviert.")
 
+        _cache_lib = os.path.join(engine_context.cfg.paths["DEST_DIR"],
+                                  engine_context.get_unpacked_dir_name(), "build", "apk", "lib")
+        if os.path.isdir(_cache_lib):
+            import shutil as _sh
+            _sh.rmtree(_cache_lib, ignore_errors=True)
+            engine_context.log("[*] apktool-Lib-Cache invalidiert: build/apk/lib/ geleert (Fix 1.9).")
+
         if not strategy.build(engine_context): return False
 
         if engine_context.cfg.config.get("INJECT_FRIDA", False) and strategy_name == "apkeditor":

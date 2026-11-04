@@ -89,6 +89,16 @@ class ActiveSessionService:
                   f"{conflicts} — eigene Version gewann, fremde evtl. ueberschrieben.")
         return merged
 
+    def clear(self) -> None:
+        """T2: Leert die aktive Session HART (umgeht den Drei-Wege-Merge, der sonst
+        Disk-Eintraege behaelt). Setzt Datei, items, baseline und mtime konsistent
+        zurueck -- der einzige Weg, die Liste wirklich zu leeren."""
+        json_store.atomic_write_text(
+            self.file, json.dumps({"patches": []}, indent=2, ensure_ascii=False))
+        self.items = []
+        self._baseline = json_store.snapshot_fingerprints(self.items, _patch_key)
+        self._mtime = json_store.file_mtime(self.file)
+
 
 def get_shared_active_session(app) -> "ActiveSessionService":
     """Liefert die EINE app-weite ActiveSessionService-Instanz (wie get_shared_favorites)."""

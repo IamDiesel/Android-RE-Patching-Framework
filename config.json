@@ -179,18 +179,37 @@
             "file": "data\\mcp_audit.jsonl",
             "log_args": true
         },
-        "tools": {},
+        "tools": {
+            "lib.build": true,
+            "lib.delete": true,
+            "pipeline.run": true,
+            "pipeline.flash": true,
+            "device.ls": true,
+            "device.pull": true,
+            "device.vault_bundle": true,
+            "device.push": true,
+            "device.delete": true,
+            "exec.deploy_run": true,
+            "exec.pull_result": true,
+            "exec.delete": true,
+            "net.push_cert": true,
+            "net.route": true,
+            "frida.scripts_delete": true,
+            "frida.collections_delete": true,
+            "frida.push_collection": true
+        },
         "caps": {
-            "build": false,
-            "flash": false,
-            "app_start": false,
-            "exec_run": false,
-            "file_manager": false,
-            "delete_ops": false
+            "build": true,
+            "flash": true,
+            "app_start": true,
+            "exec_run": true,
+            "file_manager": true,
+            "delete_ops": true
         },
         "console": {
             "max_bytes": 20971520,
             "clear_on_app_start": true
         }
-    }
+    },
+    "ADB_DEVICE_SERIAL": "45301FDAP009G0"
 }

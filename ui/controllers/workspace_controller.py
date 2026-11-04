@@ -196,6 +196,26 @@ class WorkspaceController:
 
         threading.Thread(target=task, daemon=True).start()
 
+    def clear_active_session(self):
+        """T2: Aktive Session leeren (Favoriten/History bleiben erhalten)."""
+        from tkinter import messagebox
+        if not messagebox.askyesno(
+                "Aktive Session leeren",
+                "Alle aktiven Patches aus der laufenden Session entfernen?\n"
+                "(Favoriten und History bleiben erhalten.)"):
+            return
+        try:
+            from core.application.session_state import SessionState
+            SessionState.clear_session()
+            svc = getattr(self.app, "active_session_svc", None)
+            if svc is not None:
+                svc.clear()
+            if hasattr(self.app, "_reflect_active_session"):
+                self.app._reflect_active_session(initial=True)
+            self.app.log("[+] Aktive Session geleert (Favoriten/History unberuehrt).")
+        except Exception as e:
+            self.app.log(f"[!] Leeren der aktiven Session fehlgeschlagen: {e}")
+
     def save_current_as_favorite(self):
         name = simpledialog.askstring("Favorit sichern", "Gib einen Namen für diesen Favoriten ein:")
         if not name: return

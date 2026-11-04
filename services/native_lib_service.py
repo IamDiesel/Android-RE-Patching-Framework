@@ -169,6 +169,25 @@ class NativeLibManager:
             lib.active = active
             self.save()
 
+    def set_active(self, lib_id: str, active: bool) -> list:
+        """Zentrales Aktivieren/Deaktivieren mit Exklusivitaet pro so_output_name
+        (Fix 1.9): beim Aktivieren werden gleichnamige Konkurrenten in-memory
+        deaktiviert und genau EINMAL gespeichert. Gibt die ids der auto-
+        deaktivierten Libs zurueck. Von GUI UND MCP (tools.lib_update) genutzt."""
+        lib = self.get(lib_id)
+        if not lib:
+            return []
+        auto = []
+        if active:
+            tgt = self.so_output_name(lib)
+            for l in self.libs:
+                if l.id != lib.id and l.active and self.so_output_name(l) == tgt:
+                    l.active = False
+                    auto.append(l.id)
+        lib.active = bool(active)
+        self.save()
+        return auto
+
     def set_build_result(self, lib: NativeLib, ok: bool, so_path: str) -> None:
         lib.last_build_ok = ok
         lib.last_build_at = time.strftime("%Y-%m-%d %H:%M:%S")

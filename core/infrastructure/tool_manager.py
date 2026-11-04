@@ -3,6 +3,9 @@ import urllib.request
 import lzma
 import zipfile
 import shutil
+import json
+import glob
+import threading
 from core.application.event_bus import EventBus
 
 
@@ -29,9 +32,39 @@ class ToolManager:
 
     @classmethod
     def _download_file(cls, url: str, target_path: str) -> None:
+        """Atomarer Download: erst nach .part laden, Groesse gegen Content-Length pruefen,
+        dann umbenennen. Verhindert, dass ein abgebrochener Download als 'fertige' Datei
+        liegen bleibt (sonst wird z. B. eine abgeschnittene ZIP spaeter als gueltig behandelt)."""
         req = urllib.request.Request(url, headers={'User-Agent': 'Kippy-RE-Framework-Downloader'})
-        with urllib.request.urlopen(req) as response, open(target_path, 'wb') as out_file:
-            shutil.copyfileobj(response, out_file)
+        tmp = target_path + ".part"
+        with urllib.request.urlopen(req, timeout=120) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            show = total > 20 * (1 << 20)     # Fortschritt nur bei grossen Downloads
+            done = last = 0
+            chunk = 1 << 20
+            with open(tmp, 'wb') as out_file:
+                while True:
+                    buf = response.read(chunk)
+                    if not buf:
+                        break
+                    out_file.write(buf)
+                    done += len(buf)
+                    if show and done - last >= 25 * (1 << 20):
+                        last = done
+                        mb_total = (str(total // (1 << 20)) if total else "?")
+                        pct = (f" ({done * 100 // total}%)" if total else "")
+                        try:
+                            print(f"    … {done // (1 << 20)}/{mb_total} MB{pct}", flush=True)
+                        except Exception:
+                            pass
+        got = os.path.getsize(tmp)
+        if total and got < total:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise IOError(f"unvollstaendiger Download {got}/{total} B: {url}")
+        os.replace(tmp, target_path)
 
     @classmethod
     def setup_tools(cls, base_dir: str) -> None:
@@ -71,6 +104,13 @@ class ToolManager:
 
         cls._inject_into_path(tools_dir, is_win)
         cls._create_manual_instructions(tools_dir)
+        # Ghidra beim Start bereitstellen wie die uebrigen Tools (laedt Ghidra + ggf. JDK 21,
+        # einmalig; idempotent). Meldungen landen in der Haupt-Konsole wie bei den anderen Tools.
+        try:
+            EventBus.publish("LOG_INFO", "[*] Pruefe Ghidra (C-Decompiler) ...")
+            cls.resolve_ghidra({"BASE_DIR": base_dir}, allow_download=True)
+        except Exception as e:
+            EventBus.publish("LOG_INFO", f"[!] Ghidra-Setup uebersprungen: {e!r}")
         EventBus.publish("LOG_INFO", "[+] Auto-Setup abgeschlossen. Alle Tool-Abhängigkeiten sind bereit.")
 
     @classmethod
@@ -199,9 +239,294 @@ class ToolManager:
                 "- build-tools als 'android-14' entpacken\n"
                 "- Node.js portable (ZIP) als 'node-vX.Y.Z-win-x64' entpacken\n"
                 "- Graphviz portable (ZIP) als 'graphviz' entpacken (sodass dot.exe in einem Unterordner liegt)\n"
+                "- Ghidra (ZIP von github.com/NationalSecurityAgency/ghidra/releases) als 'ghidra/ghidra_<ver>_PUBLIC' entpacken\n"
+                "- JDK 21 (Temurin, github.com/adoptium/temurin21-binaries) als 'jdk/jdk-<ver>' entpacken (nur falls kein JDK>=21 im System)\n"
             )
             with open(readme_path, "w", encoding="utf-8") as f:
                 f.write(content)
+    # ================= Ghidra (headless C-Decompile) =================
+    GHIDRA_JDK_MAJOR = 21
+    _ghidra_lock = threading.Lock()   # serialisiert Download/Entpacken (Start-Setup vs. 🧊-C-Klick)
+
+    @classmethod
+    def _emit(cls, log, msg):
+        # Primär ins Python-Terminal (stdout) — dort sieht der Nutzer Tool-Installationen,
+        # wie die pip/PATH-Meldungen aus main.py. Zusätzlich in die EventBus-Hauptkonsole.
+        # NICHT in die Analyse-Konsole (kein log-Passthrough beim Ghidra-Setup).
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+        EventBus.publish("LOG_INFO", msg)
+        if log:
+            try:
+                log(msg)
+            except Exception:
+                pass
+
+    @classmethod
+    def _headless_exe(cls) -> str:
+        return "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
+
+    @classmethod
+    def _ghidra_in(cls, root: str) -> str:
+        if not root or not os.path.isdir(root):
+            return ""
+        exe = cls._headless_exe()
+        direct = os.path.join(root, "support", exe)
+        if os.path.isfile(direct):
+            return direct
+        hits = glob.glob(os.path.join(root, "ghidra_*", "support", exe))
+        return hits[0] if hits else ""
+
+    @classmethod
+    def _ghidra_search_roots(cls, base_dir: str) -> list:
+        roots = [os.path.join(base_dir, "tools", "ghidra")]
+        for env in ("GHIDRA_INSTALL_DIR", "GHIDRA_HOME"):
+            v = os.environ.get(env)
+            if v:
+                roots.append(v)
+        if os.name == "nt":
+            for pat in ("C:\\ghidra*", "C:\\Program Files\\ghidra*",
+                        "C:\\tools\\ghidra*", os.path.expanduser("~\\ghidra*")):
+                roots += glob.glob(pat)
+        else:
+            for pat in ("/opt/ghidra*", os.path.expanduser("~/ghidra*"), "/usr/local/ghidra*"):
+                roots += glob.glob(pat)
+        return roots
+
+    @classmethod
+    def _gh_latest_asset(cls, repo: str, predicate) -> tuple:
+        url = f"https://api.github.com/repos/{repo}/releases/latest"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Kippy-RE-Framework-Downloader'})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.load(r)
+        for a in data.get("assets", []):
+            if predicate(a["name"]):
+                return a["name"], a["browser_download_url"]
+        return "", ""
+
+    @classmethod
+    def resolve_ghidra(cls, config: dict, allow_download: bool = True, log=None) -> str:
+        """Findet analyzeHeadless (Override GHIDRA_HEADLESS -> ENV -> tools/ghidra -> gaengige Orte),
+        laedt bei Bedarf Ghidra (+ JDK 21) und verdrahtet GHIDRA_INSTALL_DIR/JAVA_HOME/PATH.
+        Muster wie resolve_clang/resolve_ndk. `log` spiegelt Meldungen zusaetzlich in die GUI."""
+        config = config or {}
+        base_dir = config.get("BASE_DIR", os.getcwd())
+        override = str(config.get("GHIDRA_HEADLESS", "") or "").strip()
+        if override and os.path.isfile(override):
+            cls._wire_ghidra(base_dir, override, config, log)
+            return override
+        for root in cls._ghidra_search_roots(base_dir):
+            h = cls._ghidra_in(root)
+            if h:
+                cls._emit(log, f"[+] Ghidra gefunden: {h}")
+                cls._wire_ghidra(base_dir, h, config, log)
+                return h
+        if not allow_download:
+            return ""
+        h = cls.download_ghidra(config, log)
+        if h:
+            cls._wire_ghidra(base_dir, h, config, log)
+        return h
+
+    @classmethod
+    def download_ghidra(cls, config: dict, log=None) -> str:
+        config = config or {}
+        base_dir = config.get("BASE_DIR", os.getcwd())
+        gdir = os.path.join(base_dir, "tools", "ghidra")
+        os.makedirs(gdir, exist_ok=True)
+        # Download serialisieren: laeuft das Start-Setup schon, wartet der 🧊-C-Klick hier
+        # und findet danach das fertige Ghidra (Re-Check) -> kein Doppel-Download/-Entpacken.
+        if not cls._ghidra_lock.acquire(blocking=False):
+            cls._emit(log, "[*] Ghidra wird bereits im Hintergrund geladen — warte, bis es fertig ist …")
+            cls._ghidra_lock.acquire()
+        try:
+            existing = cls._ghidra_in(gdir)
+            if existing:
+                cls._emit(log, "[+] Ghidra bereits eingerichtet.")
+                return existing
+            cls._emit(log, "[*] Frage GitHub nach aktuellem Ghidra-Release ...")
+            try:
+                name, url = cls._gh_latest_asset("NationalSecurityAgency/ghidra",
+                                                 lambda n: n.endswith(".zip") and "PUBLIC" in n)
+            except Exception as e:
+                cls._emit(log, f"[!] Ghidra-Release-Abfrage fehlgeschlagen: {e!r} "
+                               f"(Proxy/Offline? Dann Ghidra manuell nach tools/ghidra/ entpacken "
+                               f"oder GHIDRA_HEADLESS in config.json setzen.)")
+                return ""
+            if not url:
+                cls._emit(log, "[!] Kein Ghidra-Release-Asset gefunden.")
+                return ""
+            zip_path = os.path.join(gdir, name)
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+            cls._emit(log, f"[*] Lade Ghidra herunter ({name}, ~570 MB, einmalig)...")
+            import tempfile as _tf, shutil as _sh
+            incoming = None
+            try:
+                cls._download_file(url, zip_path)
+                cls._emit(log, "[*] Entpacke Ghidra (kann etwas dauern)...")
+                for stale in glob.glob(os.path.join(gdir, ".incoming*")):
+                    _sh.rmtree(stale, ignore_errors=True)
+                incoming = _tf.mkdtemp(prefix=".incoming", dir=gdir)
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    z.extractall(incoming)
+                subs = glob.glob(os.path.join(incoming, "ghidra_*"))
+                if not subs:
+                    raise IOError("Ghidra-ZIP ohne erwartetes ghidra_*-Verzeichnis")
+                final = os.path.join(gdir, os.path.basename(subs[0]))
+                if os.path.exists(final):
+                    _sh.rmtree(final, ignore_errors=True)
+                os.replace(subs[0], final)          # erst jetzt gilt Ghidra als installiert
+                _sh.rmtree(incoming, ignore_errors=True); incoming = None
+                os.remove(zip_path)
+            except Exception as e:
+                try:
+                    if incoming:
+                        _sh.rmtree(incoming, ignore_errors=True)
+                    if os.path.exists(zip_path):
+                        os.remove(zip_path)
+                except OSError:
+                    pass
+                cls._emit(log, f"[!] Ghidra-Download/Entpacken fehlgeschlagen: {e!r}")
+                return ""
+            h = cls._ghidra_in(gdir)
+            if h:
+                cls._emit(log, "[+] Ghidra erfolgreich eingerichtet.")
+            return h
+        finally:
+            cls._ghidra_lock.release()
+
+    @classmethod
+    def _wire_ghidra(cls, base_dir: str, headless: str, config: dict, log=None) -> None:
+        os.environ["GHIDRA_INSTALL_DIR"] = os.path.dirname(os.path.dirname(headless))
+        try:
+            jh = cls.resolve_jdk(config, allow_download=True, log=log)
+        except Exception as e:
+            cls._emit(log, f"[!] JDK-Bereitstellung uebersprungen: {e!r}")
+            jh = None
+        if jh:
+            os.environ["JAVA_HOME"] = jh
+            bin_dir = os.path.join(jh, "bin")
+            cur = os.environ.get("PATH", "")
+            if bin_dir not in cur.split(os.pathsep):
+                os.environ["PATH"] = bin_dir + os.pathsep + cur
+            cls._emit(log, f"[+] JAVA_HOME gesetzt: {jh}")
+
+    @classmethod
+    def _java_major(cls, java_exe: str) -> int:
+        import re, subprocess
+        try:
+            out = subprocess.run([java_exe, "-version"], capture_output=True, text=True, timeout=15)
+            m = re.search(r'version "(\d+)', (out.stderr or "") + (out.stdout or ""))
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
+
+    @classmethod
+    def resolve_jdk(cls, config: dict, allow_download: bool = True, log=None):
+        config = config or {}
+        base_dir = config.get("BASE_DIR", os.getcwd())
+        exe = "java.exe" if os.name == "nt" else "java"
+        for j in glob.glob(os.path.join(base_dir, "tools", "jdk", "jdk*", "bin", exe)):
+            if cls._java_major(j) >= cls.GHIDRA_JDK_MAJOR:
+                return os.path.dirname(os.path.dirname(j))
+        jh = os.environ.get("JAVA_HOME")
+        if jh and cls._java_major(os.path.join(jh, "bin", exe)) >= cls.GHIDRA_JDK_MAJOR:
+            return jh
+        sys_java = shutil.which(exe)
+        if sys_java and cls._java_major(sys_java) >= cls.GHIDRA_JDK_MAJOR:
+            return None
+        if not allow_download:
+            return None
+        return cls.download_jdk(config, log)
+
+    @classmethod
+    def download_jdk(cls, config: dict, log=None):
+        import sys as _sys
+        import platform as _plat
+        config = config or {}
+        base_dir = config.get("BASE_DIR", os.getcwd())
+        exe = "java.exe" if os.name == "nt" else "java"
+        jdk_root = os.path.join(base_dir, "tools", "jdk")
+        os.makedirs(jdk_root, exist_ok=True)
+        if not cls._ghidra_lock.acquire(blocking=False):
+            cls._emit(log, "[*] JDK/Ghidra-Download laeuft bereits — warte …")
+            cls._ghidra_lock.acquire()
+        try:
+            hits = glob.glob(os.path.join(jdk_root, "jdk*", "bin", exe))
+            if hits:
+                return os.path.dirname(os.path.dirname(hits[0]))
+            osn = "windows" if os.name == "nt" else ("mac" if _sys.platform == "darwin" else "linux")
+            arch = "x64" if _plat.machine().lower() in ("amd64", "x86_64", "x64") else "aarch64"
+            want = ".zip" if osn == "windows" else ".tar.gz"
+            maj = cls.GHIDRA_JDK_MAJOR
+            cls._emit(log, f"[*] Frage GitHub nach Temurin JDK {maj} ...")
+            try:
+                name, url = cls._gh_latest_asset(
+                    f"adoptium/temurin{maj}-binaries",
+                    lambda n: n.startswith(f"OpenJDK{maj}U-jdk_") and f"_{arch}_" in n and osn in n and "alpine" not in n and n.endswith(want))
+            except Exception as e:
+                cls._emit(log, f"[!] JDK-Release-Abfrage fehlgeschlagen: {e!r}")
+                return None
+            if not url:
+                cls._emit(log, f"[!] Kein Temurin-JDK-{maj}-Asset gefunden.")
+                return None
+            arc = os.path.join(jdk_root, name)
+            if os.path.exists(arc):
+                try:
+                    os.remove(arc)
+                except OSError:
+                    pass
+            cls._emit(log, f"[*] Lade Temurin JDK {maj} herunter ({name}, einmalig fuer Ghidra)...")
+            import tempfile as _tf, shutil as _sh
+            incoming = None
+            try:
+                cls._download_file(url, arc)
+                for stale in glob.glob(os.path.join(jdk_root, ".incoming*")):
+                    _sh.rmtree(stale, ignore_errors=True)
+                incoming = _tf.mkdtemp(prefix=".incoming", dir=jdk_root)
+                if arc.endswith(".zip"):
+                    with zipfile.ZipFile(arc) as z:
+                        z.extractall(incoming)
+                else:
+                    import tarfile
+                    with tarfile.open(arc) as t:
+                        try:
+                            t.extractall(incoming, filter="data")
+                        except TypeError:
+                            t.extractall(incoming)
+                subs = glob.glob(os.path.join(incoming, "jdk*"))
+                if not subs:
+                    raise IOError("JDK-Archiv ohne erwartetes jdk*-Verzeichnis")
+                final = os.path.join(jdk_root, os.path.basename(subs[0]))
+                if os.path.exists(final):
+                    _sh.rmtree(final, ignore_errors=True)
+                os.replace(subs[0], final)
+                _sh.rmtree(incoming, ignore_errors=True); incoming = None
+                os.remove(arc)
+            except Exception as e:
+                try:
+                    if incoming:
+                        _sh.rmtree(incoming, ignore_errors=True)
+                    if os.path.exists(arc):
+                        os.remove(arc)
+                except OSError:
+                    pass
+                cls._emit(log, f"[!] JDK-Download fehlgeschlagen: {e!r}")
+                return None
+            hits = glob.glob(os.path.join(jdk_root, "jdk*", "bin", exe))
+            if hits:
+                cls._emit(log, "[+] JDK 21 erfolgreich eingerichtet.")
+                return os.path.dirname(os.path.dirname(hits[0]))
+            return None
+        finally:
+            cls._ghidra_lock.release()
+
     # ================= NDK / clang (LibForge) =================
     NDK_FALLBACK_VERSION = "r27c"
 

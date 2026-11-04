@@ -28,7 +28,13 @@ class SmaliStudioParser:
             if line.startswith(".method"):
                 sig: str = line.replace(".method ", "")
                 disp: str = SmaliStudioParser.clean_signature(sig)
-                tags: Tuple[str, ...] = ("system_api", sig) if is_system else ("method", sig)
+                _mods = sig.split("(")[0].split()
+                if is_system:
+                    tags: Tuple[str, ...] = ("system_api", sig)
+                elif "native" in _mods:
+                    tags = ("native_method", sig)
+                else:
+                    tags = ("method", sig)
                 results.append({"type": "[M]", "display": disp, "tags": tags, "signature": sig})
             elif line.startswith(".field"):
                 sig: str = line.replace(".field ", "")

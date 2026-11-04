@@ -158,6 +158,7 @@ class FuzzyMatchController:
             self.app.log(f"[+] Patch direkt aus Konflikt-Löser angewendet: {new_patch['file']}")
 
         self.smali_studio.refresh_smali_tree()
+        self.app.persist_active_session()  # T1
         self.view.destroy()
 
 

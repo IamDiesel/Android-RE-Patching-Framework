@@ -21,13 +21,8 @@ class PatchService:
     @staticmethod
     def clean_smali_for_match(text: str) -> str:
         """Bereinigt Smali-Code von Zeilennummern und Kommentaren für einen Strukturvergleich."""
-        lines = text.split("\n")
-        cleaned = []
-        for l in lines:
-            l = l.strip()
-            if not l or l.startswith(".line ") or l.startswith("#"): continue
-            cleaned.append(l)
-        return "\n".join(cleaned)
+        from core.fuzzing_engine import FuzzingEngine
+        return FuzzingEngine._normalize_smali(text)
 
     @classmethod
     def evaluate_smali_patch(cls, patch: Dict[str, Any], ram_cache: List[Tuple[str, str]],

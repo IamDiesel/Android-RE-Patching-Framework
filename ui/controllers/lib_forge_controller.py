@@ -74,11 +74,9 @@ class LibForgeController:
         # Targets deaktiviert -- fuer shared = welche .so injiziert wird, fuer executable
         # = welches Binary ExeDeploy deployt. So kann trotz vieler gleichnamiger
         # Build-Iterationen immer nur EINES aktiv (und damit deploybar) sein.
-        if not lib.active:
-            n = self.mgr.deactivate_same_name(lib)
-            if n:
-                self.app.log(f"[*] LibForge: {n} andere aktive Target(s) mit gleichem Namen deaktiviert.")
-        self.mgr.toggle_active(lib.id, not lib.active)
+        auto = self.mgr.set_active(lib.id, not lib.active)  # Fix 1.9: zentral + exklusiv
+        if auto:
+            self.app.log(f"[*] LibForge: {len(auto)} gleichnamige(s) Target(s) deaktiviert.")
         self.view.refresh_list(select_id=lib.id)
 
     def save_editor(self):
@@ -88,6 +86,7 @@ class LibForgeController:
         self.view.sync_editor_into(lib)
         self.mgr.update(lib)
         self.app.log(f"[*] LibForge: '{lib.name}' gespeichert.")
+        self.view.refresh_list(select_id=lib.id)  # Fix: Liste nach Speichern neu zeichnen (Version/Name/Desc)
 
     # ---------- Compile ----------
     def compile_selected(self):

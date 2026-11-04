@@ -303,6 +303,79 @@ def build_server(ctx, host, port):
         """Collection aufs Geraet pushen (kompiliert + adb push). Gated: file_manager + confirm."""
         return runtime.run(ctx, "frida.push_collection", lambda: tools.frida_push_collection(ctx, ref), _summ(ref=ref), confirm=confirm)
 
+    # ---------------- M: Native Studio (native.*) ----------------
+    @mcp.tool(name="native_targets")
+    def native_targets(apk: Optional[str] = None, abi: str = "arm64-v8a") -> str:
+        """Gepackte/verschluesselte native Libs in einem APK listen (lib/<abi>/*.so)."""
+        return runtime.run(ctx, "native.targets",
+                           lambda: tools.native_targets(ctx, apk, abi), _summ(apk=apk, abi=abi))
+
+    @mcp.tool(name="native_status")
+    def native_status() -> str:
+        """Native-Arbeitsbereich: entschluesselte .dec.so, Index-Cache, gecachtes Ghidra-C."""
+        return runtime.run(ctx, "native.status", lambda: tools.native_status(ctx))
+
+    @mcp.tool(name="native_unpack")
+    def native_unpack(apk: Optional[str] = None, entry: Optional[str] = None,
+                      so_path: Optional[str] = None, smali_root: Optional[str] = None) -> str:
+        """Gepackte Lib via entdecktem Decrypter-Plugin entschluesseln -> .dec.so (lokal, git-ignoriert)."""
+        return runtime.run(ctx, "native.unpack",
+                           lambda: tools.native_unpack(ctx, entry=entry, apk=apk,
+                                                       so_path=so_path, smali_root=smali_root),
+                           _summ(apk=apk, entry=entry, so_path=so_path))
+
+    @mcp.tool(name="native_load")
+    def native_load(path: str) -> str:
+        """ELF-Kurzinfo einer .so (AArch64?, Segmente, Symbole, Entry)."""
+        return runtime.run(ctx, "native.load", lambda: tools.native_load(ctx, path), _summ(path=path))
+
+    @mcp.tool(name="native_index")
+    def native_index(path: str, fast: bool = True) -> str:
+        """XREF/CallGraph-Index bauen/auffrischen (SHA-gegateter Cache)."""
+        return runtime.run(ctx, "native.index", lambda: tools.native_index(ctx, path, fast),
+                           _summ(path=path, fast=fast))
+
+    @mcp.tool(name="native_search")
+    def native_search(path: str, query: str, max_results: int = 100) -> str:
+        """In einer .so suchen: Symbolname (Substring), String (ASCII) oder Adresse."""
+        return runtime.run(ctx, "native.search",
+                           lambda: tools.native_search(ctx, path, query, max_results),
+                           _summ(path=path, query=query))
+
+    @mcp.tool(name="native_xref")
+    def native_xref(path: str, ref: str, max_results: int = 200) -> str:
+        """Eingehende Referenzen auf eine Adresse/ein Symbol (Instruktions-/Reloc-Refs + Caller)."""
+        return runtime.run(ctx, "native.xref",
+                           lambda: tools.native_xref(ctx, path, ref, max_results),
+                           _summ(path=path, ref=ref))
+
+    @mcp.tool(name="native_disasm")
+    def native_disasm(path: str, at: Optional[str] = None, count: int = 48) -> str:
+        """Disassembliert count Instruktionen ab Adresse/Symbol (Default: Entry/erstes Symbol)."""
+        return runtime.run(ctx, "native.disasm",
+                           lambda: tools.native_disasm(ctx, path, at, count),
+                           _summ(path=path, at=at, count=count))
+
+    @mcp.tool(name="native_read_bytes")
+    def native_read_bytes(path: str, addr: Optional[str] = None,
+                          offset: Optional[str] = None, length: int = 64) -> str:
+        """Rohbytes (Hex+ASCII) an virtueller Adresse (addr=0x..) oder Datei-Offset (offset=0x..)."""
+        return runtime.run(ctx, "native.read_bytes",
+                           lambda: tools.native_read_bytes(ctx, path, addr, offset, length),
+                           _summ(path=path, addr=addr, offset=offset, length=length))
+
+    @mcp.tool(name="native_callgraph")
+    def native_callgraph(path: str, func: str) -> str:
+        """Caller/Callees einer Funktion (symbolbasiert; func=Name oder 0xAddr)."""
+        return runtime.run(ctx, "native.callgraph",
+                           lambda: tools.native_callgraph(ctx, path, func), _summ(path=path, func=func))
+
+    @mcp.tool(name="native_decompile")
+    def native_decompile(path: str, func: str) -> str:
+        """Gecachtes Ghidra-C einer Funktion (func=Name/0xAddr); nicht im Cache -> Hinweis: in GUI erzeugen."""
+        return runtime.run(ctx, "native.decompile",
+                           lambda: tools.native_decompile(ctx, path, func), _summ(path=path, func=func))
+
     @mcp.tool(name="device_info")
     def device_info() -> str:
         """adb-State + 3rd-Party-Paketliste (kein Dateizugriff)."""

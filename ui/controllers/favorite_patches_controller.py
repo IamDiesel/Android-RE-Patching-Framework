@@ -114,7 +114,9 @@ class FavoritePatchesController:
             else:
                 failed_patches.append((index, current_patch))
 
-        if success_count > 0: studio.refresh_smali_tree()
+        if success_count > 0:
+            studio.refresh_smali_tree()
+            studio.app.persist_active_session()  # T1
 
         if not failed_patches:
             messagebox.showinfo("Batch Abgeschlossen", f"Alle {success_count} Patches erfolgreich angewendet!", parent=self.view)

@@ -63,4 +63,18 @@ VERSIONIERUNG (Libs, Patch-Favoriten & Frida) — PFLICHT:\n- Jede Lib und jeder
   (smali.*) geht trotzdem.
 - smali.search hat ein Zeitbudget; bei "Zeitbudget erreicht" praeziser suchen.
 - Alles wird auditiert: mcp.audit_tail.
+
+8. NATIVE STUDIO (native.*) — STATISCHE Analyse nativer AArch64-Libs (.so):
+   Voraussetzung: eine ENTSCHLUESSELTE .so im Analyse-Arbeitsbereich.
+   - native.targets: gepackte Libs im APK finden (APK-Pfad aus workspace.status ->
+     APP_SOURCE_DIR, z. B. source/<pkg>/*.apk).
+   - native.unpack (P): entschluesseln via entdecktem Plugin (apk=<apk> entry=<lib/..> ODER
+     so_path=<gepackte .so>) -> out_path der .dec.so.
+   - native.status: was ist schon entschluesselt/indiziert/dekompiliert (keine Doppelarbeit).
+   Analyse mit path=<out_path einer .dec.so>: native.load (ELF-Info), native.index (XREF/
+   CallGraph, einmalig teuer, danach Cache), native.search (Symbol/String/Adresse),
+   native.xref (wer referenziert 0xADDR), native.disasm (ab Symbol/Adresse), native.read_bytes
+   (vtable/.rodata/Zeiger), native.callgraph (Caller/Callees). native.decompile liefert NUR
+   GECACHTES Ghidra-C; fehlt es -> in der GUI '🧊 C' erzeugen (langer Ghidra-Lauf, bewusst
+   nicht ueber MCP). native.* ist rein statisch; Laufzeit/Hooking deckt frida.* ab.
 """
