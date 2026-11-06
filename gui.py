@@ -271,22 +271,49 @@ class ReFrameworkApp(tk.Tk):
         nb = self.console_notebook
         self._console_visible = True
         # Schmaler Platzhalter fuer den eingeklappten Zustand (haelt die Button-Zeile sichtbar).
-        spacer = ttk.Frame(host, height=26)
+        spacer = ttk.Frame(host, height=16)
+        try:
+            ttk.Style().configure("Slim.TButton", padding=(3, 0), font=("Segoe UI", 7))
+        except Exception:
+            pass
 
         def _toggle_vis():
             if getattr(self, "_console_visible", True):
+                try:
+                    self._console_sash_prev = self.root_paned.sashpos(0)
+                except Exception:
+                    self._console_sash_prev = None
                 nb.pack_forget(); spacer.pack(side="top", fill="x")
-                btn_vis.config(text="▸ einblenden"); self._console_visible = False
+                btn_vis.config(text="🖥 Konsole ▸"); self._console_visible = False
+
+                def _shrink():
+                    try:
+                        h = self.root_paned.winfo_height()
+                        if h > 60:
+                            self.root_paned.sashpos(0, h - 22)
+                    except Exception:
+                        pass
+                self.root_paned.after_idle(_shrink)
             else:
                 spacer.pack_forget(); nb.pack(fill="both", expand=True, padx=5, pady=5)
                 btn_vis.config(text="▾ ausblenden"); self._console_visible = True
+                prev = getattr(self, "_console_sash_prev", None)
+
+                def _restore():
+                    try:
+                        h = self.root_paned.winfo_height()
+                        pos = prev if (prev and prev > 0) else (h * 6 // 7)
+                        self.root_paned.sashpos(0, pos)
+                    except Exception:
+                        pass
+                self.root_paned.after_idle(_restore)
 
         # Buttons in EINER Zeile mit den Tabs: Overlay oben rechts ueber dem Tab-Streifen.
         btns = ttk.Frame(host)
-        btn_dock = ttk.Button(btns, text="⧉ Abdocken", width=11)
+        btn_dock = ttk.Button(btns, text="⧉ Abdocken", width=10, style="Slim.TButton")
         btn_dock.config(command=lambda: self.workspace_tab.toggle_dock(
             host, "\U0001f5a5️ Konsole & Live-Logging", host, self.root_paned, 1, btn_dock))
-        btn_vis = ttk.Button(btns, text="▾ ausblenden", width=11, command=_toggle_vis)
+        btn_vis = ttk.Button(btns, text="▾ ausblenden", width=12, command=_toggle_vis, style="Slim.TButton")
         btn_dock.pack(side="left", padx=2)
         btn_vis.pack(side="left", padx=2)
         btns.place(relx=1.0, x=-6, y=4, anchor="ne")

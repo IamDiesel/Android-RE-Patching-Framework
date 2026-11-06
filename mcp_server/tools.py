@@ -2122,7 +2122,7 @@ def native_callgraph(ctx, path, func):
 
 
 # ---- M.11 native.decompile (O, nur Cache) -----------------------------------
-def native_decompile(ctx, path, func):
+def native_decompile(ctx, path, func, run=False):
     from core.native import unpack as _u
     try:
         rp, img = _native_load_image(ctx, path)
@@ -2148,6 +2148,19 @@ def native_decompile(ctx, path, func):
             return {"ok": False, "hinweis": f"C-Cache nicht lesbar: {e!r}"}
         return {"ok": True, "path": rp, "funktion": name or func,
                 "addr": f"0x{addr:x}", "cached": True, "c": c}
+    if run:
+        try:
+            from services.ghidra_service import GhidraService
+            import threading as _th
+            _gsvc = GhidraService(getattr(ctx, "cfg", None), lambda *a, **k: None)
+            _th.Thread(target=lambda: _gsvc.decompile(rp, addr, ws), daemon=True).start()
+            return {"ok": False, "cached": False, "why": "started", "path": rp,
+                    "funktion": name or func, "addr": f"0x{addr:x}",
+                    "hinweis": ("Ghidra-Decompile im Hintergrund gestartet (Erstlauf analysiert die ganze "
+                                "Lib, dauert). Bei der naechsten native.decompile-Abfrage (ohne run) ist das C da.")}
+        except Exception as _e:
+            return {"ok": False, "cached": False, "why": "ghidra", "path": rp,
+                    "funktion": name or func, "addr": f"0x{addr:x}", "hinweis": f"Ghidra nicht startbar: {_e!r}"}
     return {
         "ok": False, "cached": False, "path": rp,
         "funktion": name or func, "addr": f"0x{addr:x}",
@@ -2156,3 +2169,775 @@ def native_decompile(ctx, path, func):
                     "(liest nur Cache) — den langen Ghidra-Lauf in der GUI ausloesen: Native "
                     "Studio -> Funktion waehlen -> '🧊 C'. Danach liefert dieses Tool das C sofort."),
     }
+
+
+# ---- M.12 native.functions (O) ---------------------------------------------
+def native_functions(ctx, path, max_results=500, named_only=False):
+    """Funktionsanfaenge: benannte Dynsym-Funktionen (STT_FUNC/IFUNC) + per Index
+    entdeckte bl-Ziele (sub_). O."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    named = [(sy.value, nm) for nm, sy in img.dynsyms.items()
+             if sy.value and (sy.info & 0xf) in (2, 10)]
+    named.sort()
+    subs = []
+    if not named_only:
+        try:
+            idx = _native_build_index(ctx, rp, img, fast=True)
+            namedset = {a for a, _ in named}
+            starts = set()
+            for src, mnem, tgt in idx.edges:
+                if mnem.split(".", 1)[0] == "bl":
+                    starts.add(tgt)
+            subs = sorted(a for a in starts if a and a not in namedset)
+        except Exception:
+            subs = []
+    funcs = [{"addr": f"0x{a:x}", "name": nm} for a, nm in named[:max_results]]
+    extra = max_results - len(funcs)
+    if extra > 0:
+        funcs += [{"addr": f"0x{a:x}", "name": f"sub_{a:x}"} for a in subs[:extra]]
+    return {"ok": True, "path": rp, "benannt": len(named), "sub_entdeckt": len(subs),
+            "funktionen": funcs,
+            "hinweis": "benannte STT_FUNC + bl-Ziele (sub_). named_only=True unterdrueckt sub_."}
+
+
+# ---- M.13 native.strings (O) -----------------------------------------------
+def native_strings(ctx, path, query=None, min_len=4, max_results=300):
+    """ASCII-Strings aus der .so (Krypto-/Algo-Namen, /proc, ptrace ...). O."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    import re as _re
+    data = img.data
+    pat = _re.compile(rb"[\x20-\x7e]{%d,}" % int(min_len))
+    q = (query or "").lower().encode("utf-8", "ignore")
+    out = []
+    for m in pat.finditer(data):
+        s = m.group(0)
+        if q and q not in s.lower():
+            continue
+        off = m.start()
+        v = _native_o2v(img, off)
+        out.append({"off": f"0x{off:x}", "vaddr": (f"0x{v:x}" if v is not None else None),
+                    "s": s.decode("latin-1")})
+        if len(out) >= max_results:
+            break
+    return {"ok": True, "path": rp, "treffer": len(out), "strings": out,
+            "hinweis": f"min_len={min_len}" + (f", filter={query!r}" if query else "")}
+
+
+# ---- M.14 native.run (O) — Emulation ---------------------------------------
+def native_run(ctx, path, entry, args=None, sp=None, maxins=2000000, stubs=None, read=None, relocs=False):
+    """Emuliert eine Funktion (run-to-completion) -> Register/ret/Out-Puffer. O.
+    args: Liste aus int | '0x..' | {'ptr':hex}|{'buf':n}|{'int':v}.
+    stubs: [{'at':addr|sym,'ret':int}]. read: [{'addr':..,'len':..}]."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not getattr(img, "is_aarch64", False):
+        return {"ok": False, "hinweis": "kein AArch64-ELF (oder gepackt) — erst native.unpack."}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, entry)
+    if addr is None:
+        return {"ok": False, "hinweis": f"entry nicht aufloesbar: {entry!r}"}
+    try:
+        from services.native_emu_service import NativeEmuService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Emu-Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    try:
+        svc.load_image(eng, img, apply_relocs=relocs)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Laden in Engine: {e!r}"}
+    try:
+        if stubs:
+            svc.install_stubs(eng, stubs, image=img)
+        res = svc.run(eng, addr, args or [], None, sp, int(maxins), image=img)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Run-Fehler: {e!r}"}
+    if not res.get("ok"):
+        base = {"ok": False, "path": rp, "entry": f"0x{addr:x}"}
+        base.update({k: v for k, v in res.items() if k != "ok"})
+        return base
+    xs = res.get("x", [])
+    reads = {}
+    for rd in (read or []):
+        try:
+            ra = _native_resolve_addr(img, idx, rd.get("addr"))
+            if ra is not None:
+                reads[f"0x{ra:x}"] = svc.read_mem(eng, ra, int(rd.get("len", 16))).hex()
+        except Exception:
+            pass
+    return {
+        "ok": True, "path": rp, "entry": f"0x{addr:x}", "ret": f"0x{res['ret']:x}",
+        "x0_7": [f"0x{xs[i]:x}" for i in range(min(8, len(xs)))],
+        "sp": f"0x{res.get('sp', 0):x}", "lr": f"0x{res.get('lr', 0):x}",
+        "flags": res.get("flags"), "out": res.get("out"), "read": (reads or None),
+        "hinweis": ("Emulation (arm64mini). Komplexe WB-/Krypto-Funktionen brauchen ggf. Stubs/Snapshot "
+                    "(GUI Run-Panel). Unbekannte Instruktion -> why=unknown_instr mit pc/raw."),
+    }
+
+
+# ---- M.15 native.run_break (O) — Emulation bis Breakpoint --------------------
+def native_run_break(ctx, path, entry, args=None, sp=None, maxins=2000000,
+                     stubs=None, breakpoints=None, read=None, relocs=False):
+    """Emuliert eine Funktion und haelt VOR einer Breakpoint-Adresse an (nur an
+    Basisblock-Eintritts-PCs, z. B. Funktions-/Sprungziele). O.
+    breakpoints: Liste aus addr|'0x..'|Symbol. Rueckgabe: paused=True + pc/Register,
+    sonst run-to-completion (ret/Out-Puffer wie native.run)."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not getattr(img, "is_aarch64", False):
+        return {"ok": False, "hinweis": "kein AArch64-ELF (oder gepackt) — erst native.unpack."}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, entry)
+    if addr is None:
+        return {"ok": False, "hinweis": f"entry nicht aufloesbar: {entry!r}"}
+    bps = []
+    for b in (breakpoints or []):
+        ra = _native_resolve_addr(img, idx, b)
+        if ra is not None:
+            bps.append(ra)
+    try:
+        from services.native_emu_service import NativeEmuService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Emu-Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    try:
+        svc.load_image(eng, img, apply_relocs=relocs)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Laden in Engine: {e!r}"}
+    try:
+        if stubs:
+            svc.install_stubs(eng, stubs, image=img)
+        res = svc.run_with_breaks(eng, addr, args or [], None, sp, int(maxins),
+                                  breakpoints=bps, image=img)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Run-Fehler: {e!r}"}
+    if not res.get("ok"):
+        base = {"ok": False, "path": rp, "entry": f"0x{addr:x}"}
+        base.update({k: v for k, v in res.items() if k != "ok"})
+        return base
+    xs = res.get("x", [])
+    reads = {}
+    for rd in (read or []):
+        try:
+            ra = _native_resolve_addr(img, idx, rd.get("addr"))
+            if ra is not None:
+                reads[f"0x{ra:x}"] = svc.read_mem(eng, ra, int(rd.get("len", 16))).hex()
+        except Exception:
+            pass
+    base = {
+        "ok": True, "path": rp, "entry": f"0x{addr:x}", "paused": bool(res.get("paused")),
+        "breakpoints": [f"0x{p:x}" for p in bps],
+        "x0_7": [f"0x{xs[i]:x}" for i in range(min(8, len(xs)))],
+        "sp": f"0x{res.get('sp', 0):x}", "lr": f"0x{res.get('lr', 0):x}",
+        "pc": f"0x{res.get('pc', 0):x}", "flags": res.get("flags"), "read": (reads or None),
+    }
+    if res.get("paused"):
+        base["bp"] = f"0x{res.get('bp', 0):x}"
+        sid = _session_put({"svc": svc, "eng": eng, "img": img, "rp": rp})
+        base["session"] = sid
+        base["hinweis"] = (f"An Breakpoint angehalten (Basisblock-Eintritt). session={sid} "
+                           "fuer native.step / native.resume.")
+    else:
+        base["ret"] = f"0x{res.get('ret', 0):x}"
+        base["out"] = res.get("out")
+        base["hinweis"] = "Kein Breakpoint getroffen -> run-to-completion."
+    return base
+
+
+# ---- M.16 native.lift (O) — Block->Python-Lifter ----------------------------
+def native_lift(ctx, path, entry, mode="block", max_blocks=64, relocs=False):
+    """Hebt einen Basisblock (mode='block') oder per BFS die erreichbaren Bloecke einer
+    Funktion (mode='function') nach Python (bbsrc-Lifter). O. entry=addr|'0x..'|Symbol."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not getattr(img, "is_aarch64", False):
+        return {"ok": False, "hinweis": "kein AArch64-ELF (oder gepackt) — erst native.unpack."}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, entry)
+    if addr is None:
+        return {"ok": False, "hinweis": f"entry nicht aufloesbar: {entry!r}"}
+    try:
+        from services.native_emu_service import NativeEmuService
+        from services.native_lift_service import NativeLiftService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Lift-Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False); eng = svc.new_engine()
+    try:
+        svc.load_image(eng, img, apply_relocs=relocs)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Laden in Engine: {e!r}"}
+    lift = NativeLiftService()
+    try:
+        if str(mode) == "function":
+            res = lift.lift_function(eng, addr, int(max_blocks))
+        else:
+            res = lift.lift_block(eng, addr)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Lift-Fehler: {e!r}"}
+    res["path"] = rp
+    res.setdefault("hinweis", "Block->Python (arm64mini-bbsrc). Nachfolger intra-funktional "
+                   "(Callees nicht verfolgt); dynamische Ziele (br/blr/ret) enden den Pfad.")
+    return res
+
+
+# ---- M.17 native.verify (O) — Bit-Exakt-Regression --------------------------
+def native_verify(ctx, path, entry, args=None, sp=None, maxins=2000000, stubs=None,
+                  name=None, update=False, read=None, relocs=False):
+    """Emuliert und prueft gegen einen gespeicherten Golden-Zustand (ret/Register/Out).
+    update=True (oder noch kein Golden) speichert den aktuellen Lauf als Golden. O."""
+    if not name:
+        return {"ok": False, "hinweis": "name= (Golden-Fallname) erforderlich."}
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not getattr(img, "is_aarch64", False):
+        return {"ok": False, "hinweis": "kein AArch64-ELF (oder gepackt) — erst native.unpack."}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, entry)
+    if addr is None:
+        return {"ok": False, "hinweis": f"entry nicht aufloesbar: {entry!r}"}
+    try:
+        from services.native_emu_service import NativeEmuService
+        from services.native_verify_service import NativeVerifyService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False); eng = svc.new_engine()
+    try:
+        svc.load_image(eng, img, apply_relocs=relocs)
+        if stubs:
+            svc.install_stubs(eng, stubs, image=img)
+        res = svc.run(eng, addr, args or [], None, sp, int(maxins), image=img)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Run-Fehler: {e!r}"}
+    if not res.get("ok"):
+        base = {"ok": False, "path": rp, "entry": f"0x{addr:x}"}
+        base.update({k: v for k, v in res.items() if k != "ok"})
+        return base
+    store = os.path.join(os.path.dirname(rp), "verify_golden.json")
+    vs = NativeVerifyService(store)
+    g = vs.get(name)
+    if update or g is None:
+        vs.set(name, vs.reduce(res), meta={"entry": f"0x{addr:x}", "args": args})
+        return {"ok": True, "path": rp, "entry": f"0x{addr:x}", "name": name, "stored": True,
+                "fields": sorted(vs.reduce(res).keys()),
+                "hinweis": ("Golden neu gespeichert." if g is None else "Golden aktualisiert (update=True).")
+                + f" ret=0x{res['ret']:x}"}
+    cmp = vs.compare(g, res)
+    return {"ok": True, "path": rp, "entry": f"0x{addr:x}", "name": name,
+            "match": cmp["match"], "diffs": (cmp["diffs"] or None), "ret": f"0x{res['ret']:x}",
+            "hinweis": ("Bit-Exakt gegen Golden." if cmp["match"]
+                        else f"ABWEICHUNG in {len(cmp['diffs'])} Feld(ern) — siehe diffs.")}
+
+
+# ---- M.18/19 Session-Zustand fuer interaktives Step/Resume ------------------
+_NATIVE_SESSIONS = {}
+_NATIVE_SESSION_SEQ = [0]
+
+
+def _session_put(d):
+    _NATIVE_SESSION_SEQ[0] += 1
+    sid = f"s{_NATIVE_SESSION_SEQ[0]}"
+    _NATIVE_SESSIONS[sid] = d
+    while len(_NATIVE_SESSIONS) > 8:                 # nur die juengsten 8 Sessions halten
+        old = min(_NATIVE_SESSIONS, key=lambda k: int(k[1:]))
+        _NATIVE_SESSIONS.pop(old, None)
+    return sid
+
+
+def _fmt_native_state(res, session):
+    xs = res.get("x", [])
+    out = {"ok": res.get("ok", True), "session": session}
+    if not res.get("ok"):
+        out.update({k: v for k, v in res.items() if k != "ok"})
+        return out
+    for k in ("paused", "done"):
+        if k in res:
+            out[k] = res[k]
+    out["pc"] = f"0x{res.get('pc', 0):x}"
+    out["x0_7"] = [f"0x{xs[i]:x}" for i in range(min(8, len(xs)))]
+    out["sp"] = f"0x{res.get('sp', 0):x}"
+    out["lr"] = f"0x{res.get('lr', 0):x}"
+    out["flags"] = res.get("flags")
+    if isinstance(res.get("bp"), int):
+        out["bp"] = f"0x{res['bp']:x}"
+    if isinstance(res.get("ret"), int):
+        out["ret"] = f"0x{res['ret']:x}"
+    if res.get("done"):
+        _NATIVE_SESSIONS.pop(session, None)
+        out["session_ended"] = True
+    return out
+
+
+def native_step(ctx, session):
+    """Ein Basisblock-Schritt in einer pausierten Session (session= von native.run_break). O."""
+    s = _NATIVE_SESSIONS.get(session)
+    if not s:
+        return {"ok": False, "hinweis": f"session unbekannt/abgelaufen: {session!r}"}
+    try:
+        res = s["svc"].step(s["eng"])
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Step-Fehler: {e!r}"}
+    return _fmt_native_state(res, session)
+
+
+def native_resume(ctx, session, breakpoints=None, maxins=2000000):
+    """Fortsetzen bis zum naechsten Breakpoint oder Ende in einer pausierten Session. O."""
+    s = _NATIVE_SESSIONS.get(session)
+    if not s:
+        return {"ok": False, "hinweis": f"session unbekannt/abgelaufen: {session!r}"}
+    bps = []
+    for b in (breakpoints or []):
+        ra = _native_resolve_addr(s.get("img"), None, b)
+        if ra is not None:
+            bps.append(ra)
+    try:
+        res = s["svc"].resume(s["eng"], breakpoints=bps, maxins=int(maxins), image=s.get("img"))
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Resume-Fehler: {e!r}"}
+    return _fmt_native_state(res, session)
+
+
+# ---- M.20 native.rebase (O) — Offsets ueber Lib-Versionen --------------------
+def native_rebase(ctx, path_old, path_new, target=None, mode="auto", limit=40):
+    """Adressen/Symbole von path_old auf path_new abbilden (dynsym-Name-Match).
+    target=Symbol|'0x..' -> Mapping; mode='diff' oder target leer -> Versions-Diff. O."""
+    try:
+        rpo, imo = _native_load_image(ctx, path_old)
+        rpn, imn = _native_load_image(ctx, path_new)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        from services.native_rebase_service import NativeRebaseService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    svc = NativeRebaseService()
+    if mode == "diff" or not target:
+        d = svc.diff(imo, imn, int(limit))
+        d.update({"old": rpo, "new": rpn})
+        return d
+    t = str(target).strip()
+    if t.lower().startswith("0x") or t.isdigit():
+        r = svc.map_address(imo, imn, int(t, 0))
+    else:
+        r = svc.map_symbol(imo, imn, t)
+    r.update({"old": rpo, "new": rpn})
+    for k in ("old_addr", "new_addr", "old_func", "new_func"):
+        if isinstance(r.get(k), int):
+            r[k] = f"0x{r[k]:x}"
+    return r
+
+
+# ---- M.21 native.coverage (O) — Coverage/Unknown-Report ---------------------
+def native_coverage(ctx, path, entry, args=None, sp=None, maxins=2000000, stubs=None, top=25, relocs=False):
+    """Emuliert und berichtet Coverage (Mnemonic-Zaehlung), Slow-Pfad-Mnemonics
+    (Kandidaten fuer schnellen Emit) und unbekannte Instruktionen (pc/raw). O."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not getattr(img, "is_aarch64", False):
+        return {"ok": False, "hinweis": "kein AArch64-ELF (oder gepackt) — erst native.unpack."}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, entry)
+    if addr is None:
+        return {"ok": False, "hinweis": f"entry nicht aufloesbar: {entry!r}"}
+    try:
+        from services.native_emu_service import NativeEmuService
+        from services.native_coverage_service import NativeCoverageService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False); eng = svc.new_engine()
+    try:
+        svc.load_image(eng, img, apply_relocs=relocs)
+        if stubs:
+            svc.install_stubs(eng, stubs, image=img)
+        cov = NativeCoverageService().run_coverage(eng, addr, args or [], sp, int(maxins), image=img)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Coverage-Fehler: {e!r}"}
+    mnem = cov.get("mnemonics", {})
+    top_m = sorted(mnem.items(), key=lambda kv: (-kv[1], kv[0]))[:int(top)]
+    slow = cov.get("slow_path", {})
+    return {
+        "ok": True, "path": rp, "entry": f"0x{addr:x}", "ran_ok": cov.get("ran_ok"),
+        "blocks_reached": cov.get("blocks_reached"), "instr_total": cov.get("instr_total"),
+        "distinct_mnemonics": len(mnem),
+        "top_mnemonics": [{"m": m, "n": n} for m, n in top_m],
+        "slow_path": [{"m": m, "n": n} for m, n in sorted(slow.items(), key=lambda kv: (-kv[1], kv[0]))],
+        "ret": (f"0x{cov['ret']:x}" if cov.get("ret") is not None else None),
+        "unknown": cov.get("unknown"), "why": cov.get("why"),
+        "hinweis": "slow_path = Mnemonics ohne schnellen Emit (Kandidaten); unknown = harte Luecke (pc/raw).",
+    }
+
+
+# ---- M.22 native.snapshot (P) — Zustand speichern/laden ---------------------
+def native_snapshot(ctx, path, entry, op="save", out=None, load=None,
+                    args=None, sp=None, maxins=2000000, stubs=None, relocs=False):
+    """op='save': ab entry ausfuehren und Zustand (Mem+Register) als .pkl.xz speichern.
+    op='load': Snapshot in eine frische Engine laden und ab entry ausfuehren. P (save schreibt Datei).
+    out/load relativ -> neben der .so (sha_dir); absolut wird uebernommen."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    if not getattr(img, "is_aarch64", False):
+        return {"ok": False, "hinweis": "kein AArch64-ELF (oder gepackt) — erst native.unpack."}
+    idx = None
+    try:
+        idx = _native_build_index(ctx, rp, img, fast=True)
+    except Exception:
+        pass
+    addr = _native_resolve_addr(img, idx, entry)
+    if addr is None:
+        return {"ok": False, "hinweis": f"entry nicht aufloesbar: {entry!r}"}
+    try:
+        from services.native_emu_service import NativeEmuService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False); eng = svc.new_engine()
+    try:
+        svc.load_image(eng, img, apply_relocs=relocs)
+        if stubs:
+            svc.install_stubs(eng, stubs, image=img)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Laden in Engine: {e!r}"}
+    base_dir = os.path.dirname(rp)
+
+    if str(op) == "load":
+        if not load:
+            return {"ok": False, "hinweis": "op='load' braucht load=<snapshot.pkl.xz>"}
+        lp = load if os.path.isabs(load) else os.path.join(base_dir, load)
+        if not os.path.isfile(lp):
+            return {"ok": False, "hinweis": f"Snapshot nicht gefunden: {lp}"}
+        try:
+            svc.load_snapshot(eng, lp)
+        except Exception as e:
+            return {"ok": False, "hinweis": f"Snapshot laden: {e!r}"}
+        res = svc.run(eng, addr, args or [], None, sp, int(maxins), image=img)
+        if not res.get("ok"):
+            b = {"ok": False, "path": rp, "entry": f"0x{addr:x}", "loaded": lp}
+            b.update({k: v for k, v in res.items() if k != "ok"}); return b
+        return {"ok": True, "path": rp, "entry": f"0x{addr:x}", "loaded": lp,
+                "ret": f"0x{res['ret']:x}", "hinweis": "Snapshot geladen, dann ab entry ausgefuehrt."}
+
+    # op == 'save'
+    res = svc.run(eng, addr, args or [], None, sp, int(maxins), image=img)
+    if not res.get("ok"):
+        b = {"ok": False, "path": rp, "entry": f"0x{addr:x}"}
+        b.update({k: v for k, v in res.items() if k != "ok"}); return b
+    outp = out if (out and os.path.isabs(out)) else os.path.join(base_dir, out or f"snap_0x{addr:x}.pkl.xz")
+    try:
+        svc.save_snapshot(eng, outp)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Snapshot speichern: {e!r}"}
+    return {"ok": True, "path": rp, "entry": f"0x{addr:x}", "saved": outp,
+            "ret": f"0x{res['ret']:x}", "hinweis": "Zustand nach dem Lauf gespeichert (Mem+Register, lzma)."}
+
+
+# ---- M.23 native.resolveptr (O) — Reloc/Zeiger statisch aufloesen -----------
+def native_resolveptr(ctx, path, addr=None, around=None, radius=64):
+    """Loest einen Reloc-Slot auf (addr=) oder listet Relocs um eine Adresse (around=). O.
+    RELATIVE-Reloc -> target=addend = echter Zeiger (statisch in der Datei NULL)."""
+    try:
+        rp, img = _native_load_image(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        from services.native_reloc_service import NativeRelocService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    svc = NativeRelocService()
+    if around is not None:
+        r = svc.around(img, around, int(radius))
+        return {"ok": True, "path": rp, "addr": f"0x{r['addr']:x}", "count": r["count"],
+                "relocs": [{"site": f"0x{x['site']:x}", "target": f"0x{x['target']:x}"} for x in r["relocs"]],
+                "hinweis": "Relocs (site -> target) im Umkreis."}
+    if addr is not None:
+        r = svc.resolve(img, addr)
+        return {"ok": r["ok"], "path": rp, "addr": f"0x{r['addr']:x}",
+                "target": (f"0x{r['target']:x}" if r["target"] is not None else None),
+                "hinweis": ("Reloc-Ziel (RELATIVE=addend)." if r["ok"]
+                            else "Keine Reloc an dieser Adresse (kein durch Reloc gefuellter Zeiger).")}
+    return {"ok": True, "path": rp, "reloc_count": svc.count(img),
+            "hinweis": "addr=0x.. zum Aufloesen oder around=0x.. (+radius) zum Listen."}
+
+
+# ---- M.xx native.dbg_* (O) — geteilte Debug-Sitzung GUI<->KI --------------------
+_DBG_SESSION_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets", "probe", "out", "dbg")
+
+
+def _dbg_folder(folder):
+    return folder or _DBG_SESSION_FOLDER
+
+
+def native_dbg_state(ctx, folder=None):
+    """Geteilte Debug-Sitzung ansehen (read-only). O. In der GUI vorher 🔗 Sync."""
+    try:
+        from services.native_debug_session_service import NativeDebugSessionService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    pk = NativeDebugSessionService().peek(_dbg_folder(folder))
+    meta = pk.get("meta")
+    if not meta:
+        return {"ok": False, "hinweis": f"keine Sitzung in {_dbg_folder(folder)} — in der GUI erst 🔗 Sync."}
+    tr = pk.get("trace") or []
+    return {"ok": True, "folder": _dbg_folder(folder),
+            "pc": f"0x{int(meta.get('pc', 0)):x}", "seq": meta.get("seq"), "writer": meta.get("writer"),
+            "entry": meta.get("entry"), "relocs": meta.get("relocs"), "mode": meta.get("mode"),
+            "flags": meta.get("flags"), "ts": meta.get("ts"),
+            "bps": [f"0x{int(b):x}" for b in (meta.get("bps") or [])],
+            "trace_len": len(tr), "trace_tail": [e.get("pc_hex") for e in tr[-10:]]}
+
+
+def native_dbg_lift(ctx, folder=None):
+    """Geteilte Debug-Sitzung laden und den gelaufenen Pfad nach Python liften (read-only). O."""
+    try:
+        from services.native_emu_service import NativeEmuService
+        from services.native_debug_session_service import NativeDebugSessionService
+        from services.native_trace_decompile_service import NativeTraceDecompileService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    ld = NativeDebugSessionService().load(eng, _dbg_folder(folder))
+    if not ld.get("ok"):
+        return {"ok": False, "hinweis": "keine Sitzung — in der GUI erst 🔗 Sync."}
+    lr = NativeTraceDecompileService().lift_to_function(eng)
+    if not lr.get("ok"):
+        return {"ok": False, "why": lr.get("why"), "residual": lr.get("residual"),
+                "hinweis": "Lift unvollstaendig."}
+    return {"ok": True, "entry": lr.get("entry"), "visits": lr.get("visits"),
+            "unique": lr.get("unique"), "pc": ld.get("pc"),
+            "seq": (ld.get("meta") or {}).get("seq"), "source": lr.get("source")}
+
+
+def _dbg_open(folder):
+    """Geteilte Sitzung in eine frische Engine laden. -> (sess, svc, eng, base_seq, meta) oder (None,...)."""
+    from services.native_emu_service import NativeEmuService
+    from services.native_debug_session_service import NativeDebugSessionService
+    sess = NativeDebugSessionService()
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    ld = sess.load(eng, _dbg_folder(folder))
+    if not ld.get("ok"):
+        return None, None, None, None, None
+    meta = dict(ld.get("meta") or {})
+    return sess, svc, eng, int(meta.get("seq", 0) or 0), meta
+
+
+def native_dbg_step(ctx, folder=None, mode="block", n=1):
+    """Geteilte Debug-Sitzung n Schritte weiter + zurueckschreiben (writer=ki). G: dbg_write."""
+    try:
+        from services.native_trace_service import NativeTraceService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    sess, svc, eng, base, meta = _dbg_open(folder)
+    if sess is None:
+        return {"ok": False, "hinweis": "keine Sitzung — in der GUI erst ⬆ An KI."}
+    tr = NativeTraceService(publish=False)
+    r = None
+    for _ in range(max(1, min(int(n), 2000))):
+        r = (tr.step_insn if mode == "insn" else tr.step_block)(eng)
+        if not r.get("ok") or r.get("done"):
+            break
+    sv = sess.save(eng, _dbg_folder(folder), meta=meta, writer="ki", base_seq=base)
+    if not sv.get("ok") and sv.get("why") == "conflict":
+        return {"ok": False, "why": "conflict",
+                "hinweis": f"GUI ist weiter (Datei seq {sv['file_seq']}) — NICHT ueberschrieben."}
+    d = svc.snapshot_regs(eng)
+    return {"ok": True, "pc": (r or {}).get("pc_hex"), "done": bool((r or {}).get("done")),
+            "x0": f"0x{d['x'][0]:x}", "seq": sv.get("seq"),
+            "trace_len": len(getattr(eng, "_trace", []) or [])}
+
+
+def native_dbg_resume(ctx, folder=None, budget=4000, mode=None):
+    """Geteilte Debug-Sitzung bis Breakpoint/Budget fortsetzen + zurueckschreiben. G: dbg_write."""
+    try:
+        from services.native_trace_service import NativeTraceService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    sess, svc, eng, base, meta = _dbg_open(folder)
+    if sess is None:
+        return {"ok": False, "hinweis": "keine Sitzung — in der GUI erst ⬆ An KI."}
+    bps = []
+    for b in (meta.get("bps") or []):
+        try:
+            bps.append(int(b) if isinstance(b, int) else int(str(b), 0))
+        except Exception:
+            pass
+    m = mode or ("insn" if bps else "block")
+    tr = NativeTraceService(publish=False)
+    r = tr.resume(eng, breakpoints=bps, maxins=int(budget), mode=m)
+    sv = sess.save(eng, _dbg_folder(folder), meta=meta, writer="ki", base_seq=base)
+    if not sv.get("ok") and sv.get("why") == "conflict":
+        return {"ok": False, "why": "conflict",
+                "hinweis": f"GUI ist weiter (Datei seq {sv['file_seq']}) — NICHT ueberschrieben."}
+    stop = ("breakpoint" if r.get("paused") else "done" if r.get("done")
+            else "budget" if r.get("budget") else "?")
+    return {"ok": True, "stop": stop, "pc": r.get("pc_hex"),
+            "bp": (f"0x{r['bp']:x}" if r.get("bp") else None),
+            "steps": r.get("steps"), "seq": sv.get("seq")}
+
+
+def _jni_lib_path():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "tools", "lib", "libdb0c.so")
+
+
+def native_jni_run(ctx, budget=400000, stop_at_rasp=True, lib=None):
+    """JNI_OnLoad mit Fake-JNIEnv + Reloc + Import-Wiring emulieren (read-only Analyse).
+    Fortschritt/Stop + JNI-Call-Map; stop_at_rasp haelt an den 4 RASP-Routinen an."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+    img = ElfImage.from_file(path)
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    nrel = svc.load_image(eng, img, apply_relocs=True)
+    ffi = NativeFfiService(publish=False)
+    w = ffi.wire_imports(eng, img)
+    jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+    entry = svc.resolve_entry("JNI_OnLoad", img)
+    tr = NativeTraceService(publish=False)
+    tr.begin(eng, entry, args=[Jm.VM_OBJ], faithful=True)
+    bps = [0x8e158, 0x3e7d8, 0x37cd4, 0x37b88] if stop_at_rasp else []
+    r = tr.run(eng, breakpoints=bps, maxins=int(budget), mode="block")
+    globals()["_LAST_JNI"] = jni
+    stop = ("rasp_bp" if r.get("paused") else "done" if r.get("done")
+            else "budget" if r.get("budget") else "error" if r.get("why") == "error" else "?")
+    head = []
+    for c in jni.get_calls():
+        if c.get("fn") == "FindClass" or c.get("fn") == "RegisterNatives" or "method" in c:
+            head.append({k: c.get(k) for k in ("fn", "class", "method", "sig", "category",
+                                               "proposed", "final", "resolved", "count")
+                         if c.get(k) is not None})
+        if len(head) >= 40:
+            break
+    return {"ok": True, "stop": stop, "pc": r.get("pc_hex"),
+            "bp": (f"0x{r['bp']:x}" if r.get("bp") else None), "steps": r.get("steps"),
+            "trace_len": len(tr.get_trace(eng)), "relocs": nrel, "imports": w.get("count"),
+            "jni": jni.summary(), "natives": jni.get_natives()[:50], "calls_head": head,
+            "error": r.get("error")}
+
+
+def native_jni_log(ctx, limit=100):
+    """Letzten native.jni_run auslesen: Call-Log + RegisterNatives-Map + Klassifizierungen."""
+    jni = globals().get("_LAST_JNI")
+    if jni is None:
+        return {"ok": False, "hinweis": "erst native.jni_run aufrufen"}
+    return {"ok": True, "summary": jni.summary(), "natives": jni.get_natives(),
+            "calls": jni.get_calls()[:int(limit)]}
+
+
+def native_jni_smali(ctx, cls, name, sig):
+    """Smali-Body + Klassifizierung + Vorschlagsrueckgabe zu Klasse/Methode/Signatur (fuers Popup)."""
+    try:
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    return NativeJniEnvService(publish=False).smali_of(cls, name, sig)
+
+
+def _ckpt_dir():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = os.path.join(root, "secrets", "probe", "out", "dbg_checkpoints")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _dbg_live_dir():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "secrets", "probe", "out", "dbg")
+
+
+def native_dbg_ckpt_list(ctx):
+    """Benannte Debug-Checkpoints auflisten (Ordner unter secrets/probe/out/dbg_checkpoints/)."""
+    import json
+    base = _ckpt_dir()
+    out = []
+    for name in sorted(os.listdir(base)):
+        d = os.path.join(base, name)
+        if not os.path.isdir(d):
+            continue
+        meta = {}
+        try:
+            with open(os.path.join(d, "meta.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            pass
+        note = ""
+        try:
+            md = [x for x in os.listdir(d) if x.endswith(".md")]
+            if md:
+                note = open(os.path.join(d, md[0]), encoding="utf-8").read()[:400]
+        except Exception:
+            pass
+        out.append({"name": name,
+                    "pc": (hex(int(meta.get("pc"))) if meta.get("pc") is not None else None),
+                    "writer": meta.get("writer"), "meta_note": meta.get("note"),
+                    "ts": meta.get("ts"), "md": note})
+    return {"ok": True, "count": len(out), "checkpoints": out}
+
+
+def native_dbg_ckpt_activate(ctx, name):
+    """Kopiert den benannten Checkpoint in die Live-Debug-Sitzung. Danach in der GUI ⬇ Von KI klicken.
+    Ueberschreibt die aktuelle Live-Sitzung."""
+    import shutil
+    src = os.path.join(_ckpt_dir(), str(name))
+    if not os.path.isdir(src):
+        return {"ok": False, "hinweis": f"Checkpoint '{name}' nicht gefunden"}
+    dst = _dbg_live_dir()
+    os.makedirs(dst, exist_ok=True)
+    copied = []
+    for fn in ("state.pkl.xz", "meta.json", "trace.json"):
+        s = os.path.join(src, fn)
+        if os.path.isfile(s):
+            shutil.copy2(s, os.path.join(dst, fn))
+            copied.append(fn)
+    if "state.pkl.xz" not in copied:
+        return {"ok": False, "hinweis": f"Checkpoint '{name}' unvollstaendig (kein state.pkl.xz)"}
+    return {"ok": True, "activated": name, "copied": copied,
+            "hinweis": "In der GUI jetzt ⬇ Von KI klicken, um den Checkpoint zu laden."}

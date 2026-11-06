@@ -103,6 +103,88 @@ class NativeStudioController:
                 self._log(f"Engine-Selbsttest FEHLER: {e!r}")
         threading.Thread(target=_work, daemon=True).start()
 
+    def _fav_service(self):
+        from services.native_favorites_service import NativeFavoritesService
+        p = os.path.join(_unpack.plugin_root(self.base_dir(), self._session_plugin()), "run_favorites.json")
+        return NativeFavoritesService(p)
+
+    def _cfg_jsonsafe(self, cfg):
+        c = dict(cfg)
+        c["mem_overrides"] = [
+            {"addr": ov.get("addr"),
+             "bytes": (ov["bytes"].hex() if isinstance(ov.get("bytes"), (bytes, bytearray)) else ov.get("bytes", ""))}
+            for ov in cfg.get("mem_overrides", []) or []
+        ]
+        return c
+
+    def fav_refresh(self):
+        try:
+            names = self._fav_service().list()
+            self.app.after(0, lambda: self.tab.set_fav_list(names))
+        except Exception as e:
+            self._log(f"Favoriten-Liste FEHLER: {e!r}")
+
+    def fav_save(self):
+        try:
+            from tkinter import simpledialog
+            name = simpledialog.askstring("Arbeitsansicht speichern", "Name der Arbeitsansicht:")
+            if not name:
+                return
+            st = self._fav_service().add(name, self._cfg_jsonsafe(self.tab.get_run_config()))
+            self._log(f"Arbeitsansicht '{name}' {st}.")
+            self.fav_refresh()
+        except Exception as e:
+            self._log(f"Favorit speichern FEHLER: {e!r}")
+
+    def fav_update(self):
+        name = (self.tab.fav_combo.get() or "").strip()
+        if not name:
+            self._log("Keine Arbeitsansicht ausgewaehlt (erst im Dropdown waehlen)."); return
+        try:
+            self._fav_service().add(name, self._cfg_jsonsafe(self.tab.get_run_config()))
+            self._log(f"Arbeitsansicht '{name}' aktualisiert.")
+        except Exception as e:
+            self._log(f"Favorit aktualisieren FEHLER: {e!r}")
+
+    def fav_load(self, name):
+        if not name:
+            return
+        try:
+            cfg = self._fav_service().get(name)
+            if cfg is None:
+                self._log(f"Arbeitsansicht '{name}' nicht gefunden."); return
+            self.app.after(0, lambda: self.tab.set_run_config(cfg))
+            self._log(f"Arbeitsansicht '{name}' geladen.")
+        except Exception as e:
+            self._log(f"Favorit laden FEHLER: {e!r}")
+
+    def _relocs_on(self):
+        """Zustand der GUI-Checkbox 'Relocs anwenden' (robust)."""
+        try:
+            return bool(self.tab.var_relocs.get())
+        except Exception:
+            return False
+
+    def resolve_reloc(self, addr):
+        """Loest den Reloc-Zeiger an `addr` statisch auf und springt zum Ziel (#178)."""
+        if self.image is None:
+            self._log("Keine Lib geladen."); return
+        try:
+            a = int(str(addr), 0)
+        except Exception:
+            self._log(f"Ungueltige Adresse: {addr!r}"); return
+        try:
+            from services.native_reloc_service import NativeRelocService
+            r = NativeRelocService().resolve(self.image, a)
+        except Exception as e:
+            self._log(f"Reloc-Aufloesung FEHLER: {e!r}"); return
+        t = r.get("target")
+        if t is not None:
+            self._log(f"Reloc 0x{a:x} -> 0x{t:x} (springe hin).")
+            self.navigate(t, set_entry=False)
+        else:
+            self._log(f"Keine Reloc an 0x{a:x} (kein per Reloc gefuellter Zeiger).")
+
     def run_emulation(self):
         """A1a: fuehrt die Funktion aus dem Run-Panel aus (run-to-completion) und zeigt
         Register/Memory/Coverage. Nutzt services.native_emu_service (headless getestet)."""
@@ -135,9 +217,22 @@ class NativeStudioController:
             svc = NativeEmuService(publish=False)
             eng = svc.new_engine()
             try:
-                svc.load_image(eng, self.image)
+                svc.load_image(eng, self.image, apply_relocs=self._relocs_on())
             except Exception as e:
                 self._log(f"Laden in Engine FEHLER: {e!r}"); return
+            snap_path = getattr(self, "_snapshot_path", None)
+            if snap_path:
+                try:
+                    svc.load_snapshot(eng, snap_path)
+                    self._log(f"Snapshot geladen: {snap_path}")
+                except Exception as e:
+                    self._log(f"Snapshot laden FEHLER: {e!r}"); return
+            if cfg.get("stubs"):
+                try:
+                    done = svc.install_stubs(eng, cfg["stubs"], image=self.image)
+                    self._log(f"Stubs gesetzt: {len(done)} ({', '.join('0x%x' % a for a in done) or '—'})")
+                except Exception as e:
+                    self._log(f"Stub-Setup FEHLER: {e!r}")
             args = list(cfg.get("args") or [])
             reg_args, stack_args = args[:8], args[8:]
             sp = cfg.get("sp")
@@ -146,11 +241,13 @@ class NativeStudioController:
                     self._log("Stack-Argumente gesetzt, aber kein SP angegeben."); return
                 try:
                     for k, v in enumerate(stack_args):
+                        if not isinstance(v, int):
+                            self._log("Pointer/Buffer-Args nur in x0–x7 (Stack: nur Ganzzahlen)."); continue
                         eng.mem.write(sp + k * 8, int(v).to_bytes(8, "little"))
                 except Exception as e:
                     self._log(f"Stack-Setup FEHLER: {e!r}"); return
             self.app.after(0, self.tab.start_progress)
-            self._log(f"▶ Run {cfg['entry']}  x0..={', '.join(hex(a) for a in reg_args) or '—'}"
+            self._log(f"▶ Run {cfg['entry']}  x0..={', '.join((hex(a) if isinstance(a, int) else 'ptr/buf') for a in reg_args) or '—'}"
                       + (f"  (+{len(stack_args)} Stack-Args)" if stack_args else ""))
             try:
                 res = svc.run(eng, cfg["entry"], reg_args, cfg.get("mem_overrides"),
@@ -159,6 +256,12 @@ class NativeStudioController:
                 res = {"ok": False, "why": "exception", "error": repr(e)}
             finally:
                 self.app.after(0, self.tab.stop_progress)
+            if res.get("why") == "maxins":
+                self._log(f"\u23f1 Instruktionsbudget erreicht @{res.get('at') or '?'} \u2014 kein Fehler: "
+                          f"die Emulation lief bis zum maxins-Limit. Erhoehe maxins oder setze "
+                          f"einen Breakpoint, um gezielt anzuhalten.")
+                self._last_engine = eng
+                return
             if not res.get("ok"):
                 self._log(f"Run FEHLER [{res.get('why')}]: "
                           f"{res.get('error') or res.get('hint') or res.get('pc')}")
@@ -166,10 +269,477 @@ class NativeStudioController:
             self._last_engine = eng
             self.app.after(0, lambda: self.tab.set_registers(res))
             cov = (f"Lauf OK · ret=0x{res['ret']:x} · entry={cfg['entry']} · "
-                   f"x0..={', '.join(hex(a) for a in reg_args) or '—'}")
+                   f"x0..={', '.join((hex(a) if isinstance(a, int) else 'ptr/buf') for a in reg_args) or '—'}")
             self.app.after(0, lambda: self.tab.set_coverage(cov))
             self._log(f"Run fertig: ret=0x{res['ret']:x}")
+            if res.get("out"):
+                self._log("Out-Puffer: " + ", ".join(f"{k}={v}" for k, v in res["out"].items()))
         threading.Thread(target=_work, daemon=True).start()
+
+    # ---- Debugger: Trace / Step / Lift (#GUI1) ----------------------------
+    _DBG_BUDGET = 4000  # Fallback-Budget (Bloecke), wenn kein gueltiges maxins-Feld
+    _DBG_SESSION = "secrets/probe/out/dbg"  # geteilter Sitzungsordner (Mensch + KI)
+
+    def _dbg_budget(self):
+        """Budget (Bloecke) fuer Resume/Auto-Lift aus dem Run-Panel-Feld 'maxins';
+        Fallback _DBG_BUDGET, wenn leer/ungueltig. Im Main-Thread aufrufen (liest tk)."""
+        try:
+            m = int((self.tab.get_run_config() or {}).get("maxins"))
+            if m > 0:
+                return m
+        except Exception:
+            pass
+        return self._DBG_BUDGET
+
+    def _dbg_setup(self):
+        """Frische Debug-Engine wie run_emulation aufbauen + Trace-Lauf initialisieren."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return None
+        if not self._require_capstone():
+            return None
+        cfg = self.tab.get_run_config()
+        if not cfg.get("entry"):
+            self._log("Kein Entry angegeben (Symbol oder 0xAddr)."); return None
+        try:
+            from services.native_emu_service import NativeEmuService
+            from services.native_trace_service import NativeTraceService
+        except Exception as e:
+            self._log(f"Debug-Services nicht ladbar: {e!r}"); return None
+        svc = NativeEmuService(publish=False)
+        eng = svc.new_engine()
+        try:
+            svc.load_image(eng, self.image, apply_relocs=self._relocs_on())
+        except Exception as e:
+            self._log(f"Laden in Engine FEHLER: {e!r}"); return None
+        if cfg.get("stubs"):
+            try:
+                svc.install_stubs(eng, cfg["stubs"], image=self.image)
+            except Exception as e:
+                self._log(f"Stub-Setup FEHLER: {e!r}")
+        try:
+            ea = svc.resolve_entry(cfg["entry"], self.image)
+            int_args, _out = svc.materialize_args(eng, cfg.get("args") or [])
+            svc.apply_mem(eng, cfg.get("mem_overrides"))
+        except Exception as e:
+            self._log(f"Arg-/Mem-Setup FEHLER: {e!r}"); return None
+        tr = NativeTraceService(publish=False)
+        tr.begin(eng, ea, int_args[:8], sp=cfg.get("sp"), faithful=True)
+        self._dbg_svc = svc
+        self._dbg_eng = eng
+        self._dbg_tr = tr
+        self._dbg_bps = getattr(self, "_dbg_bps", set())  # persistente Breakpoints (GUI-Gutter)
+        self._log(f"⟲ Debug bereit @0x{ea:x} (Relocs {'an' if self._relocs_on() else 'aus'}).")
+        self._dbg_update()
+        return eng
+
+    def _dbg_require(self):
+        if getattr(self, "_dbg_eng", None) is None:
+            return self._dbg_setup()
+        return self._dbg_eng
+
+    def _dbg_update(self):
+        eng = getattr(self, "_dbg_eng", None)
+        if eng is None:
+            return
+        try:
+            d = self._dbg_svc.snapshot_regs(eng); d["ret"] = d["x"][0]
+            self.app.after(0, lambda: self.tab.set_registers(d))
+        except Exception:
+            pass
+        try:
+            trace = self._dbg_tr.get_trace(eng)
+            self.app.after(0, lambda: self.tab.set_trace(trace))
+        except Exception:
+            pass
+        try:
+            pc = int(eng.cpu.pc)
+            self.app.after(0, lambda: self.navigate(pc, set_entry=False))
+        except Exception:
+            pass
+
+    def plugin_names(self):
+        """Namen der entdeckten native_plugins/ (fuer die dynamische GUI)."""
+        try:
+            return self.registry.names() if self.registry else []
+        except Exception:
+            return []
+
+    def plugin_contributions(self):
+        """Stufe 2: deklarative GUI-Beitraege der Plugins (leer -> kein dynamischer Bereich)."""
+        try:
+            return self.registry.contributions() if self.registry else []
+        except Exception:
+            return []
+
+    def plugin_action(self, action, plugin=None):
+        """Dispatcher fuer Plugin-Beitrags-Aktionen. Bekannte Namen werden gemappt;
+        unbekannte werden geloggt (erweiterbar fuer kuenftige Plugins)."""
+        try:
+            if action == "unpack":
+                return self.unpack_dialog()
+            self._log(f"Plugin-Aktion '{action}' (Plugin {plugin or '?'}) nicht implementiert.")
+        except Exception as e:
+            self._log(f"Plugin-Aktion FEHLER: {e!r}")
+
+    def jni_run(self):
+        """⚡ JNI: JNI_OnLoad mit der Fake-JNIEnv-Fassade (Reloc+Imports) laufen lassen,
+        JNI-Call-Liste fuellen. Haelt an den 4 RASP-Routinen; Budget = maxins-Feld."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return
+        if not self._require_capstone():
+            return
+        _budget = self._dbg_budget()
+        self._log("⚡ JNI-Lauf gestartet (Budget %d) — laeuft im Hintergrund, kann einige Sekunden dauern …" % _budget)
+
+        def _w():
+            try:
+                from services.native_emu_service import NativeEmuService
+                from services.native_ffi_service import NativeFfiService
+                from services.native_trace_service import NativeTraceService
+                from services import native_jni_env_service as Jm
+                from services.native_jni_env_service import NativeJniEnvService
+                svc = NativeEmuService(publish=False)
+                eng = svc.new_engine()
+                svc.load_image(eng, self.image, apply_relocs=True)
+                ffi = NativeFfiService(publish=False); ffi.wire_imports(eng, self.image)
+                jni = NativeJniEnvService(publish=False); jni.install(eng, ffi, set_entry_reg=None)
+                cfg = self.tab.get_run_config()
+                entry = svc.resolve_entry(cfg.get("entry") or "JNI_OnLoad", self.image)
+                tr = NativeTraceService(publish=False)
+                tr.begin(eng, entry, args=[Jm.VM_OBJ], faithful=True)
+                r = tr.run(eng, breakpoints=[], maxins=_budget, mode="block")
+                self._jni = jni
+                calls = [c for c in jni.get_calls()
+                         if c.get("fn") in ("FindClass", "RegisterNatives") or "method" in c]
+                self.app.after(0, lambda: self.tab.set_jni_calls(calls))
+                s = jni.summary()
+                self._log(f"⚡ JNI-Lauf: stop @{r.get('pc_hex')} ({r.get('steps')} Schritte) · "
+                          f"Calls {s['calls']} · RegisterNatives {s['natives']} · Kategorien {s['by_category']}")
+            except Exception as e:
+                self._log(f"JNI-Lauf FEHLER: {e!r}")
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def jni_show_popup(self, row):
+        """Popup: Smali-Body + Klassifizierung + Vorschlagsrueckgabe + Buttons (Durchreichen/
+        Manipulieren/Zum Smali springen)."""
+        import tkinter as tk
+        from tkinter import ttk, messagebox, simpledialog
+        cls = row.get("class"); name = row.get("method"); sig = row.get("sig")
+        jni = getattr(self, "_jni", None)
+        if jni and cls and name and sig:
+            info = jni.smali_of(cls, name, sig)
+            title = f"JNI: {cls}->{name}{sig}"
+        else:
+            info = {"ok": False, "category": row.get("category"), "proposed": row.get("proposed", "-"),
+                    "propsrc": "-", "retchar": "-", "file": None,
+                    "body": f"{row.get('fn')}  —  Klasse: {cls or '(leer)'}\n\n"
+                            f"(Kein Methoden-Smali fuer diese Zeile. Das reiche Popup mit Body + "
+                            f"Klassifizierung erscheint bei GetMethodID/Call*-Zeilen.)"}
+            title = f"JNI: {row.get('fn')} {cls or ''}"
+        top = tk.Toplevel(self.app); top.title(title); top.geometry("840x560")
+        head = ttk.Frame(top); head.pack(fill="x", padx=8, pady=6)
+        ttk.Label(head, text=(f"{cls}->{name}{sig}" if name else f"{row.get('fn')}  {cls or '(leer)'}"),
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(head, text=(f"Kategorie: {info.get('category') or '—'}    ·    "
+                              f"Vorschlag: {info.get('proposed')} ({info.get('propsrc')})    ·    "
+                              f"Rueckgabetyp: {info.get('retchar')}    ·    aufgeloest: {info.get('ok')}")).pack(anchor="w")
+        if info.get("file"):
+            ttk.Label(head, text=str(info["file"]), foreground="gray").pack(anchor="w")
+        tf = ttk.Frame(top); tf.pack(fill="both", expand=True, padx=8)
+        sb = ttk.Scrollbar(tf, orient="vertical"); sb.pack(side="right", fill="y")
+        txt = tk.Text(tf, wrap="none", font=("Consolas", 9), yscrollcommand=sb.set)
+        txt.pack(side="left", fill="both", expand=True); sb.config(command=txt.yview)
+        txt.insert("1.0", info.get("body") or "(kein Smali-Body gefunden)")
+        txt.config(state="disabled")
+        bf = ttk.Frame(top); bf.pack(fill="x", padx=8, pady=6)
+        ttk.Button(bf, text="Durchreichen", command=top.destroy).pack(side="left", padx=3)
+
+        def _manip():
+            v = simpledialog.askstring("Manipulieren",
+                                       "Erzwungener Rueckgabewert (Dez oder 0x..):",
+                                       initialvalue=str(info.get("proposed", 0)), parent=top)
+            if v is not None:
+                try:
+                    jni.set_override(cls, name, sig, int(v, 0))
+                    self._log(f"JNI-Override: {cls}->{name}{sig} = {v}")
+                except Exception as e:
+                    self._log(f"Override FEHLER: {e!r}")
+        ttk.Button(bf, text="Manipulieren", command=_manip).pack(side="left", padx=3)
+        ttk.Button(bf, text="Zum Smali springen",
+                   command=lambda: self.jni_goto_smali(cls, name, sig)).pack(side="left", padx=3)
+
+    def jni_goto_smali(self, cls, name, sig):
+        """Best-effort: Smali-Datei/Methode oeffnen bzw. Pfad in die Konsole (im Smali Studio oeffnen)."""
+        try:
+            jni = getattr(self, "_jni", None)
+            cf = jni._class_file(cls) if jni else None
+            if not cf:
+                self._log(f"Smali-Datei fuer {cls} nicht gefunden."); return
+            opened = False
+            for attr in ("open_smali", "goto_smali", "smali_open"):
+                fn = getattr(self.app, attr, None)
+                if callable(fn):
+                    try:
+                        fn(cf, (name or "") + (sig or "")); opened = True; break
+                    except Exception:
+                        pass
+            if not opened:
+                self._log(f"Smali: {cf}   (Methode {name}{sig}) — im Smali Studio oeffnen.")
+        except Exception as e:
+            self._log(f"Smali-Sprung FEHLER: {e!r}")
+
+    def dbg_start(self):
+        """(Neu) Debug-Sitzung am aktuellen Entry/Arg-Stand starten (pc am Entry)."""
+        self._dbg_eng = None
+        self._dbg_setup()
+
+    def dbg_step_block(self):
+        eng = self._dbg_require()
+        if eng is None:
+            return
+        r = self._dbg_tr.step_block(eng)
+        self._log(f"⏭ Block → pc={r.get('pc_hex')}" + ("  (fertig)" if r.get("done") else ""))
+        self._dbg_update()
+
+    def dbg_step_insn(self):
+        eng = self._dbg_require()
+        if eng is None:
+            return
+        r = self._dbg_tr.step_insn(eng)
+        ins = r.get("insn") or {}
+        self._log(f"⏱ {ins.get('mnem','?')} {ins.get('ops','')} → pc={r.get('pc_hex')}"
+                  + ("  (fertig)" if r.get("done") else ""))
+        self._dbg_update()
+
+    def dbg_resume(self):
+        eng = self._dbg_require()
+        if eng is None:
+            return
+        _budget = self._dbg_budget()  # tk-Feld im Main-Thread lesen
+
+        def _w():
+            _bps = list(getattr(self, "_dbg_bps", set()))
+            r = self._dbg_tr.resume(eng, breakpoints=_bps, maxins=_budget,
+                                    mode=("insn" if _bps else "block"))
+            st = ("Breakpoint" if r.get("paused") else "fertig" if r.get("done")
+                  else "Budget" if r.get("budget") else "?")
+            self._log(f"⏩ Resume (Budget {_budget}) → {st} @ {r.get('pc_hex')} ({r.get('steps')} Schritte)")
+            self._dbg_update()
+
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def dbg_lift_python(self):
+        """🐍 Trace→Python: aktuelle Spur liften — oder, ohne Sitzung, einmal komplett tracen + liften."""
+        if getattr(self, "_dbg_eng", None) is None:
+            if self._dbg_setup() is None:
+                return
+            _budget = self._dbg_budget()
+
+            def _w0():
+                self._dbg_tr.run(self._dbg_eng, breakpoints=[], maxins=_budget, mode="block")
+                self._dbg_update()
+                self._dbg_do_lift()
+
+            import threading
+            threading.Thread(target=_w0, daemon=True).start()
+            return
+        self._dbg_do_lift()
+
+    def _dbg_do_lift(self):
+        eng = getattr(self, "_dbg_eng", None)
+        if eng is None:
+            return
+        try:
+            from services.native_trace_decompile_service import NativeTraceDecompileService
+            lr = NativeTraceDecompileService().lift_to_function(eng)
+        except Exception as e:
+            self._log(f"Lift FEHLER: {e!r}"); return
+        if lr.get("ok"):
+            src = lr["source"]
+            self._log(f"🐍 Trace→Python: {lr['visits']} Besuche · {lr['unique']} Bloecke → Funktion geliftet.")
+        else:
+            src = f"# Lift unvollstaendig: why={lr.get('why')}\n# {lr.get('residual') or lr.get('addr') or ''}"
+            self._log(f"🐍 Trace→Python: unvollstaendig ({lr.get('why')}).")
+        self.app.after(0, lambda: self.tab.set_python_lift(src))
+
+    def set_breakpoints(self, addrs):
+        """Von der GUI gesetzte Breakpoints uebernehmen (int-Adressen)."""
+        out = set()
+        for a in (addrs or []):
+            try:
+                out.add(int(a) if isinstance(a, int) else int(str(a), 0))
+            except Exception:
+                pass
+        self._dbg_bps = out
+
+    def dbg_status(self):
+        """⇅ Abgleich: vergleicht deinen Stand mit der geteilten Sitzung (wer ist neuer?)."""
+        def _w():
+            try:
+                from services.native_debug_session_service import NativeDebugSessionService
+                pk = NativeDebugSessionService().peek(self._DBG_SESSION)
+            except Exception as e:
+                self._log(f"Abgleich FEHLER: {e!r}"); return
+            fmeta = pk.get("meta")
+            if not fmeta:
+                self._log("⇅ Abgleich: keine geteilte Sitzung vorhanden (noch kein ⬆ An KI)."); return
+            fseq = int(fmeta.get("seq", 0) or 0)
+            base = int(getattr(self, "_dbg_base_seq", 0) or 0)
+            eng = getattr(self, "_dbg_eng", None)
+            local_pc = (f"0x{int(eng.cpu.pc):x}" if eng is not None else "—")
+            if fseq > base:
+                rel = f"geteilt ist NEUER (seq {fseq} > dein {base}) → ⬇ Von KI laden"
+            elif eng is not None:
+                rel = f"du bist auf/ueber dem geteilten Stand (seq {base}) → ⬆ An KI zum Teilen"
+            else:
+                rel = "kein lokaler Debug-Stand (erst ⟲ Dbg)"
+            tr = pk.get("trace") or []
+            self._log(f"⇅ Abgleich: geteilt seq {fseq} · writer {fmeta.get('writer')} · "
+                      f"pc 0x{int(fmeta.get('pc', 0)):x} · {len(tr)} Bloecke · {fmeta.get('ts')}  |  "
+                      f"dein pc {local_pc}, letzter Sync-seq {base}  →  {rel}")
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def dbg_sync(self):
+        """⬆ An KI: aktuellen Debug-Stand in die geteilte Sitzung schreiben (push), mit Clobber-Schutz."""
+        eng = getattr(self, "_dbg_eng", None)
+        if eng is None:
+            self._log("Keine Debug-Sitzung — erst ⟲ Dbg / Step."); return
+        from services.native_debug_session_service import NativeDebugSessionService
+        sess = NativeDebugSessionService()
+        try:
+            fmeta = sess.peek(self._DBG_SESSION, with_trace=False).get("meta") or {}
+        except Exception:
+            fmeta = {}
+        base = int(getattr(self, "_dbg_base_seq", 0) or 0)
+        fseq = int(fmeta.get("seq", 0) or 0)
+        force = False
+        if fmeta and fseq > base:   # jemand (KI) hat seit deinem letzten Abgleich geschrieben
+            try:
+                from tkinter import messagebox
+                force = messagebox.askyesno(
+                    "Geteilte Sitzung ueberschreiben?",
+                    f"Die geteilte Sitzung wurde seit deinem letzten Abgleich von "
+                    f"'{fmeta.get('writer')}' auf seq {fseq} fortgeschrieben.\n\n"
+                    f"Mit DEINEM Stand ueberschreiben?\n(Nein = erst ⬇ Von KI laden)")
+            except Exception:
+                force = False
+            if not force:
+                self._log(f"⬆ An KI abgebrochen — geteilt ist neuer (seq {fseq}, {fmeta.get('writer')}). Erst ⬇ Von KI."); return
+
+        def _w():
+            try:
+                cfg = self.tab.get_run_config()
+                meta = {"entry": cfg.get("entry"), "sp": cfg.get("sp"),
+                        "relocs": self._relocs_on(),
+                        "lib": getattr(self, "image_path", None),
+                        "bps": sorted(getattr(self, "_dbg_bps", set())), "mode": "block"}
+                r = sess.save(eng, self._DBG_SESSION, meta=meta, writer="gui",
+                              base_seq=base, force=force)
+                if not r.get("ok") and r.get("why") == "conflict":
+                    self._log(f"⬆ An KI: Konflikt (Datei seq {r['file_seq']} > dein {r['base_seq']}). Erst ⬇ Von KI."); return
+                self._dbg_base_seq = int(r.get("seq", base + 1))
+                self._log(f"⬆ An KI → geschrieben (seq {r['seq']}, pc {r['pc']}, {r['trace']} Bloecke).")
+            except Exception as e:
+                self._log(f"An-KI FEHLER: {e!r}")
+
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _resolve_lib(self, libpath):
+        """Lib-Pfad aus der Sitzung aufloesen (as-is / absolut / tools/lib/<basename>)."""
+        if not libpath:
+            return None
+        cands = [libpath, os.path.abspath(libpath),
+                 os.path.join("tools", "lib", os.path.basename(libpath))]
+        for c in cands:
+            try:
+                if c and os.path.isfile(c):
+                    return c
+            except Exception:
+                pass
+        return None
+
+    def dbg_load_session(self):
+        """⬇ Von KI: geteilten Stand laden. Fehlt die Lib, wird sie aus meta['lib'] nachgeladen."""
+        from services.native_debug_session_service import NativeDebugSessionService
+        sess = NativeDebugSessionService()
+        try:
+            m0 = sess.peek(self._DBG_SESSION, with_trace=False).get("meta") or {}
+        except Exception:
+            m0 = {}
+        libpath = self._resolve_lib(m0.get("lib"))
+
+        def _restore():
+            def _w():
+                try:
+                    from services.native_emu_service import NativeEmuService
+                    from services.native_trace_service import NativeTraceService
+                    svc = NativeEmuService(publish=False)
+                    eng = svc.new_engine()
+                    ld = sess.load(eng, self._DBG_SESSION)
+                    if not ld.get("ok"):
+                        self._log("⬇ Von KI: keine Sitzung gefunden."); return
+                    self._dbg_svc = svc
+                    self._dbg_eng = eng
+                    self._dbg_tr = NativeTraceService(publish=False)
+                    m = ld.get("meta") or {}
+                    self._dbg_bps = set(m.get("bps") or [])
+                    self._dbg_base_seq = int(m.get("seq", 0) or 0)
+                    self.app.after(0, lambda: self.tab.set_breakpoint_marks(self._dbg_bps))
+                    self._log(f"⬇ Von KI: Sitzung geladen (seq {ld.get('seq')}, pc {ld['pc']}, "
+                              f"{ld['trace_len']} Bloecke, writer {m.get('writer')}).")
+                    self._dbg_update()
+                except Exception as e:
+                    self._log(f"Von-KI FEHLER: {e!r}")
+            import threading
+            threading.Thread(target=_w, daemon=True).start()
+
+        if self.image is None:
+            if libpath:
+                self._log(f"⬇ Von KI: lade zugehoerige Lib {os.path.basename(libpath)} …")
+                self._load_so(libpath, then=_restore)
+            else:
+                self._log("⬇ Von KI: keine (auffindbare) Lib in der Sitzung — lade die .so manuell, "
+                          "dann erneut ⬇ Von KI (Register/Trace lade ich jetzt trotzdem).")
+                _restore()
+        else:
+            if libpath and os.path.basename(libpath) != os.path.basename(getattr(self, "image_path", "") or ""):
+                self._log(f"⚠ Geladene Lib ({os.path.basename(getattr(self, 'image_path', '?') or '?')}) "
+                          f"≠ Sitzungs-Lib ({os.path.basename(libpath)}) — Adressen koennten abweichen.")
+            _restore()
+
+    def snapshot_save(self):
+        """Speichert den Zustand des letzten Laufs (Mem+Register) als .pkl.xz."""
+        eng = getattr(self, "_last_engine", None)
+        if eng is None:
+            self._log("Noch kein Lauf — erst ▶ Run (Snapshot speichert den Zustand nach dem Lauf)."); return
+        try:
+            from tkinter import filedialog
+            p = filedialog.asksaveasfilename(defaultextension=".pkl.xz",
+                                             filetypes=[("Snapshot", "*.pkl.xz"), ("Alle", "*.*")])
+            if not p:
+                return
+            from services.native_emu_service import NativeEmuService
+            NativeEmuService(publish=False).save_snapshot(eng, p)
+            self._log(f"Snapshot gespeichert: {p}")
+        except Exception as e:
+            self._log(f"Snapshot speichern FEHLER: {e!r}")
+
+    def snapshot_set_load(self):
+        """Waehlt einen Snapshot, der beim naechsten ▶ Run vor der Ausfuehrung geladen wird."""
+        try:
+            from tkinter import filedialog
+            p = filedialog.askopenfilename(filetypes=[("Snapshot", "*.pkl.xz"), ("Alle", "*.*")])
+            if not p:
+                return
+            self._snapshot_path = p
+            self._log(f"Snapshot fuer naechsten Run gesetzt: {p} (▶ Run laedt ihn vor der Ausfuehrung). "
+                      "Zum Deaktivieren Native Studio '🧹 Leeren'.")
+        except Exception as e:
+            self._log(f"Snapshot-Auswahl FEHLER: {e!r}")
 
     def show_memory(self):
         """Liest 64 Bytes an der im Memory-Reiter angegebenen Adresse aus dem letzten Lauf."""
@@ -197,7 +767,7 @@ class NativeStudioController:
             return
         self._load_so(path)
 
-    def _load_so(self, path):
+    def _load_so(self, path, then=None):
         def _work():
             try:
                 img = ElfImage.parse(open(path, "rb").read())
@@ -220,7 +790,7 @@ class NativeStudioController:
                 for _n in _imports:
                     rows.append(("import", _n, "0x0"))
                 self._outline_base_rows = rows
-                self.app.after(0, lambda: self.tab.set_outline(rows))
+                self.app.after(0, lambda: self.tab.set_outline(self._apply_anno(rows)))
                 self._log(f"geladen: {os.path.basename(path)} — "
                           f"{len(img.segments)} Segmente, {len(img.dynsyms)} Symbole, "
                           f"AArch64={img.is_aarch64}")
@@ -230,6 +800,8 @@ class NativeStudioController:
                 else:
                     self._log("Lade fertig. Baue XREF-Index (Fast) im Hintergrund — Suche/XREF danach sofort.")
                     self._build_index(img)
+                if then:
+                    self.app.after(0, then)
             except Exception as e:
                 self._log(f"Laden FEHLER: {e!r}")
         threading.Thread(target=_work, daemon=True).start()
@@ -484,6 +1056,18 @@ class NativeStudioController:
         """Zur Adresse springen (Alias auf navigate)."""
         self.navigate(addr)
 
+    def goto_text(self, text):
+        """Adresse ODER Symbol aus dem Gehe-zu-Feld aufloesen und anspringen (Fenster um die Adresse)."""
+        s = (text or "").strip()
+        if not s:
+            return
+        try:
+            from services.native_emu_service import NativeEmuService
+            a = NativeEmuService(publish=False).resolve_entry(s, self.image)
+        except Exception:
+            self._log(f"Gehe zu: nicht aufloesbar: {s!r}"); return
+        self.navigate(int(a), set_entry=False)
+
     # --- Navigation + baum-basierte Historie (nach Smali-Studio-Vorbild) ---
     def navigate(self, addr, add_to_history=True, set_entry=False):
         """Zentrale Navigation: Disassemblieren + XREF + Historie, mit UI-Spiegelung
@@ -591,13 +1175,18 @@ class NativeStudioController:
             return
         for i in tree.get_children():
             tree.delete(i)
-        if self.history_root_id:
-            self._build_history_tree("", self.history_root_id)
-            if self.current_history_id:
-                try:
-                    tree.selection_set(self.current_history_id); tree.see(self.current_history_id)
-                except Exception:
-                    pass
+        # Flache, chronologische Liste statt kaskadierender Einrueckung (#164).
+        # Branching bleibt im Datenmodell (parent/children) fuer back/forward erhalten.
+        for nid, node in self.history_nodes.items():
+            nm = self._short_name(node["name"]) if node.get("name") else ""
+            label = (f"{nm.split('(')[0][:40]} @0x{node['addr']:x}" if nm else f"0x{node['addr']:x}")
+            tags = ("current",) if nid == self.current_history_id else ()
+            tree.insert("", "end", iid=nid, text=label, tags=tags)
+        if self.current_history_id:
+            try:
+                tree.selection_set(self.current_history_id); tree.see(self.current_history_id)
+            except Exception:
+                pass
 
     def open_search(self):
         if self.index is None:
@@ -1014,6 +1603,50 @@ class NativeStudioController:
             pc += 4
         return rows
 
+    def _anno_service(self):
+        from services.native_annotations_service import NativeAnnotationsService
+        p = os.path.join(_unpack.plugin_root(self.base_dir(), self._session_plugin()), "annotations.json")
+        return NativeAnnotationsService(p)
+
+    def _anno_sha(self):
+        try:
+            return _unpack.sha8(self.image_path)
+        except Exception:
+            return "?"
+
+    def _apply_anno(self, rows):
+        """Overlay: ersetzt Namen definierter Zeilen durch gespeicherte Annotationen (✎)."""
+        try:
+            anno = self._anno_service().all(self._anno_sha())
+        except Exception:
+            anno = {}
+        if not anno:
+            return rows
+        out = []
+        for r in rows:
+            if len(r) >= 3 and r[0] in ("fn", "sub", "data"):
+                info = anno.get(r[2])
+                if info and info.get("name"):
+                    out.append((r[0], "\u270e " + info["name"], r[2]))
+                    continue
+            out.append(r)
+        return out
+
+    def annotate(self, addr, name, note=""):
+        """Speichert einen eigenen Namen/Notiz fuer eine Adresse und frischt die Outline auf."""
+        try:
+            self._anno_service().set(self._anno_sha(), f"0x{addr:x}", name, note or "")
+            self._log(f"Annotiert 0x{addr:x}: {name}" + (f"  // {note}" if note else ""))
+        except Exception as e:
+            self._log(f"Annotieren FEHLER: {e!r}"); return
+        try:
+            if self.index is not None:
+                self._emit_enriched_outline()
+            elif getattr(self, "_outline_base_rows", None):
+                self.app.after(0, lambda: self.tab.set_outline(self._apply_anno(self._outline_base_rows)))
+        except Exception:
+            pass
+
     def _emit_enriched_outline(self):
         """Ergaenzt die Outline um vom Index entdeckte Funktionsanfaenge (bl-Ziele)
         als sub_<addr>, ohne Dubletten zu benannten Symbolen. Idempotent."""
@@ -1047,7 +1680,7 @@ class NativeStudioController:
         except Exception:
             pass
         rows = meta + seg + merged + imps
-        self.app.after(0, lambda: self.tab.set_outline(rows))
+        self.app.after(0, lambda: self.tab.set_outline(self._apply_anno(rows)))
         self._log(f"Outline angereichert: {_nfn} benannte Funktionen + {len(subs)} per Index entdeckte "
                   f"(sub_…) + Daten-Symbole (grau). Doppelklick auf sub_ oeffnet die Funktion.")
 
@@ -1079,15 +1712,22 @@ class NativeStudioController:
                 name = self.index.func_at(addr)
             except Exception:
                 pass
-        count = max(1, min((end - start) // 4, 2000))
+        if addr == start:                              # Funktionskopf -> ab Funktionsanfang (gekappt)
+            _disp_start = start
+            count = max(1, min((end - start) // 4, 2000))
+        else:                                          # Sprung zu pc/BP -> festes Fenster UM addr
+            _disp_start = max(0, addr - 64 * 4)
+            count = 256
 
         def _work():
             if not self._require_capstone():
                 return
             try:
-                rows = self._disasm_rows(start, count, mark_addr=addr)
+                rows = self._disasm_rows(_disp_start, count, mark_addr=addr)
                 hdr_name = self._short_name(name) if name else f"sub_{start:x}"
-                header = f"{hdr_name}  ·  0x{start:x} .. 0x{end:x}  ({count} Instr.)"
+                _we = _disp_start + count * 4
+                _anchor = "" if addr == start else f"  ·  @0x{addr:x}"
+                header = f"{hdr_name}{_anchor}  ·  0x{_disp_start:x} .. 0x{_we:x}  ({count} Instr.)"
                 self.app.after(0, lambda: self.tab.set_disasm_rows(header, rows))
                 self._log(f"Funktion @0x{start:x}" + (f" ({name})" if name else "") + f": {count} Instruktionen.")
             except Exception as e:

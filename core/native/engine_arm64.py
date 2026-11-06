@@ -147,6 +147,22 @@ class Arm64Engine:
         """Nicht-invasiver Beobachtungs-Hook (läuft vor der Instruktion an pc)."""
         self.cpu.probes[pc] = fn
 
+    def apply_relocations(self, image) -> int:
+        """Wendet die vom Loader geparsten Relocations an: schreibt je (site, target) den
+        8-Byte-Zeiger `target` nach `site`. Fuellt die in der Datei NULL-Dispatch-/Call-Zeiger
+        obfuskierter Libs (z. B. OLLVM-Flattening). Additiv; wird nur auf Wunsch aufgerufen
+        (load_image ruft sie NICHT automatisch -> Kontrakt bleibt bit-exakt)."""
+        m64 = (1 << 64) - 1
+        n = 0
+        for row in (getattr(image, "relocs", None) or []):
+            try:
+                site = int(row[0]); tgt = int(row[1]) & m64
+                self.mem.write(site, tgt.to_bytes(8, "little"))
+                n += 1
+            except Exception:
+                pass
+        return n
+
     def decode_at(self, pc: int) -> Insn:
         if self._dec is None:
             self._dec = Arm64Decoder()

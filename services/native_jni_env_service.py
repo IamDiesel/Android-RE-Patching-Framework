@@ -1,0 +1,457 @@
+# -*- coding: utf-8 -*-
+"""native_jni_env_service — Fake-JNIEnv/JavaVM-Fassade fuer die arm64mini-Emulation (A3.2).
+
+Setzt additiv auf der FFI-Trap-Schicht (A3.1, ``NativeFfiService``) auf: Wir uebernehmen die Rolle
+von ART und stellen die **vollstaendige JNI-Schnittstelle** als Fassade bereit, damit ``libdb0c``
+ueber den ersten ``env->FindClass`` hinaus laeuft und die RASP-Logik beobachtbar wird.
+
+Drei Stufen in einer kohaerenten Schicht:
+  Stufe 1 — Struktur + Resolver + Log: volle 233-Slot-JNINativeInterface + 8-Slot-JNIInvokeInterface
+            als FFI-Stubs; Handle-Registry (jclass/jmethodID/...); ``FindClass``/``GetMethodID``/
+            ``RegisterNatives`` werden gegen das **echte App-Smali** (datei-basiert, 4 Roots) aufgeloest;
+            jeder Call wird protokolliert.
+  Stufe 2 — Klassifikator + Trivial-Evaluator: der Smali-Body der aufgeloesten Methode wird klassifiziert
+            (root/debug/signature/proc/exec/frida/emulator/file) und ein **Vorschlags-Rueckgabewert**
+            je Rueckgabetyp bestimmt; triviale Bodies (const/return) direkt ausgewertet.
+  Stufe 3 — Policy: Default auto-pass mit Vorschlag; Watchlist markiert ``pending``; Overrides pro
+            ``Klasse->Methode(Sig)`` erzwingen einen Wert (manipulieren).
+
+Engine-Kontrakt bleibt bit-exakt: nur additive Nutzung von ``cpu.stub`` (via FFI) + Writes in einen
+eigenen Fassaden-Speicherbereich. SOA: der Zustand (Handles, Call-Log, RegisterNatives-Map, Policy)
+liegt an der Service-Instanz (1:1 pro ``install``) und zusaetzlich an ``eng._jni`` fuer Leser.
+"""
+from __future__ import annotations
+
+import os
+import re
+from typing import Dict, List, Optional
+
+_M64 = (1 << 64) - 1
+
+# ---- Fassaden-Speicherlayout (weit ausserhalb der Lib, <0x15b958) --------------
+ENV_OBJ = 0x66000000       # JNIEnv*  -> *(ENV_OBJ) = ENV_TABLE
+ENV_TABLE = 0x66001000     # JNINativeInterface (233 Slots)
+VM_OBJ = 0x66010000        # JavaVM*  -> *(VM_OBJ) = VM_TABLE
+VM_TABLE = 0x66011000      # JNIInvokeInterface (8 Slots)
+HANDLE_BASE = 0x55000000   # getaggte Fake-Handles (jclass/jmethodID/...)
+SCRATCH = 0x67000000       # Bump-Allocator fuer Rueckgabe-Puffer (GetStringUTFChars ...)
+
+# JNINativeInterface in fester ABI-Reihenfolge (Index == Offset/8). FindClass=6 (0x30) bestaetigt.
+JNI_FUNCS = [
+    "reserved0", "reserved1", "reserved2", "reserved3",
+    "GetVersion", "DefineClass", "FindClass",
+    "FromReflectedMethod", "FromReflectedField", "ToReflectedMethod",
+    "GetSuperclass", "IsAssignableFrom", "ToReflectedField",
+    "Throw", "ThrowNew", "ExceptionOccurred", "ExceptionDescribe", "ExceptionClear",
+    "FatalError", "PushLocalFrame", "PopLocalFrame",
+    "NewGlobalRef", "DeleteGlobalRef", "DeleteLocalRef", "IsSameObject",
+    "NewLocalRef", "EnsureLocalCapacity",
+    "AllocObject", "NewObject", "NewObjectV", "NewObjectA",
+    "GetObjectClass", "IsInstanceOf", "GetMethodID",
+    "CallObjectMethod", "CallObjectMethodV", "CallObjectMethodA",
+    "CallBooleanMethod", "CallBooleanMethodV", "CallBooleanMethodA",
+    "CallByteMethod", "CallByteMethodV", "CallByteMethodA",
+    "CallCharMethod", "CallCharMethodV", "CallCharMethodA",
+    "CallShortMethod", "CallShortMethodV", "CallShortMethodA",
+    "CallIntMethod", "CallIntMethodV", "CallIntMethodA",
+    "CallLongMethod", "CallLongMethodV", "CallLongMethodA",
+    "CallFloatMethod", "CallFloatMethodV", "CallFloatMethodA",
+    "CallDoubleMethod", "CallDoubleMethodV", "CallDoubleMethodA",
+    "CallVoidMethod", "CallVoidMethodV", "CallVoidMethodA",
+    "CallNonvirtualObjectMethod", "CallNonvirtualObjectMethodV", "CallNonvirtualObjectMethodA",
+    "CallNonvirtualBooleanMethod", "CallNonvirtualBooleanMethodV", "CallNonvirtualBooleanMethodA",
+    "CallNonvirtualByteMethod", "CallNonvirtualByteMethodV", "CallNonvirtualByteMethodA",
+    "CallNonvirtualCharMethod", "CallNonvirtualCharMethodV", "CallNonvirtualCharMethodA",
+    "CallNonvirtualShortMethod", "CallNonvirtualShortMethodV", "CallNonvirtualShortMethodA",
+    "CallNonvirtualIntMethod", "CallNonvirtualIntMethodV", "CallNonvirtualIntMethodA",
+    "CallNonvirtualLongMethod", "CallNonvirtualLongMethodV", "CallNonvirtualLongMethodA",
+    "CallNonvirtualFloatMethod", "CallNonvirtualFloatMethodV", "CallNonvirtualFloatMethodA",
+    "CallNonvirtualDoubleMethod", "CallNonvirtualDoubleMethodV", "CallNonvirtualDoubleMethodA",
+    "CallNonvirtualVoidMethod", "CallNonvirtualVoidMethodV", "CallNonvirtualVoidMethodA",
+    "GetFieldID",
+    "GetObjectField", "GetBooleanField", "GetByteField", "GetCharField", "GetShortField",
+    "GetIntField", "GetLongField", "GetFloatField", "GetDoubleField",
+    "SetObjectField", "SetBooleanField", "SetByteField", "SetCharField", "SetShortField",
+    "SetIntField", "SetLongField", "SetFloatField", "SetDoubleField",
+    "GetStaticMethodID",
+    "CallStaticObjectMethod", "CallStaticObjectMethodV", "CallStaticObjectMethodA",
+    "CallStaticBooleanMethod", "CallStaticBooleanMethodV", "CallStaticBooleanMethodA",
+    "CallStaticByteMethod", "CallStaticByteMethodV", "CallStaticByteMethodA",
+    "CallStaticCharMethod", "CallStaticCharMethodV", "CallStaticCharMethodA",
+    "CallStaticShortMethod", "CallStaticShortMethodV", "CallStaticShortMethodA",
+    "CallStaticIntMethod", "CallStaticIntMethodV", "CallStaticIntMethodA",
+    "CallStaticLongMethod", "CallStaticLongMethodV", "CallStaticLongMethodA",
+    "CallStaticFloatMethod", "CallStaticFloatMethodV", "CallStaticFloatMethodA",
+    "CallStaticDoubleMethod", "CallStaticDoubleMethodV", "CallStaticDoubleMethodA",
+    "CallStaticVoidMethod", "CallStaticVoidMethodV", "CallStaticVoidMethodA",
+    "GetStaticFieldID",
+    "GetStaticObjectField", "GetStaticBooleanField", "GetStaticByteField", "GetStaticCharField",
+    "GetStaticShortField", "GetStaticIntField", "GetStaticLongField", "GetStaticFloatField",
+    "GetStaticDoubleField",
+    "SetStaticObjectField", "SetStaticBooleanField", "SetStaticByteField", "SetStaticCharField",
+    "SetStaticShortField", "SetStaticIntField", "SetStaticLongField", "SetStaticFloatField",
+    "SetStaticDoubleField",
+    "NewString", "GetStringLength", "GetStringChars", "ReleaseStringChars",
+    "NewStringUTF", "GetStringUTFLength", "GetStringUTFChars", "ReleaseStringUTFChars",
+    "GetArrayLength",
+    "NewObjectArray", "GetObjectArrayElement", "SetObjectArrayElement",
+    "NewBooleanArray", "NewByteArray", "NewCharArray", "NewShortArray", "NewIntArray",
+    "NewLongArray", "NewFloatArray", "NewDoubleArray",
+    "GetBooleanArrayElements", "GetByteArrayElements", "GetCharArrayElements",
+    "GetShortArrayElements", "GetIntArrayElements", "GetLongArrayElements",
+    "GetFloatArrayElements", "GetDoubleArrayElements",
+    "ReleaseBooleanArrayElements", "ReleaseByteArrayElements", "ReleaseCharArrayElements",
+    "ReleaseShortArrayElements", "ReleaseIntArrayElements", "ReleaseLongArrayElements",
+    "ReleaseFloatArrayElements", "ReleaseDoubleArrayElements",
+    "GetBooleanArrayRegion", "GetByteArrayRegion", "GetCharArrayRegion", "GetShortArrayRegion",
+    "GetIntArrayRegion", "GetLongArrayRegion", "GetFloatArrayRegion", "GetDoubleArrayRegion",
+    "SetBooleanArrayRegion", "SetByteArrayRegion", "SetCharArrayRegion", "SetShortArrayRegion",
+    "SetIntArrayRegion", "SetLongArrayRegion", "SetFloatArrayRegion", "SetDoubleArrayRegion",
+    "RegisterNatives", "UnregisterNatives", "MonitorEnter", "MonitorExit", "GetJavaVM",
+    "GetStringRegion", "GetStringUTFRegion",
+    "GetPrimitiveArrayCritical", "ReleasePrimitiveArrayCritical",
+    "GetStringCritical", "ReleaseStringCritical",
+    "NewWeakGlobalRef", "DeleteWeakGlobalRef", "ExceptionCheck",
+    "NewDirectByteBuffer", "GetDirectBufferAddress", "GetDirectBufferCapacity",
+    "GetObjectRefType",
+]  # 233 Eintraege
+
+VM_FUNCS = ["reserved0", "reserved1", "reserved2", "DestroyJavaVM", "AttachCurrentThread",
+            "DetachCurrentThread", "GetEnv", "AttachCurrentThreadAsDaemon"]
+
+# Klassifikations-Muster (Smali-Body-Substrings) -> Kategorie
+_CLASS_PATTERNS = [
+    ("root", ("/system/xbin/su", "/system/bin/su", "/sbin/su", "magisk", "superuser",
+              "Superuser.apk", "busybox", "/su/bin")),
+    ("exec", ("Ljava/lang/Runtime;->exec", "Ljava/lang/ProcessBuilder;", "/system/bin/sh")),
+    ("debug", ("Landroid/os/Debug;->isDebuggerConnected", "TracerPid", "waitForDebugger",
+               "Landroid/os/Debug;->isDebuggerConnected()Z")),
+    ("signature", ("GET_SIGNATURES", "GET_SIGNING_CERTIFICATES", "Landroid/content/pm/Signature;",
+                   "getPackageInfo", "signatures")),
+    ("frida", ("frida", "gum-js-loop", "gmain", "linjector", "27042", "re.frida", "gadget")),
+    ("emulator", ("goldfish", "ranchu", "generic_x86", "vbox", "Genymotion",
+                  "Landroid/os/Build;->FINGERPRINT", "ro.kernel.qemu", "sdk_gphone")),
+    ("proc", ("/proc/self/", "/proc/", "/proc/net/tcp", "maps")),
+    ("file-exists", ("Ljava/io/File;->exists", "Ljava/io/File;->canRead")),
+    ("xposed", ("de/robv/android/xposed", "XposedBridge", "EdXposed", "LSPosed")),
+]
+
+
+class _JniState:
+    __slots__ = ("handles", "next_handle", "calls", "natives", "classes", "max_calls")
+
+    def __init__(self):
+        self.handles: Dict[int, dict] = {}   # id -> {kind, cls, name, sig, category, proposed, ret}
+        self.next_handle = HANDLE_BASE
+        self.calls: List[dict] = []          # geordnetes Call-Log
+        self.natives: List[dict] = []        # RegisterNatives-Landkarte
+        self.classes: Dict[int, str] = {}    # jclass-handle -> classname
+        self.max_calls = 100000
+
+
+class NativeJniEnvService:
+    def __init__(self, publish: bool = True, app_base: Optional[str] = None):
+        self.publish = publish
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.app_base = app_base or os.path.join(
+            root, "source", "org.nativescript.LibreLinkUp_5_1_1", "base_unpacked_apktool")
+        self.smali_roots = [os.path.join(self.app_base, r)
+                            for r in ("smali", "smali_classes2", "smali_classes3", "smali_classes4")]
+        self.st = _JniState()
+        self.scratch_next = SCRATCH
+        self.overrides: Dict[str, int] = {}   # "cls->name(sig)" -> forced return
+        self.watchlist = set()                # Kategorien, die pending markieren
+        self.default_watch_categories = {"root", "debug", "signature", "frida", "emulator",
+                                         "exec", "proc", "file-exists", "xposed"}
+
+    # ================= Installation =================
+    def install(self, eng, ffi, set_entry_reg: Optional[int] = 0) -> dict:
+        """Baut JNIEnv+JavaVM im Emulator-Speicher, haengt alle Slots als FFI-Stubs ein.
+        set_entry_reg: wenn nicht None, wird x[set_entry_reg] = ENV_OBJ gesetzt (Default x0)."""
+        m = eng.cpu.m
+        m.wb(ENV_OBJ, ENV_TABLE.to_bytes(8, "little"))
+        for i, name in enumerate(JNI_FUNCS):
+            stub = ffi.install_named_stub(eng, "JNIEnv::" + name)
+            m.wb(ENV_TABLE + i * 8, stub.to_bytes(8, "little"))
+            ffi.set_handler(eng, "JNIEnv::" + name, self._mk(name, "env"))
+        m.wb(VM_OBJ, VM_TABLE.to_bytes(8, "little"))
+        for i, name in enumerate(VM_FUNCS):
+            stub = ffi.install_named_stub(eng, "JavaVM::" + name)
+            m.wb(VM_TABLE + i * 8, stub.to_bytes(8, "little"))
+            ffi.set_handler(eng, "JavaVM::" + name, self._mk(name, "vm"))
+        if set_entry_reg is not None:
+            eng.cpu.x[set_entry_reg] = ENV_OBJ
+        eng._jni = self.st
+        self.watchlist = set(self.default_watch_categories)
+        return {"ok": True, "env": ENV_OBJ, "vm": VM_OBJ, "slots": len(JNI_FUNCS)}
+
+    def _mk(self, name, kind):
+        def h(cpu, ffi):
+            return self._dispatch(cpu, name, kind)
+        return h
+
+    # ================= Hilfen: Speicher / Strings =================
+    @staticmethod
+    def _cstr(cpu, addr, maxn=512):
+        if not addr:
+            return ""
+        out = bytearray()
+        a = int(addr) & _M64
+        for _ in range(maxn):
+            b = cpu.m.rb(a, 1)
+            if not b or b[0] == 0:
+                break
+            out.append(b[0])
+            a += 1
+        return out.decode("utf-8", "replace")
+
+    def _alloc(self, cpu, data: bytes) -> int:
+        a = self.scratch_next
+        cpu.m.wb(a, bytes(data))
+        self.scratch_next = (a + len(data) + 8) & ~0x7
+        return a
+
+    def _new_handle(self, kind, **kw) -> int:
+        hid = self.st.next_handle
+        self.st.next_handle += 0x10
+        d = {"kind": kind}
+        d.update(kw)
+        self.st.handles[hid] = d
+        return hid
+
+    # ================= Smali-Resolver (Stufe 1) =================
+    def _class_file(self, classname: str) -> Optional[str]:
+        """classname in Slash-Form ('com/foo/Bar') -> .smali-Pfad oder None."""
+        rel = classname.strip()
+        if rel.startswith("L") and rel.endswith(";"):
+            rel = rel[1:-1]
+        rel = rel.replace(".", "/")
+        for root in self.smali_roots:
+            p = os.path.join(root, rel + ".smali")
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _method_body(self, classfile: str, name: str, sig: str):
+        """Body-Zeilen der Methode name+sig im .smali oder None."""
+        try:
+            with open(classfile, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
+        except Exception:
+            return None
+        pat = re.compile(r"^\.method\b.*?\b" + re.escape(name) + re.escape(sig) + r"\s*$",
+                         re.MULTILINE)
+        m = pat.search(txt)
+        if not m:
+            return None
+        start = m.end()
+        end = txt.find(".end method", start)
+        body = txt[start:end if end >= 0 else len(txt)]
+        return body
+
+    # ================= Klassifikator + Evaluator (Stufe 2) =================
+    @staticmethod
+    def _ret_char(sig: str) -> str:
+        i = sig.rfind(")")
+        r = sig[i + 1:] if i >= 0 else "V"
+        return r[0] if r else "V"
+
+    def _classify(self, body: Optional[str]) -> Optional[str]:
+        if not body:
+            return None
+        low = body
+        for cat, pats in _CLASS_PATTERNS:
+            for p in pats:
+                if p in low:
+                    return cat
+        return None
+
+    def _trivial_eval(self, body: Optional[str], ret_char: str):
+        """Einfache Bodies direkt auswerten: const vX, n; return vX  /  return-void. Sonst None."""
+        if body is None:
+            return None
+        lines = [ln.strip() for ln in body.splitlines() if ln.strip()
+                 and not ln.strip().startswith(("#", ".line", ".prologue", ".registers", ".locals",
+                                                ".param", ".annotation", ".end"))]
+        if not lines:
+            return None
+        if ret_char == "V" and lines and lines[-1].startswith("return-void"):
+            return 0
+        # Muster: ... const(/4|/16|-wide)? vR, LIT ; return(-wide)? vR
+        m = re.match(r"return(?:-wide|-object)?\s+([vp]\d+)", lines[-1])
+        if not m:
+            return None
+        reg = m.group(1)
+        for ln in reversed(lines[:-1]):
+            cm = re.match(r"const(?:/4|/16|/high16|-wide(?:/16|/high16|/32)?)?\s+" +
+                          re.escape(reg) + r",\s*(-?0x[0-9a-fA-F]+|-?\d+)", ln)
+            if cm:
+                try:
+                    return int(cm.group(1), 0) & _M64
+                except Exception:
+                    return None
+            if reg in ln:  # Register wird anders geschrieben -> nicht trivial
+                return None
+        return None
+
+    def _propose(self, ret_char: str, category: Optional[str], trivial):
+        """Vorschlags-Rueckgabewert: trivial > sauber(0/false/null)."""
+        if trivial is not None:
+            return trivial, "trivial"
+        # saubere Default-Antwort: 0 == false == null (bei Detection-Checks = 'nicht erkannt')
+        return 0, ("clean" if category else "default")
+
+    # ================= Policy (Stufe 3) =================
+    def set_override(self, cls, name, sig, value):
+        self.overrides["%s->%s%s" % (cls, name, sig)] = int(value) & _M64
+
+    def _apply_policy(self, cls, name, sig, proposed, category):
+        key = "%s->%s%s" % (cls, name, sig)
+        if key in self.overrides:
+            return self.overrides[key], True, False
+        pending = bool(category and category in self.watchlist)
+        return proposed, False, pending
+
+    # ================= Dispatcher =================
+    def _log(self, entry):
+        if len(self.st.calls) < self.st.max_calls:
+            self.st.calls.append(entry)
+
+    def _dispatch(self, cpu, name, kind):
+        x = cpu.x
+        ret = 0
+        info = {"fn": name, "kind": kind}
+
+        if kind == "vm":
+            if name == "GetEnv":                       # (vm, void** penv, version) -> 0
+                cpu.m.wb(int(x[1]) & _M64, ENV_OBJ.to_bytes(8, "little"))
+                ret = 0
+            elif name == "AttachCurrentThread":
+                cpu.m.wb(int(x[1]) & _M64, ENV_OBJ.to_bytes(8, "little"))
+                ret = 0
+            else:
+                ret = 0
+            self._log({**info, "ret": ret})
+            return ret & _M64
+
+        # ---- env ----
+        if name == "GetVersion":
+            ret = 0x00010006
+        elif name == "FindClass":
+            cls = self._cstr(cpu, x[1])
+            cf = self._class_file(cls)
+            hid = self._new_handle("jclass", cls=cls, file=cf)
+            self.st.classes[hid] = cls
+            ret = hid
+            self._log({**info, "class": cls, "resolved": bool(cf), "handle": hex(hid), "name_ptr": hex(int(x[1]) & _M64), "lr": hex(int(cpu.lr) & _M64), "x23": hex(int(x[23]) & _M64)})
+            return ret & _M64
+        elif name in ("GetMethodID", "GetStaticMethodID"):
+            clsh = int(x[1]) & _M64
+            mname = self._cstr(cpu, x[2])
+            sig = self._cstr(cpu, x[3])
+            cls = self.st.classes.get(clsh) or (self.st.handles.get(clsh, {}) or {}).get("cls", "?")
+            cf = self._class_file(cls) if cls and cls != "?" else None
+            body = self._method_body(cf, mname, sig) if cf else None
+            rchar = self._ret_char(sig)
+            cat = self._classify(body)
+            triv = self._trivial_eval(body, rchar)
+            proposed, psrc = self._propose(rchar, cat, triv)
+            hid = self._new_handle("jmethodID", cls=cls, name=mname, sig=sig, static=(name[3] == "S"),
+                                   category=cat, proposed=proposed, propsrc=psrc, retchar=rchar,
+                                   resolved=bool(body))
+            ret = hid
+            self._log({**info, "class": cls, "method": mname, "sig": sig, "category": cat,
+                       "proposed": proposed, "propsrc": psrc, "resolved": bool(body),
+                       "handle": hex(hid)})
+            return ret & _M64
+        elif name in ("GetFieldID", "GetStaticFieldID"):
+            clsh = int(x[1]) & _M64
+            fname = self._cstr(cpu, x[2])
+            sig = self._cstr(cpu, x[3])
+            cls = self.st.classes.get(clsh) or (self.st.handles.get(clsh, {}) or {}).get("cls", "?")
+            hid = self._new_handle("jfieldID", cls=cls, name=fname, sig=sig)
+            ret = hid
+            self._log({**info, "class": cls, "field": fname, "sig": sig, "handle": hex(hid)})
+            return ret & _M64
+        elif name == "RegisterNatives":
+            clsh = int(x[1]) & _M64
+            arr = int(x[2]) & _M64
+            cnt = int(x[3]) & 0xffffffff
+            cls = self.st.classes.get(clsh) or (self.st.handles.get(clsh, {}) or {}).get("cls", "?")
+            recs = []
+            for i in range(min(cnt, 4096)):
+                base = arr + i * 24
+                np= int.from_bytes(cpu.m.rb(base, 8), "little")
+                sp = int.from_bytes(cpu.m.rb(base + 8, 8), "little")
+                fp = int.from_bytes(cpu.m.rb(base + 16, 8), "little")
+                rec = {"class": cls, "name": self._cstr(cpu, np), "sig": self._cstr(cpu, sp),
+                       "fnptr": hex(fp & _M64)}
+                recs.append(rec)
+                self.st.natives.append(rec)
+            self._log({**info, "class": cls, "count": int(cnt), "registered": recs})
+            return 0
+        elif name.startswith("Call") and ("Method" in name):
+            # Call[Static|Nonvirtual]<T>Method[V|A]: methodID ist x2 (bei allen Varianten)
+            mid = int(x[2]) & _M64
+            h = self.st.handles.get(mid, {})
+            cls = h.get("cls", "?"); mname = h.get("name", "?"); sig = h.get("sig", "?")
+            proposed = h.get("proposed", 0); cat = h.get("category")
+            final, overridden, pending = self._apply_policy(cls, mname, sig, proposed, cat)
+            ret = final
+            self._log({**info, "class": cls, "method": mname, "sig": sig, "category": cat,
+                       "proposed": proposed, "final": final, "overridden": overridden,
+                       "pending": pending})
+            return ret & _M64
+        elif name in ("ExceptionCheck", "ExceptionOccurred"):
+            ret = 0
+        elif name == "GetJavaVM":                       # (env, JavaVM** vm) -> 0
+            cpu.m.wb(int(x[1]) & _M64, VM_OBJ.to_bytes(8, "little"))
+            ret = 0
+        elif name == "GetObjectClass":
+            ret = self._new_handle("jclass", cls="?")
+        elif name in ("NewGlobalRef", "NewLocalRef", "NewWeakGlobalRef"):
+            ret = int(x[1]) & _M64 or self._new_handle("jobject")
+        elif name == "NewStringUTF":
+            s = self._cstr(cpu, x[1])
+            ret = self._new_handle("jstring", text=s)
+        elif name == "GetStringUTFChars":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            data = (h.get("text", "") or "").encode("utf-8") + b"\x00"
+            ret = self._alloc(cpu, data)
+            if x[2]:
+                cpu.m.wb(int(x[2]) & _M64, (0).to_bytes(1, "little"))  # isCopy=false
+        elif name == "GetStringUTFLength":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            ret = len((h.get("text", "") or "").encode("utf-8"))
+        elif name.startswith("Get") and name.endswith("Field"):
+            ret = 0
+        else:
+            ret = 0  # generischer, protokollierter Default
+        self._log({**info, "ret": ret})
+        return ret & _M64
+
+    # ================= Leser =================
+    def get_calls(self):
+        return list(self.st.calls)
+
+    def get_natives(self):
+        return list(self.st.natives)
+
+    def summary(self):
+        from collections import Counter
+        cats = Counter(c.get("category") for c in self.st.calls if c.get("category"))
+        fns = Counter(c.get("fn") for c in self.st.calls)
+        return {"calls": len(self.st.calls), "natives": len(self.st.natives),
+                "by_fn": dict(fns), "by_category": dict(cats)}
+
+    def smali_of(self, cls, name, sig):
+        """Fuer das GUI-Popup: Smali-Body + Klassifizierung + Vorschlag + Datei/Zeile."""
+        cf = self._class_file(cls)
+        body = self._method_body(cf, name, sig) if cf else None
+        rchar = self._ret_char(sig)
+        cat = self._classify(body)
+        triv = self._trivial_eval(body, rchar)
+        proposed, psrc = self._propose(rchar, cat, triv)
+        return {"ok": bool(body), "file": cf, "class": cls, "name": name, "sig": sig,
+                "category": cat, "proposed": proposed, "propsrc": psrc, "retchar": rchar,
+                "body": body or ""}

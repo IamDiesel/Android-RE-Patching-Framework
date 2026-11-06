@@ -27,6 +27,7 @@ CAP_LABELS = {
     "exec_run": "Executables starten (ExeDeploy)",
     "file_manager": "File Manager (Geraete-Dateizugriff)",
     "delete_ops": "Loeschen (Patches/Libs/Executables)",
+    "dbg_write": "Debug-Sitzung schreiben (KI treibt die geteilte Sitzung)",
 }
 
 

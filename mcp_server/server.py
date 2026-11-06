@@ -371,10 +371,159 @@ def build_server(ctx, host, port):
                            lambda: tools.native_callgraph(ctx, path, func), _summ(path=path, func=func))
 
     @mcp.tool(name="native_decompile")
-    def native_decompile(path: str, func: str) -> str:
-        """Gecachtes Ghidra-C einer Funktion (func=Name/0xAddr); nicht im Cache -> Hinweis: in GUI erzeugen."""
+    def native_decompile(path: str, func: str, run: bool = False) -> str:
+        """Gecachtes Ghidra-C einer Funktion (func=Name/0xAddr). run=True startet Ghidra nicht-blockierend im Hintergrund."""
         return runtime.run(ctx, "native.decompile",
-                           lambda: tools.native_decompile(ctx, path, func), _summ(path=path, func=func))
+                           lambda: tools.native_decompile(ctx, path, func, run=run), _summ(path=path, func=func))
+
+    @mcp.tool(name="native_functions")
+    def native_functions(path: str, max_results: int = 500, named_only: bool = False) -> str:
+        """Funktionsanfaenge: benannte Dynsym-Funktionen + per Index entdeckte bl-Ziele (sub_)."""
+        return runtime.run(ctx, "native.functions",
+                           lambda: tools.native_functions(ctx, path, max_results, named_only), _summ(path=path))
+
+    @mcp.tool(name="native_strings")
+    def native_strings(path: str, query: Optional[str] = None, min_len: int = 4, max_results: int = 300) -> str:
+        """ASCII-Strings aus der .so (optional per query gefiltert; Krypto-/Algo-Namen)."""
+        return runtime.run(ctx, "native.strings",
+                           lambda: tools.native_strings(ctx, path, query, min_len, max_results), _summ(path=path))
+
+    @mcp.tool(name="native_run")
+    def native_run(path: str, entry: str, args: Optional[list] = None, sp: Optional[int] = None,
+                   maxins: int = 2000000, stubs: Optional[list] = None, read: Optional[list] = None,
+                   relocs: bool = False) -> str:
+        """Funktion emulieren: args=[int|'0x..'|{'ptr':hex}|{'buf':n}|{'int':v}], stubs=[{'at':..,'ret':..}], read=[{'addr':..,'len':..}]."""
+        return runtime.run(ctx, "native.run",
+                           lambda: tools.native_run(ctx, path, entry, args, sp, maxins, stubs, read, relocs), _summ(path=path, entry=entry))
+
+    @mcp.tool(name="native_run_break")
+    def native_run_break(path: str, entry: str, args: Optional[list] = None, sp: Optional[int] = None,
+                         maxins: int = 2000000, stubs: Optional[list] = None,
+                         breakpoints: Optional[list] = None, read: Optional[list] = None,
+                         relocs: bool = False) -> str:
+        """Emulieren bis Breakpoint(e) (addr|'0x..'|Symbol, nur an Block-Eintritten) -> Pause-Zustand (pc/Register) oder ret."""
+        return runtime.run(ctx, "native.run_break",
+                           lambda: tools.native_run_break(ctx, path, entry, args, sp, maxins, stubs, breakpoints, read, relocs),
+                           _summ(path=path, entry=entry))
+
+    @mcp.tool(name="native_lift")
+    def native_lift(path: str, entry: str, mode: str = "block", max_blocks: int = 64,
+                    relocs: bool = False) -> str:
+        """Block->Python-Lifter: mode='block' (ein Basisblock) oder 'function' (BFS erreichbare Bloecke) ab Adresse/Symbol."""
+        return runtime.run(ctx, "native.lift",
+                           lambda: tools.native_lift(ctx, path, entry, mode, max_blocks, relocs),
+                           _summ(path=path, entry=entry))
+
+    @mcp.tool(name="native_verify")
+    def native_verify(path: str, entry: str, name: str, args: Optional[list] = None,
+                      sp: Optional[int] = None, maxins: int = 2000000, stubs: Optional[list] = None,
+                      update: bool = False, read: Optional[list] = None, relocs: bool = False) -> str:
+        """Emulation gegen gespeicherten Golden (name=) pruefen; update=True speichert/aktualisiert den Golden."""
+        return runtime.run(ctx, "native.verify",
+                           lambda: tools.native_verify(ctx, path, entry, args, sp, maxins, stubs, name, update, read, relocs),
+                           _summ(path=path, entry=entry))
+
+    @mcp.tool(name="native_step")
+    def native_step(session: str) -> str:
+        """Ein Basisblock-Schritt in einer pausierten Session (session= von native_run_break)."""
+        return runtime.run(ctx, "native.step",
+                           lambda: tools.native_step(ctx, session), _summ(session=session))
+
+    @mcp.tool(name="native_resume")
+    def native_resume(session: str, breakpoints: Optional[list] = None, maxins: int = 2000000) -> str:
+        """Pausierte Session bis zum naechsten Breakpoint/Ende fortsetzen (breakpoints=addr|'0x..'|Symbol)."""
+        return runtime.run(ctx, "native.resume",
+                           lambda: tools.native_resume(ctx, session, breakpoints, maxins), _summ(session=session))
+
+    @mcp.tool(name="native_rebase")
+    def native_rebase(path_old: str, path_new: str, target: Optional[str] = None,
+                      mode: str = "auto", limit: int = 40) -> str:
+        """Offsets/Symbole alt->neu abbilden; target=Symbol|'0x..' oder mode='diff' fuer Versions-Diff."""
+        return runtime.run(ctx, "native.rebase",
+                           lambda: tools.native_rebase(ctx, path_old, path_new, target, mode, limit),
+                           _summ(path=path_old))
+
+    @mcp.tool(name="native_coverage")
+    def native_coverage(path: str, entry: str, args: Optional[list] = None, sp: Optional[int] = None,
+                        maxins: int = 2000000, stubs: Optional[list] = None, top: int = 25,
+                        relocs: bool = False) -> str:
+        """Coverage/Unknown-Report einer Emulation: Mnemonic-Zaehlung + Slow-Pfad-Kandidaten + unbekannte Instruktionen."""
+        return runtime.run(ctx, "native.coverage",
+                           lambda: tools.native_coverage(ctx, path, entry, args, sp, maxins, stubs, top, relocs),
+                           _summ(path=path, entry=entry))
+
+    @mcp.tool(name="native_snapshot")
+    def native_snapshot(path: str, entry: str, op: str = "save", out: Optional[str] = None,
+                        load: Optional[str] = None, args: Optional[list] = None, sp: Optional[int] = None,
+                        maxins: int = 2000000, stubs: Optional[list] = None, relocs: bool = False) -> str:
+        """op='save' (Lauf -> Zustand als .pkl.xz) oder op='load' (Snapshot laden -> ab entry ausfuehren)."""
+        return runtime.run(ctx, "native.snapshot",
+                           lambda: tools.native_snapshot(ctx, path, entry, op, out, load, args, sp, maxins, stubs, relocs),
+                           _summ(path=path, entry=entry))
+
+    @mcp.tool(name="native_resolveptr")
+    def native_resolveptr(path: str, addr: Optional[str] = None, around: Optional[str] = None,
+                          radius: int = 64) -> str:
+        """Reloc-Slot aufloesen (addr=0x..) oder Relocs um eine Adresse listen (around=0x.., radius)."""
+        return runtime.run(ctx, "native.resolveptr",
+                           lambda: tools.native_resolveptr(ctx, path, addr, around, radius), _summ(path=path))
+
+    @mcp.tool(name="native_dbg_state")
+    def native_dbg_state(folder: Optional[str] = None) -> str:
+        """Geteilte Debug-Sitzung (GUI<->KI) ansehen: pc/seq/writer/Breakpoints/Trace (read-only)."""
+        return runtime.run(ctx, "native.dbg_state", lambda: tools.native_dbg_state(ctx, folder))
+
+    @mcp.tool(name="native_dbg_lift")
+    def native_dbg_lift(folder: Optional[str] = None) -> str:
+        """Geteilte Debug-Sitzung laden und den gelaufenen Pfad nach Python liften (read-only)."""
+        return runtime.run(ctx, "native.dbg_lift", lambda: tools.native_dbg_lift(ctx, folder))
+
+    @mcp.tool(name="native_dbg_step")
+    def native_dbg_step(folder: Optional[str] = None, mode: str = "block", n: int = 1,
+                        confirm: bool = False) -> str:
+        """Geteilte Debug-Sitzung n Schritte weiter + zurueckschreiben (Freigabe dbg_write + confirm)."""
+        return runtime.run(ctx, "native.dbg_step",
+                           lambda: tools.native_dbg_step(ctx, folder, mode, n),
+                           _summ(mode=mode, n=n), confirm=confirm)
+
+    @mcp.tool(name="native_dbg_resume")
+    def native_dbg_resume(folder: Optional[str] = None, budget: int = 4000,
+                          mode: Optional[str] = None, confirm: bool = False) -> str:
+        """Geteilte Debug-Sitzung bis Breakpoint/Budget fortsetzen + zurueckschreiben (Freigabe dbg_write + confirm)."""
+        return runtime.run(ctx, "native.dbg_resume",
+                           lambda: tools.native_dbg_resume(ctx, folder, budget, mode),
+                           _summ(budget=budget), confirm=confirm)
+
+    @mcp.tool(name="native_jni_run")
+    def native_jni_run(budget: int = 400000, stop_at_rasp: bool = True,
+                       lib: Optional[str] = None) -> str:
+        """JNI_OnLoad mit Fake-JNIEnv emulieren (Reloc+Imports); Fortschritt + JNI-Call-Map."""
+        return runtime.run(ctx, "native.jni_run",
+                           lambda: tools.native_jni_run(ctx, budget, stop_at_rasp, lib),
+                           _summ(budget=budget, stop_at_rasp=stop_at_rasp))
+
+    @mcp.tool(name="native_jni_log")
+    def native_jni_log(limit: int = 100) -> str:
+        """Letzten jni_run auslesen: Call-Log + RegisterNatives-Map + Klassifizierungen."""
+        return runtime.run(ctx, "native.jni_log", lambda: tools.native_jni_log(ctx, limit))
+
+    @mcp.tool(name="native_jni_smali")
+    def native_jni_smali(cls: str, name: str, sig: str) -> str:
+        """Smali-Body + Klassifizierung + Vorschlagsrueckgabe zu Klasse/Methode/Signatur."""
+        return runtime.run(ctx, "native.jni_smali",
+                           lambda: tools.native_jni_smali(ctx, cls, name, sig),
+                           _summ(cls=cls, name=name))
+
+    @mcp.tool(name="native_dbg_ckpt_list")
+    def native_dbg_ckpt_list() -> str:
+        """Benannte Debug-Checkpoints auflisten (geteilte Sitzungen zum Nachstellen)."""
+        return runtime.run(ctx, "native.dbg_ckpt_list", lambda: tools.native_dbg_ckpt_list(ctx))
+
+    @mcp.tool(name="native_dbg_ckpt_activate")
+    def native_dbg_ckpt_activate(name: str) -> str:
+        """Benannten Checkpoint in die Live-Debug-Sitzung kopieren (danach in der GUI ⬇ Von KI)."""
+        return runtime.run(ctx, "native.dbg_ckpt_activate",
+                           lambda: tools.native_dbg_ckpt_activate(ctx, name), _summ(name=name))
 
     @mcp.tool(name="device_info")
     def device_info() -> str:

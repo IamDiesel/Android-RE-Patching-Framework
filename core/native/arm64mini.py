@@ -523,6 +523,48 @@ class CPU:
                 if c>maxins: raise Exception("maxins@0x%x"%self.pc)
         finally:
             if gcwas: gc.enable()
+
+    def run_from(self, maxins=2000000000):
+        """A2 (additiv): setzt die Ausfuehrung am AKTUELLEN pc/lr fort, ohne pc/lr/args
+        neu zu initialisieren. Gleiche Dispatch-Semantik wie run(); run() bleibt unveraendert.
+        Rueckkehr = x[0] beim Sentinel 0xdead0000 (identisch zu run())."""
+        import gc
+        SENT=0xdead0000
+        c=0
+        bb=self.bb; stub=self.stub; probes=self.probes
+        has_probes=bool(probes)
+        gcwas=gc.isenabled()
+        if gcwas: gc.disable()
+        try:
+            while True:
+                pc=self.pc
+                if pc==SENT: return self.x[0]
+                if has_probes and pc in probes: probes[pc](self)
+                fn=stub.get(pc)
+                if fn is not None:
+                    nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr); continue
+                blk=bb.get(pc)
+                if blk is None:
+                    blk=self._compile_block(pc); bb[pc]=blk
+                self.pc=blk(self); c+=1
+                if c>maxins: raise Exception("maxins@0x%x"%self.pc)
+        finally:
+            if gcwas: gc.enable()
+
+    def step_block(self):
+        """A2 (additiv): fuehrt genau EINEN Dispatch (Stub oder einen Basisblock) am
+        aktuellen pc aus und gibt den neuen pc zurueck. Ignoriert Breakpoints (expliziter
+        Schritt). Am Sentinel 0xdead0000 passiert nichts."""
+        SENT=0xdead0000
+        pc=self.pc
+        if pc==SENT: return SENT
+        fn=self.stub.get(pc)
+        if fn is not None:
+            nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr); return self.pc
+        blk=self.bb.get(pc)
+        if blk is None:
+            blk=self._compile_block(pc); self.bb[pc]=blk
+        self.pc=blk(self); return self.pc
     # ===== Basic-Block-JIT: heisse GP-Instruktionen -> direktes Python; Rest -> step() =====
     _JTERM=("b","bl","blr","br","ret","cbz","cbnz","tbz","tbnz","brk","svc","hlt")
     _CONDX={"eq":"(cpu.z==1)","ne":"(cpu.z==0)","cs":"(cpu.c==1)","hs":"(cpu.c==1)",

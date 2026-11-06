@@ -141,11 +141,32 @@ TOOL_CATALOG = [
     ToolSpec("native.read_bytes", "M", "Native Studio", "O", (), "Rohbytes/Hex an virtueller Adresse oder Datei-Offset lesen"),
     ToolSpec("native.callgraph",  "M", "Native Studio", "O", (), "Caller/Callees einer Funktion (symbolbasiert)"),
     ToolSpec("native.decompile",  "M", "Native Studio", "O", (), "Gecachtes Ghidra-C einer Funktion (sonst Hinweis: in GUI erzeugen)"),
+    ToolSpec("native.functions",  "M", "Native Studio", "O", (), "Funktionsanfaenge listen: benannte + per Index entdeckte (sub_)"),
+    ToolSpec("native.strings",    "M", "Native Studio", "O", (), "ASCII-Strings aus der .so (Krypto-/Algo-Namen, /proc, ptrace ...)"),
+    ToolSpec("native.run",        "M", "Native Studio", "O", (), "Funktion emulieren (Args/Pointer/Buffer/Stubs) -> Register/ret/Out-Puffer"),
+    ToolSpec("native.run_break",  "M", "Native Studio", "O", (), "Funktion emulieren bis Breakpoint(e) am Block-Eintritt -> Pause-Zustand (pc/Register) oder ret"),
+    ToolSpec("native.lift",       "M", "Native Studio", "O", (), "Basisblock/Funktion nach Python heben (bbsrc Block->Python-Lifter) ab Adresse/Symbol"),
+    ToolSpec("native.verify",     "M", "Native Studio", "O", (), "Emulation gegen gespeicherten Golden pruefen (Bit-Exakt-Regression); update=True speichert Golden"),
+    ToolSpec("native.step",       "M", "Native Studio", "O", (), "Ein Basisblock-Schritt in einer pausierten Session (von native.run_break)"),
+    ToolSpec("native.resume",     "M", "Native Studio", "O", (), "Pausierte Session bis zum naechsten Breakpoint/Ende fortsetzen"),
+    ToolSpec("native.rebase",     "M", "Native Studio", "O", (), "Adressen/Symbole ueber Lib-Versionen abbilden (dynsym-Match) oder Versions-Diff"),
+    ToolSpec("native.coverage",   "M", "Native Studio", "O", (), "Funktion emulieren -> Coverage (Mnemonics), Slow-Pfad-Kandidaten und unbekannte Instruktionen"),
+    ToolSpec("native.snapshot",   "M", "Native Studio", "P", (), "Emu-Zustand (Mem+Register) nach einem Lauf als .pkl.xz speichern bzw. laden+ausfuehren"),
+    ToolSpec("native.resolveptr", "M", "Native Studio", "O", (), "Reloc/Zeiger statisch aufloesen (addr=) oder Relocs um eine Adresse listen (around=)"),
+    ToolSpec("native.dbg_state",  "M", "Native Studio", "O", (), "Geteilte Debug-Sitzung (GUI<->KI) ansehen: pc/seq/writer/Breakpoints/Trace (read-only)"),
+    ToolSpec("native.dbg_lift",   "M", "Native Studio", "O", (), "Geteilte Debug-Sitzung laden und den gelaufenen Pfad nach Python liften (read-only)"),
+    ToolSpec("native.dbg_step",   "M", "Native Studio", "G", ("dbg_write",), "Geteilte Debug-Sitzung n Schritte weiter + zurueckschreiben (Freigabe dbg_write)"),
+    ToolSpec("native.dbg_resume", "M", "Native Studio", "G", ("dbg_write",), "Geteilte Debug-Sitzung bis Breakpoint/Budget fortsetzen + zurueckschreiben (Freigabe dbg_write)"),
+    ToolSpec("native.jni_run",    "M", "Native Studio", "O", (), "JNI_OnLoad mit Fake-JNIEnv+Reloc+Imports emulieren; Fortschritt/Stop + JNI-Call-Map + RegisterNatives"),
+    ToolSpec("native.jni_log",    "M", "Native Studio", "O", (), "Letzten jni_run auslesen: Call-Log + RegisterNatives-Map + Klassifizierungen (read-only)"),
+    ToolSpec("native.jni_smali",  "M", "Native Studio", "O", (), "Smali-Body + Klassifizierung + Vorschlagsrueckgabe zu Klasse/Methode/Signatur (read-only)"),
+    ToolSpec("native.dbg_ckpt_list",    "M", "Native Studio", "O", (), "Benannte Debug-Checkpoints auflisten (geteilte Sitzungen zum Nachstellen)"),
+    ToolSpec("native.dbg_ckpt_activate","M", "Native Studio", "O", (), "Benannten Checkpoint in die Live-Debug-Sitzung kopieren (danach in der GUI ⬇ Von KI)"),
 ]
 
 GROUP_ORDER = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M"]
 GROUP_NAMES = {s.group: s.group_name for s in TOOL_CATALOG}
-CAP_KEYS = ["build", "flash", "app_start", "exec_run", "file_manager", "delete_ops"]
+CAP_KEYS = ["build", "flash", "app_start", "exec_run", "file_manager", "delete_ops", "dbg_write"]
 
 _BY_ID = {s.id: s for s in TOOL_CATALOG}
 

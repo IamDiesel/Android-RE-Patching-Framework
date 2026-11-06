@@ -47,6 +47,7 @@ class UnpackPlugin(ABC):
 class UnpackRegistry:
     def __init__(self):
         self._plugins: List[UnpackPlugin] = []
+        self._contribs = []  # Stufe 2: deklarative GUI-Beitraege (gui_contributions)
 
     def register(self, plugin: UnpackPlugin) -> None:
         self._plugins.append(plugin)
@@ -56,6 +57,10 @@ class UnpackRegistry:
 
     def names(self) -> List[str]:
         return [p.name for p in self._plugins]
+
+    def contributions(self) -> list:
+        """Stufe 2: deklarative GUI-Beitraege der Plugins (aus gui_contributions())."""
+        return list(self._contribs)
 
     def find_for(self, path: str) -> List[UnpackPlugin]:
         return [p for p in self._plugins if p.can_handle(path)]
@@ -84,6 +89,13 @@ class UnpackRegistry:
                 spec.loader.exec_module(mod)
                 if hasattr(mod, "register"):
                     mod.register(self)
+                if hasattr(mod, "gui_contributions"):
+                    try:
+                        for _c in (mod.gui_contributions() or []):
+                            if isinstance(_c, dict):
+                                self._contribs.append(dict(_c))
+                    except Exception:
+                        pass
             except Exception:
                 # Ein defektes privates Plugin darf die Registry nicht sprengen.
                 continue
