@@ -58,8 +58,12 @@ class SettingsTab(ttk.Frame):
             return False
 
     def save_settings(self):
+        old_pkg = self.app.cfg.config.get("APP_PACKAGE", "")
         if self._sync_config_from_ui():
             self.app.cfg.save()
+            new_pkg = self.app.cfg.config.get("APP_PACKAGE", "")
+            if new_pkg != old_pkg and hasattr(self.app, "on_app_switched"):
+                self.app.on_app_switched(new_pkg)
             messagebox.showinfo("Saved", "Einstellungen gespeichert!")
 
     def save_settings_as(self):
@@ -70,14 +74,22 @@ class SettingsTab(ttk.Frame):
                 messagebox.showinfo("Gespeichert", f"Konfiguration gespeichert unter:\n{path}")
 
     def load_settings_file(self):
+        old_pkg = self.app.cfg.config.get("APP_PACKAGE", "")
         path = filedialog.askopenfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
         if path:
             self.app.cfg.load(path)
             self.populate_settings()
             self.app.history.data = self.app.history.load()
             self.app.history_tab.refresh_tree()
+            new_pkg = self.app.cfg.config.get("APP_PACKAGE", "")
+            if new_pkg != old_pkg and hasattr(self.app, "on_app_switched"):
+                self.app.on_app_switched(new_pkg)
             messagebox.showinfo("Geladen", f"Konfiguration geladen:\n{path}")
 
     def restore_defaults(self):
+        old_pkg = self.app.cfg.config.get("APP_PACKAGE", "")
         self.app.cfg.restore_defaults()
         self.populate_settings()
+        new_pkg = self.app.cfg.config.get("APP_PACKAGE", "")
+        if new_pkg != old_pkg and hasattr(self.app, "on_app_switched"):
+            self.app.on_app_switched(new_pkg)

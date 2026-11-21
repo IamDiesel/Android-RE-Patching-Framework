@@ -33,21 +33,33 @@ class Mem:
         if b is None: b=bytearray(PAGE); self.pages[p]=b
         return b,a-p
     def wb(self,a,data):
-        n=len(data); p=a&~(PAGE-1); o=a-p
+        if not isinstance(data,(bytes,bytearray,memoryview)): data=bytes(data)
+        n=len(data)
+        if n==0: return
+        p=a&~(PAGE-1); o=a-p
         if o+n<=PAGE:
             b=self.pages.get(p)
             if b is None: b=bytearray(PAGE); self.pages[p]=b
-            b[o:o+n]=bytes(data); return
-        for i in range(n):
-            b,oo=self._pg(a+i); b[oo]=data[i]
+            b[o:o+n]=data; return
+        mv=memoryview(data); i=0
+        while i<n:
+            chunk=min(PAGE-o,n-i)
+            b=self.pages.get(p)
+            if b is None: b=bytearray(PAGE); self.pages[p]=b
+            b[o:o+chunk]=mv[i:i+chunk]
+            i+=chunk; p+=PAGE; o=0
     def rb(self,a,n):
+        if n<=0: return b""
         p=a&~(PAGE-1); o=a-p
         if o+n<=PAGE:
             b=self.pages.get(p)
             return bytes(b[o:o+n]) if b is not None else bytes(n)
-        out=bytearray(n)
-        for i in range(n):
-            b,oo=self._pg(a+i); out[i]=b[oo]
+        out=bytearray(n); i=0
+        while i<n:
+            chunk=min(PAGE-o,n-i)
+            b=self.pages.get(p)
+            if b is not None: out[i:i+chunk]=b[o:o+chunk]
+            i+=chunk; p+=PAGE; o=0
         return bytes(out)
     def r(self,a,sz):
         p=a&~(PAGE-1); o=a-p
@@ -177,6 +189,9 @@ class CPU:
         self.md=None   # lazy: capstone erst bei cache-miss
         self.stub=stub or {}; self.cache={}; self.tcache={}; self.bb={}; self.probes={}
         self.inline_loops=True   # Self-Loop-JIT-Inlining; Analyse/Profiling: False fuer exakte maxins/Block-Counts
+        self.tpidr_el0=0
+        self.stopped=False
+        self.stop_reason=None
         self._REG={}
         for i in range(31):
             self._REG["x%d"%i]=(i,M64); self._REG["w%d"%i]=(i,0xffffffff)
@@ -498,12 +513,26 @@ class CPU:
             d=next(self.md.disasm_lite(bytes(self.m.rb(pc,4)),pc))   # (addr,size,mnemonic,op_str) -> picklable Tupel
             ins=(d[0],d[2],d[3]); self.cache[pc]=ins
         return ins
-    def run(self, entry, args=(), maxins=2000000000):
-        import gc
+    def invalidate_code(self, start=0, size=None):
+        if size is None:
+            self.bb.clear(); self.cache.clear(); self.tcache.clear(); return
+        end=int(start)+max(int(size),0)
+        bb_start=max(0,int(start)-1600)
+        for k in [p for p in self.cache if start<=p<end]:
+            del self.cache[k]
+        for k in [p for p in self.tcache if start<=p<end]:
+            del self.tcache[k]
+        for k in [p for p in self.bb if bb_start<=p<end]:
+            del self.bb[k]
+
+    def run(self, entry, args=(), maxins=2000000000, max_wall_s=None):
+        import gc, time as _t
         SENT=0xdead0000
         for i,a in enumerate(args):
             if i<31: self.x[i]=a&M64
         self.lr=SENT; self.pc=entry; c=0
+        self.stopped=False; self.stop_reason=None
+        deadline=(_t.monotonic()+float(max_wall_s)) if (max_wall_s is not None and float(max_wall_s)>0) else 0.0
         bb=self.bb; stub=self.stub; probes=self.probes
         has_probes=bool(probes)            # P2: Hoist statt Per-Block-Truthiness
         gcwas=gc.isenabled()
@@ -511,26 +540,33 @@ class CPU:
         try:
             while True:
                 pc=self.pc
-                if pc==SENT: return self.x[0]
+                if pc==SENT or self.stopped: return self.x[0]
                 if has_probes and pc in probes: probes[pc](self)
                 fn=stub.get(pc)
                 if fn is not None:
-                    nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr); continue
+                    nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr)
+                    if self.stopped: return self.x[0]
+                    continue
                 blk=bb.get(pc)
                 if blk is None:
                     blk=self._compile_block(pc); bb[pc]=blk
                 self.pc=blk(self); c+=1
+                if self.stopped: return self.x[0]
+                if deadline and (c&0x3ff)==0 and _t.monotonic()>deadline:
+                    raise Exception("timeout@0x%x"%self.pc)
                 if c>maxins: raise Exception("maxins@0x%x"%self.pc)
         finally:
             if gcwas: gc.enable()
 
-    def run_from(self, maxins=2000000000):
+    def run_from(self, maxins=2000000000, max_wall_s=None):
         """A2 (additiv): setzt die Ausfuehrung am AKTUELLEN pc/lr fort, ohne pc/lr/args
         neu zu initialisieren. Gleiche Dispatch-Semantik wie run(); run() bleibt unveraendert.
         Rueckkehr = x[0] beim Sentinel 0xdead0000 (identisch zu run())."""
-        import gc
+        import gc, time as _t
         SENT=0xdead0000
         c=0
+        self.stopped=False; self.stop_reason=None
+        deadline=(_t.monotonic()+float(max_wall_s)) if (max_wall_s is not None and float(max_wall_s)>0) else 0.0
         bb=self.bb; stub=self.stub; probes=self.probes
         has_probes=bool(probes)
         gcwas=gc.isenabled()
@@ -538,15 +574,20 @@ class CPU:
         try:
             while True:
                 pc=self.pc
-                if pc==SENT: return self.x[0]
+                if pc==SENT or self.stopped: return self.x[0]
                 if has_probes and pc in probes: probes[pc](self)
                 fn=stub.get(pc)
                 if fn is not None:
-                    nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr); continue
+                    nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr)
+                    if self.stopped: return self.x[0]
+                    continue
                 blk=bb.get(pc)
                 if blk is None:
                     blk=self._compile_block(pc); bb[pc]=blk
                 self.pc=blk(self); c+=1
+                if self.stopped: return self.x[0]
+                if deadline and (c&0x3ff)==0 and _t.monotonic()>deadline:
+                    raise Exception("timeout@0x%x"%self.pc)
                 if c>maxins: raise Exception("maxins@0x%x"%self.pc)
         finally:
             if gcwas: gc.enable()
@@ -634,7 +675,10 @@ class CPU:
     def _dv(self,tok,expr):
         low=tok.strip().lower()
         if low in ("xzr","wzr"): return "pass"
-        if low in ("sp","wsp","xsp","x30","w30"): return None
+        if low=="x30": return "cpu.lr=(%s)&M64"%expr
+        if low=="w30": return "cpu.lr=(%s)&0xffffffff"%expr
+        if low in ("sp","xsp"): return "cpu.sp=(%s)&M64"%expr
+        if low=="wsp": return "cpu.sp=(%s)&0xffffffff"%expr
         if low[:1] not in ("x","w"): return None
         try: n=int(low[1:])
         except: return None
@@ -1341,8 +1385,11 @@ class CPU:
             else: r=(-n)&M64 if hit else n
             self.wr(T[0],r); return nxt
         if m=="mrs":
-            self.wr(T[0], 0); return nxt          # tpidr_el0 -> 0 (TLS base); canary reads land in page 0
-        if m=="msr": return nxt
+            self.wr(T[0], int(getattr(self, "tpidr_el0", 0)) & M64); return nxt
+        if m=="msr":
+            if T and "tpidr_el0" in T[0].lower() and len(T)>1:
+                self.tpidr_el0=self.rd(T[1])&M64
+            return nxt
         if m=="nop": return nxt
         if m in("uxtb","uxth","uxtw","sxtb","sxth","sxtw"):
             v=self.rd(T[1])
@@ -1425,7 +1472,21 @@ class CPU:
                 bits=32 if self.is32(T[0]) else 64; sa=_sx(a,bits);sb=_sx(b,bits); q=abs(sa)//abs(sb); r=(q if (sa<0)==(sb<0) else -q)&M64
             self.wr(T[0],r&M64); return nxt
         if m=="dmb" or m=="dsb" or m=="isb" or m=="prfm" or m=="hint" or m=="sevl" or m=="yield": return nxt
-        raise Exception("unhandled opcode '%s' @0x%x : %s"%(m,pc,o))
+        if m=="svc" or m=="hvc" or m=="smc":
+            hk=getattr(self,"_svc_hook",None)
+            if hk is not None:
+                try: hk(self)
+                except Exception: pass
+            return nxt
+        if m=="brk" or m=="hlt": return nxt
+        # FR-4: strukturierter Unknown-Instr-Fehler (PC/Raw/Encoding/Mnemonic) statt stillem/generischem
+        # Abbruch -> speist den "unknown-instr -> implement"-Loop + Coverage. Lipy-Kontrakt gewahrt:
+        # lokaler Import mit Fallback auf die alte generische Exception, falls iface fehlt (lipy-standalone).
+        try:
+            from .iface import UnknownInstructionError
+        except ImportError:
+            raise Exception("unhandled opcode '%s' @0x%x : %s"%(m,pc,o))
+        raise UnknownInstructionError(pc, self.m.r32(pc), mnemonic=m, encoding=o)
     def _cond(self,cc):
         n,z,c,v=self.n,self.z,self.c,self.vf
         return {"eq":z==1,"ne":z==0,"cs":c==1,"hs":c==1,"cc":c==0,"lo":c==0,

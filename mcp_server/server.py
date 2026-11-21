@@ -144,9 +144,9 @@ def build_server(ctx, host, port):
                                                     source_file=source_file),
                            _summ(lib_id=lib_id, version=version))
     @mcp.tool(name="favorites_list")
-    def favorites_list() -> str:
-        """Favoriten-Patch-Saetze auflisten."""
-        return runtime.run(ctx, "favorites.list", lambda: tools.favorites_list(ctx))
+    def favorites_list(tool_type: str = "") -> str:
+        """Favoriten-Patch-Saetze auflisten (optional filterbar via tool_type='smali|libcarve|libforge|hex|lib_replace|kombi')."""
+        return runtime.run(ctx, "favorites.list", lambda: tools.favorites_list(ctx, tool_type), _summ(tool_type=tool_type))
 
     @mcp.tool(name="favorites_get")
     def favorites_get(ref: str) -> str:
@@ -159,10 +159,26 @@ def build_server(ctx, host, port):
         (z.B. '1.0') + 'description' (Zweck) auf Top-Ebene, dazu 'name' und 'patches':
         [{"type":"smali","file":..,"orig":..,"edit":..,"scope":"method"},
         {"type":"hex","file":..,"ram":..,"base":..,"orig":..,"patch":..},
+        {"type":"libcarve","file":..,"vaddr":..,"mode":"asm|c_cave|hex","edit":..,"aob":..},
+        {"type":"libforge","name":..,"source_code":..,"abi":"arm64-v8a"},
         {"type":"lib_replace","target":..,"source":..},
         {"type":"new_file","file":..,"edit":..}]. Einzel-Patch-Kurzform ok.
         NEUER Favorit = neuer Patch-Pfad; Bugfix am selben -> favorites.update mit Version-Bump."""
         return runtime.run(ctx, "favorites.add", lambda: tools.favorites_add(ctx, favorite_json), "favorite")
+
+    @mcp.tool(name="favorites_append")
+    def favorites_append(ref: str, patch_json: str) -> str:
+        """Haengt einen oder mehrere Patches (auch anderer Tool-Typen fuer Multi-Tool-Kombi) an einen bestehenden Favoriten (Index/Name) an."""
+        return runtime.run(ctx, "favorites.append",
+                           lambda: tools.favorites_append(ctx, ref, patch_json), _summ(ref=ref))
+
+    @mcp.tool(name="favorites_combine")
+    def favorites_combine(refs_json: str, name: str, version: str = "1.0", description: str = "") -> str:
+        """Kombiniert >= 2 Favoriten (refs_json = JSON-Liste aus Indizes oder Namen) zu einem neuen Multi-Tool-Favoriten."""
+        return runtime.run(ctx, "favorites.combine",
+                           lambda: tools.favorites_combine(ctx, refs_json, name, version=version, description=description),
+                           _summ(name=name, version=version))
+
     @mcp.tool(name="favorites_update")
     def favorites_update(ref: str, favorite_json: str) -> str:
         """Favoriten ersetzen (Index/Name). Gleiches JSON-Schema wie favorites_add (inkl. PFLICHT
@@ -193,10 +209,11 @@ def build_server(ctx, host, port):
         patch_json = EIN Patch-Objekt ODER {"patches":[...]}. Typen:
         {"type":"smali","file":..,"orig":..,"edit":..,"scope":"method"|"file"},
         {"type":"hex","file":..,"ram":..,"base":..,"orig":..,"patch":..},
+        {"type":"libcarve","file":..,"vaddr":..,"mode":"asm|c_cave|hex","edit":..,"aob":..},
         {"type":"lib_replace","target":..,"source":..},
-        {"type":"new_file","file":..,"edit":..}. Smali wird gegen den Baum evaluiert
-        (exact/structural/append); 'orig' wird aus dem Treffer gesetzt. Idempotent (already_active).
-        Danach: pipeline_run('BUILD_NATIVE') (gated) baut genau diese aktive Liste."""
+        {"type":"new_file","file":..,"edit":..}. Smali/LibCarve werden gegen den Bestand evaluiert
+        (exact/structural/AOB); Idempotent (already_active).
+        Zum Testen ohne Build: native_glass_run(zone='live'). Build: pipeline_run('BUILD_NATIVE')."""
         return runtime.run(ctx, "patch.apply", lambda: tools.patch_apply(ctx, patch_json), "patch")
 
     @mcp.tool(name="patch_apply_favorite")
@@ -494,6 +511,66 @@ def build_server(ctx, host, port):
                            lambda: tools.native_dbg_resume(ctx, folder, budget, mode),
                            _summ(budget=budget), confirm=confirm)
 
+    @mcp.tool(name="native_os_summary")
+    def native_os_summary() -> str:
+        """Read-only: letzte OS-Substrat-Summary (coverage/trace/net/threads/signals/auxv/policy) der
+        letzten native.os_attach-Session. Zwei Policy-Ebenen: NR-keyed Seed-Policy
+        (native.syscall_policy_*) vs. OS-9 namens-keyed allow/deny/stub (os_attach syscall_policy=)."""
+        return runtime.run(ctx, "native.os_summary", lambda: tools.native_os_summary(ctx))
+
+    @mcp.tool(name="native_os_config_get")
+    def native_os_config_get() -> str:
+        """Read-only: geteilten OS-Inspektor-Zustand (config-Delta + letzte Summary + seq/writer) lesen."""
+        return runtime.run(ctx, "native.os_config_get", lambda: tools.native_os_config_get(ctx))
+
+    @mcp.tool(name="native_os_config_set")
+    def native_os_config_set(config: Optional[dict] = None, base_seq: Optional[int] = None,
+                             force: bool = False, confirm: bool = False) -> str:
+        """OS-Inspektor-config setzen (writer=ki, Clobber-Schutz base_seq): Policy/Overrides/Replay/Seed/
+        Trace/VFS. Freigabe os_write + confirm. Der Mensch zieht in der GUI mit '⬇ OS←KI' nach."""
+        return runtime.run(ctx, "native.os_config_set",
+                           lambda: tools.native_os_config_set(ctx, config, base_seq, bool(force)),
+                           _summ(), confirm=confirm)
+
+    @mcp.tool(name="native_session_get")
+    def native_session_get(folder: Optional[str] = None) -> str:
+        """Geteilten Native-Studio-Zustand ansehen: Lib + Eingaben + letztes Ergebnis (read-only)."""
+        return runtime.run(ctx, "native.session_get", lambda: tools.native_session_get(ctx, folder))
+
+    @mcp.tool(name="native_session_set")
+    def native_session_set(folder: Optional[str] = None, lib: Optional[str] = None,
+                           inputs: Optional[dict] = None, run_workflow: Optional[str] = None,
+                           base_seq: Optional[int] = None, confirm: bool = False) -> str:
+        """Studio-Zustand setzen (Lib/Eingaben, optional Workflow) + zurueckschreiben (Freigabe session_write + confirm)."""
+        return runtime.run(ctx, "native.session_set",
+                           lambda: tools.native_session_set(ctx, folder, lib, inputs, run_workflow, base_seq),
+                           _summ(lib=lib, run_workflow=run_workflow), confirm=confirm)
+
+    @mcp.tool(name="native_recipe_list")
+    def native_recipe_list() -> str:
+        """Gespeicherte Workflow-Rezepte lesen (Name + Workflow + Params)."""
+        return runtime.run(ctx, "native.recipe_list", lambda: tools.native_recipe_list(ctx))
+
+    @mcp.tool(name="native_recipe_run")
+    def native_recipe_run(name: str) -> str:
+        """Gespeichertes Rezept ausfuehren (sein Workflow mit den Params)."""
+        return runtime.run(ctx, "native.recipe_run", lambda: tools.native_recipe_run(ctx, name), _summ(name=name))
+
+    @mcp.tool(name="native_plugins")
+    def native_plugins() -> str:
+        """Entdeckte native_plugins/ auflisten: Namen + GUI-Beitraege (read-only)."""
+        return runtime.run(ctx, "native.plugins", lambda: tools.native_plugins(ctx))
+
+    @mcp.tool(name="native_annotations_get")
+    def native_annotations_get(path: str) -> str:
+        """Annotationen (eigene Namen/Notizen je Adresse) einer Lib lesen (read-only)."""
+        return runtime.run(ctx, "native.annotations_get", lambda: tools.native_annotations_get(ctx, path), _summ(path=path))
+
+    @mcp.tool(name="native_annotate")
+    def native_annotate(path: str, addr: str, name: str, note: str = "") -> str:
+        """Eigenen Namen/Notiz fuer eine Adresse setzen (geteilt mit der GUI-Outline)."""
+        return runtime.run(ctx, "native.annotate", lambda: tools.native_annotate(ctx, path, addr, name, note), _summ(path=path, addr=addr))
+
     @mcp.tool(name="native_jni_run")
     def native_jni_run(budget: int = 400000, stop_at_rasp: bool = True,
                        lib: Optional[str] = None) -> str:
@@ -524,6 +601,218 @@ def build_server(ctx, host, port):
         """Benannten Checkpoint in die Live-Debug-Sitzung kopieren (danach in der GUI ⬇ Von KI)."""
         return runtime.run(ctx, "native.dbg_ckpt_activate",
                            lambda: tools.native_dbg_ckpt_activate(ctx, name), _summ(name=name))
+
+    @mcp.tool(name="native_dispatch_trace")
+    def native_dispatch_trace(budget: int = 3000000, run_into_trap: bool = True,
+                              lib: str = None) -> str:
+        """CFF-2D-vtable Dispatch-Tracer: findet Divergenz (erste getaintete) + Trap (erster leerer Slot)."""
+        return runtime.run(ctx, "native.dispatch_trace",
+                           lambda: tools.native_dispatch_trace(ctx, budget, run_into_trap, lib),
+                           _summ(budget=budget))
+
+    @mcp.tool(name="native_survive_run")
+    def native_survive_run(budget: int = 8000000, lib: str = None) -> str:
+        """RASP Survival Mode + Syscall-Trace: JNI_OnLoad ueber die Trap hinaus, Detection-Syscalls aufzeichnen."""
+        return runtime.run(ctx, "native.survive_run",
+                           lambda: tools.native_survive_run(ctx, budget, lib),
+                           _summ(budget=budget))
+
+    @mcp.tool(name="native_syscall_policy_get")
+    def native_syscall_policy_get() -> str:
+        """Syscall-Policy lesen (geraeteechte svc-Rueckgaben fuer survive_run)."""
+        return runtime.run(ctx, "native.syscall_policy_get",
+                           lambda: tools.native_syscall_policy_get(ctx))
+
+    @mcp.tool(name="native_syscall_policy_set")
+    def native_syscall_policy_set(policy: str = None, preset: str = None) -> str:
+        """Syscall-Policy setzen/persistieren (preset 'genuine'/'clear' oder JSON {default_ret,by_nr})."""
+        return runtime.run(ctx, "native.syscall_policy_set",
+                           lambda: tools.native_syscall_policy_set(ctx, policy, preset),
+                           _summ(preset=preset))
+
+    @mcp.tool(name="native_devirt")
+    def native_devirt(entry: str = "onSearchResult", budget: int = 4000000,
+                      lib: str = None, input_str: str = "0123456789ABCDEF",
+                      runs: int = 4, lift_max: int = 25000) -> str:
+        """Devirtualizer (v2): OLLVM-geflachte Funktion entflachen. runs>1 (Default 4) fuehrt die
+        Funktion mit variierten Eingaben aus und baut eine Branch-CFG (Fan-out + Branch-Points +
+        Index-Entscheidungstabelle). lift_max = max. Instruktionen fuer den Python-Lift
+        (0 = nie liften, gross = immer; Default 25000 -> grosse Funktionen wie JNI_OnLoad nur CFG)."""
+        return runtime.run(ctx, "native.devirt",
+                           lambda: tools.native_devirt(ctx, entry, budget, lib, input_str,
+                                                       runs=int(runs), lift_max=int(lift_max)),
+                           _summ(entry=entry, runs=runs, lift_max=lift_max))
+
+    @mcp.tool(name="native_devirt_static")
+    def native_devirt_static(entry: str = "onSearchResult", max_blocks: int = 400,
+                             lib: str = None) -> str:
+        """Statischer Devirtualizer: Dispatch-Graph einer OLLVM-geflachten Funktion OHNE Lauf der
+        Zielfunktion (1D-madd 0x134f48 + 2D-smaddl-Vtable 0x137740). entry = JNI_OnLoad |
+        onSearchResult | getOptionsList | Hex-Adresse. Liefert Bloecke/Branch-Points/Traps."""
+        return runtime.run(ctx, "native.devirt_static",
+                           lambda: tools.native_devirt_static(ctx, entry, int(max_blocks), lib),
+                           _summ(entry=entry, max_blocks=max_blocks))
+
+    @mcp.tool(name="native_devirt_hybrid")
+    def native_devirt_hybrid(entry: str = "onSearchResult", budget: int = 4000000,
+                             lib: str = None, input_str: str = "0123456789ABCDEF",
+                             max_blocks: int = 400, max_unique: int = 48) -> str:
+        """Hybrid-Devirt: statischer Dispatch-Graph (`devirt_static`) ⊕ getracter Branch-Zustand
+        (ein Lauf mit `dispatch_trace`+`survive`). Loest register-abhaengige Branch-Points und
+        statische Traps/Luecken durch den real genommenen Pfad auf; Coverage + Provenienz je Block.
+        entry = JNI_OnLoad | onSearchResult | getOptionsList | Hex-Adresse."""
+        return runtime.run(ctx, "native.devirt_hybrid",
+                           lambda: tools.native_devirt_hybrid(ctx, entry, int(budget), lib,
+                                                              input_str, int(max_blocks), int(max_unique)),
+                           _summ(entry=entry))
+
+    @mcp.tool(name="native_os_attach")
+    def native_os_attach(entry: str = "JNI_OnLoad", maps: str = None, vfs: str = None,
+                         config: str = None, budget: int = 200000, survive: bool = True,
+                         lib: str = None, net_replay: str = None, net_mode: str = None,
+                         trace: bool = False, trace_max: int = 4096,
+                         syscall_policy: str = None) -> str:
+        """Env/Syscall-Substrat (OS-1..OS-9) anhaengen und eine Funktion unter kontrollierter
+        Fake-Umgebung laufen lassen. maps = gefaelschte /proc/self/maps; vfs = {pfad:inhalt} (JSON);
+        config = {uid,pid,tid,...} (JSON); entry = JNI_OnLoad | Hex-Adresse.
+        OS-9-Komfort: net_replay = {"host:port": bytes/str} (JSON) + net_mode (record|replay|off);
+        trace = Syscall-Trace-Ring an (+ trace_max); syscall_policy = {"name": "allow|deny|stub"} (JSON).
+        Liefert Env/Syscall-Summary (inkl. coverage/trace/net/threads/signals/auxv) + survived + JNI."""
+        return runtime.run(ctx, "native.os_attach",
+                           lambda: tools.native_os_attach(ctx, entry, maps, vfs, config,
+                                                          int(budget), bool(survive), lib,
+                                                          net_replay, net_mode, bool(trace),
+                                                          int(trace_max), syscall_policy),
+                           _summ(entry=entry))
+
+    @mcp.tool(name="native_dalvik_run")
+    def native_dalvik_run(smali: str = None, cls: str = None, name: str = None, sig: str = None,
+                          args: str = None, maxins: int = 200000) -> str:
+        """J1: Smali (.class/.method) parsen und eine Dalvik-Methode ausfuehren (Register-VM:
+        Opcodes/Objektmodell/Intra-Invoke, generisch, read-only). args als JSON-Liste; cls/name/sig
+        waehlen die Methode (Default: erste). Liefert Ergebnis + Methoden + Coverage + missing."""
+        return runtime.run(ctx, "native.dalvik_run",
+                           lambda: tools.native_dalvik_run(ctx, smali, cls, name, sig, args,
+                                                           int(maxins)),
+                           _summ(method=name or "(default)"))
+
+    @mcp.tool(name="native_dex_run")
+    def native_dex_run(dex_path: str = None, cls: str = None, name: str = None, sig: str = None,
+                       args: str = None, maxins: int = 1000000) -> str:
+        """J3/MS-4: DEX laden und eine Methode ausfuehren (DalvikVM + lazy Klassen-Loader/<clinit> +
+        android.*-Stubs im Coverage-Loop). args als JSON-Liste. Liefert Ergebnis + Coverage +
+        nicht aufgeloeste Dalvik-/Framework-Aufrufe."""
+        return runtime.run(ctx, "native.dex_run",
+                           lambda: tools.native_dex_run(ctx, dex_path, cls, name, sig, args,
+                                                        int(maxins)),
+                           _summ(cls=cls, method=name))
+
+    @mcp.tool(name="native_jdbg_run")
+    def native_jdbg_run(smali: str = None, cls: str = None, name: str = None, sig: str = None,
+                        args: str = None, breakpoints: str = None, set_regs: str = None,
+                        max_steps: int = 200000, studio_root: str = None,
+                        zone: str = "original") -> str:
+        """X1/MS-6: Smali-Methode unter dem Java-Debugger ausfuehren (skriptbasiert). breakpoints =
+        JSON-Liste von pc-Indizes; set_regs = JSON {index: wert} (Mutation am 1. Treffer). Liefert
+        Breakpoint-Beobachtungen + Timeline-Laenge + Ergebnis."""
+        return runtime.run(ctx, "native.jdbg_run",
+                           lambda: tools.native_jdbg_run(ctx, smali, cls, name, sig, args,
+                                                        breakpoints, set_regs, int(max_steps),
+                                                        studio_root, zone),
+                           _summ(method=name or "(default)"))
+
+    @mcp.tool(name="native_app_lifecycle_run")
+    def native_app_lifecycle_run(studio_root: str = None, zone: str = "original",
+                                 entry: str = None, max_steps: int = 400000) -> str:
+        """MS-4 (erste Slice): ganze App am Lifecycle-Einstieg starten. entry = Deskriptor
+        (Lcom/foo/MainActivity;); studio_root + zone (original|patched) = Smali-Baum der Zone.
+        Ruft <init>/onCreate/onStart/onResume auf, laedt Callees lazy, meldet called/skipped/missing."""
+        return runtime.run(ctx, "native.app_lifecycle_run",
+                           lambda: tools.native_app_lifecycle_run(ctx, studio_root, zone,
+                                                                  entry, int(max_steps)),
+                           _summ(method=entry or "(entry)"))
+
+    @mcp.tool(name="native_glass_run")
+    def native_glass_run(studio_root: str = None, zone: str = "original", entry: str = None,
+                         action_points: str = None, net_replay: str = None,
+                         max_steps: int = 400000, seam_profile: str = "self_cache",
+                         java_cutoffs: str = None, jni_cutoffs: str = None,
+                         net_condition: str = None, instance_id: str = None,
+                         native_fusion: bool = False) -> str:
+        """Glaeserner App-Lauf via GlassAppRunner (zone=original|live|destination; live=Zero-Build-Overlay aktiver Patches)."""
+        return runtime.run(ctx, "native.glass_run",
+                           lambda: tools.native_glass_run(
+                               ctx, studio_root, zone, entry, action_points, net_replay,
+                               int(max_steps), seam_profile, java_cutoffs, jni_cutoffs,
+                               net_condition, instance_id, bool(native_fusion)),
+                           _summ(entry=entry or "(Manifest)", seam=seam_profile))
+
+    @mcp.tool(name="native_glass_state")
+    def native_glass_state() -> str:
+        """Read-only: aktuellen Live-Zustand des Glass-Debuggers lesen."""
+        return runtime.run(ctx, "native.glass_state", lambda: tools.native_glass_state(ctx), _summ())
+
+    @mcp.tool(name="native_glass_control")
+    def native_glass_control(cmd: str, params_json: str = None) -> str:
+        """Steuerkommando an die GUI/Debugger-Queue senden (open_debugger/set_bp/set_net_condition/load_fork)."""
+        return runtime.run(ctx, "native.glass_control",
+                           lambda: tools.native_glass_control(ctx, cmd, params_json),
+                           _summ(cmd=cmd))
+
+    @mcp.tool(name="native_glass_fork")
+    def native_glass_fork(op: str = "list", package: str = None, fork_id: str = None,
+                          label: str = "", project_name: str = None) -> str:
+        """Forks & Projekt-Snapshots verwalten (list | fork | merge | discard | save_project | load_project)."""
+        return runtime.run(ctx, "native.glass_fork",
+                           lambda: tools.native_glass_fork(ctx, op, package, fork_id, label, project_name),
+                           _summ(op=op, fork_id=fork_id or ""))
+
+    @mcp.tool(name="native_net_log")
+    def native_net_log() -> str:
+        """Read-only: NetLog des letzten native.glass_run lesen."""
+        return runtime.run(ctx, "native.net_log", lambda: tools.native_net_log(ctx), _summ())
+
+    @mcp.tool(name="native_ui_snapshot")
+    def native_ui_snapshot() -> str:
+        """Read-only (gläsern): UI-Momentaufnahme des letzten native.glass_run (Paint/Texte/Knoten)."""
+        return runtime.run(ctx, "native.ui_snapshot", lambda: tools.native_ui_snapshot(ctx), _summ())
+
+    @mcp.tool(name="native_ui_detect")
+    def native_ui_detect(studio_root: str = None) -> str:
+        """Gläsern: erkennt das UI-Toolkit einer entpackten App und nennt den Render-Produzenten."""
+        return runtime.run(ctx, "native.ui_detect",
+                           lambda: tools.native_ui_detect(ctx, studio_root), _summ())
+
+    @mcp.tool(name="native_ui_render")
+    def native_ui_render(path: str = None, title: str = None) -> str:
+        """Gläsern: rendert die zuletzt gläserne UI zu PNG (am Ende kommt echte Grafik raus)."""
+        return runtime.run(ctx, "native.ui_render",
+                           lambda: tools.native_ui_render(ctx, path, title), _summ())
+
+    @mcp.tool(name="native_ui_tap")
+    def native_ui_tap(x: float = 0, y: float = 0) -> str:
+        """Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen."""
+        return runtime.run(ctx, "native.ui_tap",
+                           lambda: tools.native_ui_tap(ctx, x, y), _summ(x=x, y=y))
+
+    @mcp.tool(name="native_ui_key")
+    def native_ui_key(text: str = "") -> str:
+        """Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben."""
+        return runtime.run(ctx, "native.ui_key",
+                           lambda: tools.native_ui_key(ctx, text), _summ())
+
+    @mcp.tool(name="native_workflow")
+    def native_workflow(name: str = "devirt", params: str = None) -> str:
+        """Workflow ausfuehren (open_lib/run_fn/devirt/gate2/jni); params als JSON-String."""
+        return runtime.run(ctx, "native.workflow",
+                           lambda: tools.native_workflow(ctx, name, params),
+                           _summ(workflow=name))
+
+    @mcp.tool(name="native_workflow_meta")
+    def native_workflow_meta() -> str:
+        """Workflow-Registry (Rail + Formularfelder) fuer die GUI."""
+        return runtime.run(ctx, "native.workflow_meta",
+                           lambda: tools.native_workflow_meta(ctx), _summ())
 
     @mcp.tool(name="device_info")
     def device_info() -> str:
@@ -600,6 +889,32 @@ def build_server(ctx, host, port):
     def api_get(req_id: int) -> str:
         """Einen Traffic-Datensatz komplett (Bodies/Headers) per ID holen."""
         return runtime.run(ctx, "api.get", lambda: tools.api_get(ctx, req_id), _summ(req_id=req_id))
+
+    @mcp.tool(name="api_rules_list")
+    def api_rules_list() -> str:
+        """Aktive HTTP Intercept-Regeln (intercept_rules.json) auflisten."""
+        return runtime.run(ctx, "api.rules_list", lambda: tools.api_rules_list(ctx), _summ())
+
+    @mcp.tool(name="api_rules_set")
+    def api_rules_set(rules_json: str, append: bool = False) -> str:
+        """Intercept-Regeln setzen oder ergaenzen (JSON-Liste von {url_match, action, payload})."""
+        return runtime.run(ctx, "api.rules_set",
+                           lambda: tools.api_rules_set(ctx, rules_json, bool(append)),
+                           _summ(append=append))
+
+    @mcp.tool(name="api_extract_flutter_static")
+    def api_extract_flutter_static(app_root: Optional[str] = None) -> str:
+        """Statische Cognito-/AppSync-GraphQL-/REST-Vorlagen aus flutter_assets & libapp.so extrahieren (optional, ohne Engine-Boot)."""
+        return runtime.run(ctx, "api.extract_flutter_static",
+                           lambda: tools.api_extract_flutter_static(ctx, app_root),
+                           _summ(app_root=app_root or "(auto)"))
+
+    @mcp.tool(name="api_import_templates")
+    def api_import_templates(templates_json: str, app_root: Optional[str] = None) -> str:
+        """Ausgewaehlte statische API-Vorlagen (JSON-Liste von Vorlagen-Dicts oder Vorlagen-IDs) in die API Inspector DB (api_traffic.db) uebernehmen."""
+        return runtime.run(ctx, "api.import_templates",
+                           lambda: tools.api_import_templates(ctx, templates_json, app_root),
+                           _summ(app_root=app_root or "(auto)"))
 
     # ---------------- J: Historie / Reporting ----------------
     @mcp.tool(name="history_list")
@@ -720,6 +1035,145 @@ def build_server(ctx, host, port):
     def proxy_stop() -> str:
         """Lokalen mitmdump stoppen."""
         return runtime.run(ctx, "proxy.stop", lambda: tools.proxy_stop(ctx))
+
+    # ---------------- N: LibCarve (Native Decompile & Patch Studio) ----------------
+    @mcp.tool(name="libcarve_libs")
+    def libcarve_libs() -> str:
+        """Alle verfuegbaren .so-Bibliotheken (APK + Self-Cache) inkl. ELF-Infos auflisten."""
+        return runtime.run(ctx, "libcarve.libs", lambda: tools.libcarve_libs(ctx))
+
+    @mcp.tool(name="libcarve_outline")
+    def libcarve_outline(path: str, filter: str = "", limit: int = 500) -> str:
+        """Funktions-Outline (JNI/Exports/Init/sub_) und Imports einer .so lesen."""
+        return runtime.run(ctx, "libcarve.outline",
+                           lambda: tools.libcarve_outline(ctx, path, filter, int(limit)),
+                           _summ(path=path, filter=filter))
+
+    @mcp.tool(name="libcarve_search")
+    def libcarve_search(path: str, term: str, mode: str = "func", limit: int = 200) -> str:
+        """RAM-Index durchsuchen (mode=func|str|asm|aob|addr; aob unterstuetzt Wildcards '??')."""
+        return runtime.run(ctx, "libcarve.search",
+                           lambda: tools.libcarve_search(ctx, path, term, mode, int(limit)),
+                           _summ(path=path, term=term, mode=mode))
+
+    @mcp.tool(name="libcarve_inspect_func")
+    def libcarve_inspect_func(path: str, func_or_addr: str, max_insns: int = 200) -> str:
+        """Komplettkontext einer Funktion: ARM64-Disasm, ggf. Ghidra-C, Relocation-AOB-Signatur, Annotationen."""
+        return runtime.run(ctx, "libcarve.inspect_func",
+                           lambda: tools.libcarve_inspect_func(ctx, path, func_or_addr, int(max_insns)),
+                           _summ(path=path, func=func_or_addr))
+
+    @mcp.tool(name="libcarve_decompile")
+    def libcarve_decompile(path: str, func_or_addr: str, run: bool = False) -> str:
+        """Ghidra-C-Decompilierung lesen (run=true startet Decompilierung im Hintergrund)."""
+        return runtime.run(ctx, "libcarve.decompile",
+                           lambda: tools.libcarve_decompile(ctx, path, func_or_addr, bool(run)),
+                           _summ(path=path, func=func_or_addr, run=run))
+
+    @mcp.tool(name="libcarve_xrefs")
+    def libcarve_xrefs(path: str, func_or_addr: str, limit: int = 200) -> str:
+        """Eingehende Code- und Relocation-XREFs auf eine Zieladresse/Funktion."""
+        return runtime.run(ctx, "libcarve.xrefs",
+                           lambda: tools.libcarve_xrefs(ctx, path, func_or_addr, int(limit)),
+                           _summ(path=path, target=func_or_addr))
+
+    @mcp.tool(name="libcarve_callgraph")
+    def libcarve_callgraph(path: str, func_or_addr: str, depth: int = 2) -> str:
+        """Ausgehende Calls und Call-Hierarchy einer Funktion (depth=1..4)."""
+        return runtime.run(ctx, "libcarve.callgraph",
+                           lambda: tools.libcarve_callgraph(ctx, path, func_or_addr, int(depth)),
+                           _summ(path=path, target=func_or_addr, depth=depth))
+
+    @mcp.tool(name="libcarve_datagraph")
+    def libcarve_datagraph(path: str, func_or_addr: str, limit: int = 200) -> str:
+        """Lese-/Schreib-Zugriffe einer Funktion auf Strings, Globals und Relocations."""
+        return runtime.run(ctx, "libcarve.datagraph",
+                           lambda: tools.libcarve_datagraph(ctx, path, func_or_addr, int(limit)),
+                           _summ(path=path, target=func_or_addr))
+
+    @mcp.tool(name="libcarve_match_pattern")
+    def libcarve_match_pattern(path: str, patch_json: str) -> str:
+        """Wildcard-AOB-/Anker-Signatur trocken gegen eine .so-Bibliothek matchen."""
+        return runtime.run(ctx, "libcarve.match_pattern",
+                           lambda: tools.libcarve_match_pattern(ctx, path, patch_json),
+                           _summ(path=path))
+
+    @mcp.tool(name="libcarve_session_get")
+    def libcarve_session_get() -> str:
+        """Geteilten Workspace/LibCarve Mensch<->KI Zustand (Fokus, Entwurf, seq) lesen."""
+        return runtime.run(ctx, "libcarve.session_get", lambda: tools.libcarve_session_get(ctx))
+
+    @mcp.tool(name="libcarve_assemble_preview")
+    def libcarve_assemble_preview(code: str, mode: str = "asm", vaddr: str = "0",
+                                  orig_size: int = 0, func_name: str = "carve_entry") -> str:
+        """ARM64-ASM oder C-Cave trocken kompilieren inkl. Byte-Groesse & NOP-Budget-Check."""
+        return runtime.run(ctx, "libcarve.assemble_preview",
+                           lambda: tools.libcarve_assemble_preview(ctx, code, mode, vaddr, int(orig_size), func_name),
+                           _summ(mode=mode, vaddr=vaddr))
+
+    @mcp.tool(name="libcarve_patch_list")
+    def libcarve_patch_list() -> str:
+        """Aktive LibCarve-Patches der laufenden Session auflisten."""
+        return runtime.run(ctx, "libcarve.patch_list", lambda: tools.libcarve_patch_list(ctx))
+
+    @mcp.tool(name="libcarve_patch_add")
+    def libcarve_patch_add(file: str, vaddr_or_func: str, code: str, mode: str = "asm",
+                           description: str = "", abi: str = "arm64-v8a",
+                           orig_size: int = 0, aob: str = "") -> str:
+        """LibCarve-Patch (mode=asm|c_cave|hex + automatische AOB-Signatur) aktivieren."""
+        return runtime.run(ctx, "libcarve.patch_add",
+                           lambda: tools.libcarve_patch_add(
+                               ctx, file, vaddr_or_func, code, mode, description, abi, int(orig_size), aob),
+                           _summ(file=file, target=vaddr_or_func, mode=mode))
+
+    @mcp.tool(name="libcarve_patch_update")
+    def libcarve_patch_update(index: int, code: str = "", mode: str = "", description: str = "") -> str:
+        """Aktiven LibCarve-Patch per Index aktualisieren."""
+        return runtime.run(ctx, "libcarve.patch_update",
+                           lambda: tools.libcarve_patch_update(ctx, int(index), code, mode, description),
+                           _summ(index=index))
+
+    @mcp.tool(name="libcarve_patch_remove")
+    def libcarve_patch_remove(index: int) -> str:
+        """Aktiven LibCarve-Patch per Index aus der Session entfernen."""
+        return runtime.run(ctx, "libcarve.patch_remove",
+                           lambda: tools.libcarve_patch_remove(ctx, int(index)),
+                           _summ(index=index))
+
+    @mcp.tool(name="libcarve_cave_save")
+    def libcarve_cave_save(name: str, code: str, file: str = "", vaddr: str = "") -> str:
+        """Wiederverwendbare C-Cave- oder ASM-Vorlage persistent ablegen."""
+        return runtime.run(ctx, "libcarve.cave_save",
+                           lambda: tools.libcarve_cave_save(ctx, name, code, file, vaddr),
+                           _summ(name=name))
+
+    @mcp.tool(name="libcarve_annotate")
+    def libcarve_annotate(path: str, func_or_addr: str, name: str, note: str = "") -> str:
+        """Funktion/Adresse in LibCarve dauerhaft umbenennen oder kommentieren."""
+        return runtime.run(ctx, "libcarve.annotate",
+                           lambda: tools.libcarve_annotate(ctx, path, func_or_addr, name, note),
+                           _summ(path=path, target=func_or_addr, name=name))
+
+    @mcp.tool(name="libcarve_gui_focus")
+    def libcarve_gui_focus(lib: str = "", vaddr: str = "", draft_code: str = "", mode: str = "asm") -> str:
+        """GUI-Workspace auf LibCarve (+ Lib/VAddr/Entwurf) fokussieren."""
+        return runtime.run(ctx, "libcarve.gui_focus",
+                           lambda: tools.libcarve_gui_focus(ctx, lib, vaddr, draft_code, mode),
+                           _summ(lib=lib, vaddr=vaddr))
+
+    @mcp.tool(name="libcarve_session_set")
+    def libcarve_session_set(staged_json: str, base_seq: Optional[int] = None, confirm: bool = False) -> str:
+        """Geteilten LibCarve-KI-Sync-Zustand mit Clobber-Schutz schreiben. Gated: session_write + confirm."""
+        return runtime.run(ctx, "libcarve.session_set",
+                           lambda: tools.libcarve_session_set(ctx, staged_json, base_seq),
+                           _summ(base_seq=base_seq), confirm=confirm)
+
+    @mcp.tool(name="libcarve_compile")
+    def libcarve_compile(file: str, abi: str = "arm64-v8a", confirm: bool = False) -> str:
+        """Gepatchte .so mit aktiven LibCarve-Patches nach data/libcarve/ kompilieren. Gated: build + confirm."""
+        return runtime.run(ctx, "libcarve.compile",
+                           lambda: tools.libcarve_compile(ctx, file, abi),
+                           _summ(file=file, abi=abi), confirm=confirm)
 
     return mcp
 

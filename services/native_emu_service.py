@@ -43,29 +43,30 @@ _M64 = (1 << 64) - 1
 def _classify_run_exc(e):
     """Klassifiziert eine Run-Ausnahme fuer das Ergebnis-Dict.
 
-    'maxins@0x..' ist KEIN Fehler, sondern das erreichte Instruktionsbudget
-    (Watchdog der Emulationsschleife) -> why='maxins' mit Zieladresse (at/pc).
+    'maxins@0x..' / 'timeout@0x..' / 'stall@0x..' sind KEINE Abstuerze, sondern kontrollierte
+    Budgets/Limits -> why='maxins'|'timeout'|'stall' mit Zieladresse (at/pc).
     Alles andere bleibt why='error'. Rein additiv; aendert keinen Erfolgspfad."""
     s = repr(e)
-    if "maxins@" in s:
-        pc = None
-        try:
-            frag = s.split("maxins@", 1)[1]
-            if frag[:2] in ("0x", "0X"):
-                hexs = "0x"
-                for ch in frag[2:]:
-                    if ch in "0123456789abcdefABCDEF":
-                        hexs += ch
-                    else:
-                        break
-                pc = int(hexs, 16)
-        except Exception:
+    for tag, why in (("maxins@", "maxins"), ("timeout@", "timeout"), ("stall@", "stall")):
+        if tag in s:
             pc = None
-        d = {"why": "maxins", "error": s}
-        if pc is not None:
-            d["at"] = f"0x{pc:x}"
-            d["pc"] = pc & _M64
-        return d
+            try:
+                frag = s.split(tag, 1)[1]
+                if frag[:2] in ("0x", "0X"):
+                    hexs = "0x"
+                    for ch in frag[2:]:
+                        if ch in "0123456789abcdefABCDEF":
+                            hexs += ch
+                        else:
+                            break
+                    pc = int(hexs, 16)
+            except Exception:
+                pc = None
+            d = {"why": why, "error": s}
+            if pc is not None:
+                d["at"] = f"0x{pc:x}"
+                d["pc"] = pc & _M64
+            return d
     return {"why": "error", "error": s}
 _ARENA_BASE = 0x70000000  # Scratch-Arena fuer Pointer/Buffer-Argumente (weit ueber den Lade-Segmenten)
 
@@ -87,13 +88,19 @@ class NativeEmuService:
     def new_engine(self) -> Arm64Engine:
         return Arm64Engine()
 
-    def load_image(self, eng: Arm64Engine, image, apply_relocs: bool = False) -> int:
+    def load_image(self, eng: Arm64Engine, image, apply_relocs: bool = False,
+                   load_bias: int = 0) -> int:
         """ElfImage in die Engine laden (Segmente + Permissions). apply_relocs=True wendet
         zusaetzlich die Relocations an (fuellt Dispatch-/Call-Zeiger obfuskierter Libs) —
         Default aus, damit der WB-Krypto-Pfad bit-exakt bleibt. Rueckgabe: Anzahl Relocs."""
-        eng.load_image(image)
+        if int(load_bias):
+            eng.load_image(image, load_bias=int(load_bias))
+        else:
+            eng.load_image(image)
         if apply_relocs:
             try:
+                if int(load_bias):
+                    return eng.apply_relocations(image, load_bias=int(load_bias))
                 return eng.apply_relocations(image)
             except Exception:
                 return 0
@@ -133,7 +140,8 @@ class NativeEmuService:
     # ---- Ausfuehrung (run-to-completion, A0) ------------------------------
     def run(self, eng: Arm64Engine, entry, args: Sequence[int] = (),
             mem_overrides=None, sp: Optional[int] = None,
-            maxins: int = 2_000_000, image=None) -> dict:
+            maxins: int = 2_000_000, image=None,
+            max_wall_s: Optional[float] = None) -> dict:
         """Fuehrt ab `entry` aus und liefert {ok, ret, x[], sp, lr, pc, flags}.
         Publiziert PROGRESS(start) / DONE bzw. UNKNOWN_INSTR / ERROR."""
         try:
@@ -158,9 +166,14 @@ class NativeEmuService:
         self._emit(NATIVE_EMU_PROGRESS,
                    {"stage": "start", "entry": f"0x{addr:x}", "args": [a & _M64 for a in int_args]})
         try:
-            ret = eng.run_function(addr, tuple(int_args), maxins)
+            if max_wall_s is not None:
+                ret = eng.run_function(addr, tuple(int_args), maxins, max_wall_s=max_wall_s)
+            else:
+                ret = eng.run_function(addr, tuple(int_args), maxins)
         except iface.UnknownInstructionError as e:
-            d = e.to_dict() if hasattr(e, "to_dict") else {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None)}
+            # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
+            d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
+                 "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
             self._emit(NATIVE_UNKNOWN_INSTR, d)
             return {"ok": False, "why": "unknown_instr", **d}
         except Exception as e:
@@ -183,7 +196,8 @@ class NativeEmuService:
     # ---- Ausfuehrung mit Breakpoints (A2, kontraktneutral) ----------------
     def run_with_breaks(self, eng: Arm64Engine, entry, args: Sequence[int] = (),
                         mem_overrides=None, sp: Optional[int] = None,
-                        maxins: int = 2_000_000, breakpoints=(), image=None) -> dict:
+                        maxins: int = 2_000_000, breakpoints=(), image=None,
+                        max_wall_s: Optional[float] = None) -> dict:
         """Wie run(), haelt aber VOR einer gesetzten Breakpoint-Adresse an und liefert den
         Pause-Zustand. Nutzt ausschliesslich den additiven engine.set_probe-Hook — der
         eingefrorene cpu.run bleibt unberuehrt. Rueckgabe zusaetzlich: paused(bool)+bp(pc)."""
@@ -218,13 +232,18 @@ class NativeEmuService:
         self._emit(NATIVE_EMU_PROGRESS,
                    {"stage": "start", "entry": f"0x{addr:x}", "breakpoints": [f"0x{p:x}" for p in bps]})
         try:
-            ret = eng.run_function(addr, tuple(int_args), maxins)
+            if max_wall_s is not None:
+                ret = eng.run_function(addr, tuple(int_args), maxins, max_wall_s=max_wall_s)
+            else:
+                ret = eng.run_function(addr, tuple(int_args), maxins)
         except BreakpointHit as bh:
             snap = self.snapshot_regs(eng)
             self._emit(NATIVE_EMU_BREAK, {"pc": f"0x{bh.pc:x}"})
             return {"ok": True, "paused": True, "bp": int(bh.pc) & _M64, **snap}
         except iface.UnknownInstructionError as e:
-            d = e.to_dict() if hasattr(e, "to_dict") else {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None)}
+            # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
+            d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
+                 "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
             self._emit(NATIVE_UNKNOWN_INSTR, d)
             return {"ok": False, "why": "unknown_instr", **d}
         except Exception as e:
@@ -259,7 +278,9 @@ class NativeEmuService:
         try:
             pc = eng.cpu.step_block()
         except iface.UnknownInstructionError as e:
-            d = e.to_dict() if hasattr(e, "to_dict") else {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None)}
+            # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
+            d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
+                 "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
             self._emit(NATIVE_UNKNOWN_INSTR, d)
             return {"ok": False, "why": "unknown_instr", **d}
         except Exception as e:
@@ -290,7 +311,9 @@ class NativeEmuService:
         try:
             pc = eng.cpu.step_block()
         except iface.UnknownInstructionError as e:
-            d = e.to_dict() if hasattr(e, "to_dict") else {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None)}
+            # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
+            d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
+                 "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
             self._emit(NATIVE_UNKNOWN_INSTR, d)
             return {"ok": False, "why": "unknown_instr", **d}
         except Exception as e:
@@ -314,7 +337,9 @@ class NativeEmuService:
             self._emit(NATIVE_EMU_BREAK, {"pc": f"0x{bh.pc:x}"})
             return {"ok": True, "paused": True, "bp": int(bh.pc) & _M64, **self.snapshot_regs(eng)}
         except iface.UnknownInstructionError as e:
-            d = e.to_dict() if hasattr(e, "to_dict") else {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None)}
+            # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
+            d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
+                 "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
             self._emit(NATIVE_UNKNOWN_INSTR, d)
             return {"ok": False, "why": "unknown_instr", **d}
         except Exception as e:
@@ -439,7 +464,7 @@ class NativeEmuService:
         if "lr" in r:
             c.lr = int(r["lr"]) & _M64
         try:
-            c.cache = {}; c.tcache = {}
+            c.cache = {}; c.tcache = {}; c.bb = {}
         except Exception:
             pass
         return r

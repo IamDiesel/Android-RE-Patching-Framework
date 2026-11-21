@@ -1,0 +1,243 @@
+{
+ "placement": {
+  "transport": {
+   "zone": "top",
+   "group": 0,
+   "visible": true,
+   "order": 26,
+   "popped": false
+  },
+  "quelle": {
+   "zone": "left",
+   "group": 0,
+   "visible": true,
+   "order": 27,
+   "popped": false
+  },
+  "callstack": {
+   "zone": "left",
+   "group": 0,
+   "visible": true,
+   "order": 28,
+   "popped": false
+  },
+  "breakpoints": {
+   "zone": "left",
+   "group": 0,
+   "visible": true,
+   "order": 29,
+   "popped": false
+  },
+  "outline": {
+   "zone": "left",
+   "group": 0,
+   "visible": false,
+   "order": 30,
+   "popped": false
+  },
+  "editor": {
+   "zone": "editor",
+   "group": 0,
+   "visible": true,
+   "order": 31,
+   "popped": false
+  },
+  "disasm": {
+   "zone": "editor",
+   "group": 0,
+   "visible": true,
+   "order": 32,
+   "popped": false
+  },
+  "screen": {
+   "zone": "right",
+   "group": 0,
+   "visible": true,
+   "order": 8,
+   "popped": false
+  },
+  "registers": {
+   "zone": "right",
+   "group": 0,
+   "visible": true,
+   "order": 33,
+   "popped": false
+  },
+  "watch": {
+   "zone": "left",
+   "group": 0,
+   "visible": false,
+   "order": 9,
+   "popped": false
+  },
+  "memory": {
+   "zone": "right",
+   "group": 0,
+   "visible": true,
+   "order": 34,
+   "popped": false
+  },
+  "objinspect": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 35,
+   "popped": false
+  },
+  "appstate": {
+   "zone": "right",
+   "group": 0,
+   "visible": true,
+   "order": 13,
+   "popped": false
+  },
+  "actionpoints": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 14,
+   "popped": false
+  },
+  "console_main": {
+   "zone": "panel",
+   "group": 0,
+   "visible": true,
+   "order": 36,
+   "popped": false
+  },
+  "console_live": {
+   "zone": "panel",
+   "group": 0,
+   "visible": true,
+   "order": 37,
+   "popped": false
+  },
+  "timeline": {
+   "zone": "panel",
+   "group": 0,
+   "visible": true,
+   "order": 38,
+   "popped": false
+  },
+  "netz": {
+   "zone": "panel",
+   "group": 0,
+   "visible": true,
+   "order": 18,
+   "popped": false
+  },
+  "jnigrenze": {
+   "zone": "panel",
+   "group": 0,
+   "visible": false,
+   "order": 19,
+   "popped": false
+  },
+  "missing": {
+   "zone": "panel",
+   "group": 0,
+   "visible": true,
+   "order": 39,
+   "popped": false
+  },
+  "status": {
+   "zone": "status",
+   "group": 0,
+   "visible": true,
+   "order": 40,
+   "popped": false
+  },
+  "os_syscalls": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 41,
+   "popped": false
+  },
+  "os_vfs": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 42,
+   "popped": false
+  },
+  "os_mem": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 43,
+   "popped": false
+  },
+  "os_threads": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 44,
+   "popped": false
+  },
+  "os_signals": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 45,
+   "popped": false
+  },
+  "os_time": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 46,
+   "popped": false
+  },
+  "os_net": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 47,
+   "popped": false
+  },
+  "os_proc": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 48,
+   "popped": false
+  },
+  "os_determinism": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 49,
+   "popped": false
+  },
+  "os_collab": {
+   "zone": "right",
+   "group": 0,
+   "visible": false,
+   "order": 50,
+   "popped": false
+  }
+ },
+ "group_state": {
+  "right/0": {
+   "popped": false,
+   "hidden": false
+  },
+  "left/0": {
+   "popped": false,
+   "hidden": false
+  },
+  "panel/0": {
+   "popped": false,
+   "hidden": false
+  },
+  "editor/0": {
+   "popped": false,
+   "hidden": false
+  },
+  "right/1": {
+   "popped": false
+  }
+ },
+ "presets": {}
+}

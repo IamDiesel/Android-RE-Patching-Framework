@@ -48,32 +48,70 @@ class NativeStudioTab(ttk.Frame):
         self.create_widgets()
         self.controller = NativeStudioController(self, app)
         self._wire_buttons()
+        self._mount_workflow_panel()
+
+    def _on_main_tab_changed(self, _e=None):
+        """Blendet die Werkbank-Button-Leiste nur im Werkbank-Tab ein (GUI-Refactoring)."""
+        try:
+            cur = self._main_nb.tab(self._main_nb.select(), "text")
+        except Exception:
+            cur = ""
+        try:
+            if "Werkbank" in cur:
+                self._wb_bar.pack(side="top", fill="x", padx=6, pady=(0, 3),
+                                  before=self._main_nb)
+            else:
+                self._wb_bar.pack_forget()
+        except Exception:
+            pass
+
+    def _mount_workflow_panel(self):
+        """Haengt die workflow-orientierte Oberflaeche in den ⚡-Tab (robust, optional)."""
+        try:
+            from ui.panels.workflow_panel import WorkflowPanel
+            if WorkflowPanel is None:
+                raise RuntimeError("WorkflowPanel nicht verfuegbar")
+            self.workflow_panel = WorkflowPanel(self._wf_host, self.controller, self.app)
+            self.workflow_panel.pack(fill="both", expand=True)
+        except Exception as e:
+            try:
+                ttk.Label(self._wf_host, text="Workflow-Panel nicht geladen: %r" % e,
+                          foreground="gray").pack(padx=10, pady=10)
+            except Exception:
+                pass
 
     # ---- Aufbau -----------------------------------------------------------
     def create_widgets(self):
         # --- Top-Bar ---
         top = ttk.Frame(self)
         top.pack(side="top", fill="x", padx=6, pady=5)
+        # Werkbank-spezifische Button-Leiste: nur sichtbar, wenn der Werkbank-Tab
+        # aktiv ist (ein-/ausgeblendet in _on_main_tab_changed). GUI-Refactoring.
+        self._wb_bar = ttk.Frame(self)
         self.btn_load = ttk.Button(top, text="📥 .so laden")
         self.btn_unpack = ttk.Button(top, text="📦 entpacken")
         self.plugin_lbl = ttk.Label(top, text="Plugins: …", foreground="gray")
         self.plugin_lbl.pack(side="right", padx=8)
         self.plugin_bar = ttk.Frame(top)            # Stufe 2: dynamischer Plugin-Bereich
         self.plugin_bar.pack(side="right", padx=4)
-        self.btn_self = ttk.Button(top, text="▶ Engine-Selbsttest")
-        self.btn_run = ttk.Button(top, text="▶ Run")
-        self.btn_disasm = ttk.Button(top, text="🔎 Disasm ab Start")
-        self.btn_clear = ttk.Button(top, text="🧹 Leeren")
-        self.btn_back = ttk.Button(top, text="◀", width=3)
-        self.btn_fwd = ttk.Button(top, text="▶", width=3)
+        self.btn_self = ttk.Button(self._wb_bar, text="▶ Engine-Selbsttest")
+        self.btn_run = ttk.Button(self._wb_bar, text="▶ Run")
+        self.btn_disasm = ttk.Button(self._wb_bar, text="🔎 Disasm ab Start")
+        self.btn_clear = ttk.Button(self._wb_bar, text="🧹 Leeren")
+        self.btn_back = ttk.Button(self._wb_bar, text="◀", width=3)
+        self.btn_fwd = ttk.Button(self._wb_bar, text="▶", width=3)
         self.btn_search = ttk.Button(top, text="🔍 Suche")
-        self.btn_decomp = ttk.Button(top, text="🧊 C")
-        self.btn_decomp_cancel = ttk.Button(top, text="⏹ Abbrechen", state="disabled")
-        self.btn_favorites = ttk.Button(top, text="⭐ Favoriten")
-        self.btn_c_col = ttk.Button(top, text="🧊 C-Spalte")
-        for b in (self.btn_load, self.btn_unpack, self.btn_self, self.btn_run, self.btn_disasm,
-                  self.btn_clear, self.btn_back, self.btn_fwd, self.btn_search, self.btn_decomp,
-                  self.btn_decomp_cancel, self.btn_favorites, self.btn_c_col):
+        self.btn_decomp = ttk.Button(self._wb_bar, text="🧊 C")
+        self.btn_decomp_cancel = ttk.Button(self._wb_bar, text="⏹ Abbrechen", state="disabled")
+        self.btn_favorites = ttk.Button(self._wb_bar, text="⭐ Favoriten")
+        self.btn_c_col = ttk.Button(self._wb_bar, text="🧊 C-Spalte")
+        # geteilte Buttons (in BEIDEN Ansichten): laden / entpacken / Suche
+        for b in (self.btn_load, self.btn_unpack, self.btn_search):
+            b.pack(side="left", padx=4)
+        # Werkbank-spezifische Buttons (nur im Werkbank-Tab)
+        for b in (self.btn_self, self.btn_run, self.btn_disasm, self.btn_clear,
+                  self.btn_back, self.btn_fwd, self.btn_decomp, self.btn_decomp_cancel,
+                  self.btn_favorites, self.btn_c_col):
             b.pack(side="left", padx=4)
         _add_tooltip(self.btn_favorites,
                      "Arbeitsansichten (Run-Favoriten): laden / neu speichern / aktuelle ueberschreiben.")
@@ -84,6 +122,7 @@ class NativeStudioTab(ttk.Frame):
         _add_tooltip(self.chk_relocs,
                      "Beim ▶ Run die Relocations anwenden (fuellt Dispatch-/Call-Zeiger obfuskierter "
                      "Libs, z. B. libdb0c). Fuer die WB-Krypto-Libs aus lassen.")
+        # (KI-Austausch jetzt zentral in der App-Titelleiste — Studio-Buttons entfernt)
         self.lbl_loaded = ttk.Label(top, text="— keine Lib geladen —", foreground="gray")
         self.lbl_loaded.pack(side="right", padx=8)
         self.progress = ttk.Progressbar(top, mode="indeterminate", length=140)
@@ -92,7 +131,16 @@ class NativeStudioTab(ttk.Frame):
         # (Coverage/Unknown-Instr-Pane entfernt #GUI1 — Trace-Pane + Konsole ersetzen es)
 
         # --- vertikaler Rahmen: 3 Spalten oben + C-Dekompilat-Leiste unten ---
-        self._vpane = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        # --- Haupt-Notebook: Workflow-Ansicht + klassische Werkbank (GUI-Refactoring) ---
+        self._main_nb = ttk.Notebook(self)
+        self._main_nb.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+        self._wf_host = ttk.Frame(self._main_nb)
+        self._main_nb.add(self._wf_host, text="⚡ Workflow")
+        _wb = ttk.Frame(self._main_nb)
+        self._main_nb.add(_wb, text="🔧 Werkbank")
+        self._main_nb.bind("<<NotebookTabChanged>>", self._on_main_tab_changed)
+        self.after(0, self._on_main_tab_changed)
+        self._vpane = ttk.PanedWindow(_wb, orient=tk.VERTICAL)
         self._vpane.pack(side="top", fill="both", expand=True, padx=6, pady=5)
         # --- 3 Spalten ---
         paned = ttk.PanedWindow(self._vpane, orient=tk.HORIZONTAL)
@@ -289,6 +337,134 @@ class NativeStudioTab(ttk.Frame):
         mem_nb.add(f_jni, text="JNI-Calls")
         self._jni_rows = []
 
+        # Reiter: Dispatch-Trace (CFF-2D-vtable 0x137740)
+        f_disp = ttk.Frame(mem_nb)
+        self.disp_tree = ttk.Treeview(f_disp, columns=("n", "pc", "slot", "idx", "col", "val", "flag"),
+                                      show="headings", height=8)
+        for _c, _t, _w in (("n", "#", 46), ("pc", "pc", 90), ("slot", "slot", 90),
+                           ("idx", "idx1", 44), ("col", "col", 44), ("val", "Handler", 90),
+                           ("flag", "Hinweis", 110)):
+            self.disp_tree.heading(_c, text=_t); self.disp_tree.column(_c, width=_w, anchor="w")
+        dsb = ttk.Scrollbar(f_disp, orient="vertical", command=self.disp_tree.yview)
+        self.disp_tree.configure(yscrollcommand=dsb.set)
+        dsb.pack(side="right", fill="y")
+        self.disp_tree.pack(side="left", fill="both", expand=True)
+        self.disp_tree.tag_configure("empty", background="#ffd0d0")
+        self.disp_tree.tag_configure("taint", background="#fff0c0")
+        mem_nb.add(f_disp, text="Dispatch")
+
+        # Reiter: Syscalls (RASP Survival Mode; Doppelklick -> Policy-Rueckgabe editieren)
+        f_sys = ttk.Frame(mem_nb)
+        self.sys_tree = ttk.Treeview(f_sys, columns=("nr", "name", "path", "args", "ret"),
+                                     show="headings", height=8)
+        for _c, _t, _w in (("nr", "nr", 40), ("name", "Syscall", 110), ("path", "Pfad/Arg", 200),
+                           ("args", "x0-x2", 150), ("ret", "Rueckgabe", 80)):
+            self.sys_tree.heading(_c, text=_t); self.sys_tree.column(_c, width=_w, anchor="w")
+        ssb = ttk.Scrollbar(f_sys, orient="vertical", command=self.sys_tree.yview)
+        self.sys_tree.configure(yscrollcommand=ssb.set)
+        ssb.pack(side="right", fill="y")
+        self.sys_tree.pack(side="left", fill="both", expand=True)
+        self.sys_tree.bind("<Double-1>", self._on_syscall_edit)
+        mem_nb.add(f_sys, text="Syscalls")
+        self._sys_rows = []
+
+        # Reiter: Devirt (OLLVM-Entflachung -> Handler-Sequenz + de-flattened Pseudocode)
+        f_dv = ttk.Frame(mem_nb)
+        dv_bar = ttk.Frame(f_dv)
+        dv_bar.pack(side="top", fill="x")
+        ttk.Label(dv_bar, text="Runs:").pack(side="left", padx=(2, 1))
+        self.devirt_runs_var = tk.StringVar(value="4")
+        ttk.Entry(dv_bar, textvariable=self.devirt_runs_var, width=4).pack(side="left")
+        ttk.Label(dv_bar, text="Lift-max:").pack(side="left", padx=(6, 1))
+        self.devirt_liftmax_var = tk.StringVar(value="25000")
+        ttk.Entry(dv_bar, textvariable=self.devirt_liftmax_var, width=8).pack(side="left")
+        ttk.Label(dv_bar, text="Instr. (0=kein Lift)").pack(side="left", padx=(4, 0))
+        self.devirt_text = tk.Text(f_dv, wrap="none", height=10, font=("Consolas", 9),
+                                   state="disabled")
+        dvy = ttk.Scrollbar(f_dv, orient="vertical", command=self.devirt_text.yview)
+        dvx = ttk.Scrollbar(f_dv, orient="horizontal", command=self.devirt_text.xview)
+        self.devirt_text.configure(yscrollcommand=dvy.set, xscrollcommand=dvx.set)
+        dvy.pack(side="right", fill="y")
+        dvx.pack(side="bottom", fill="x")
+        self.devirt_text.pack(side="left", fill="both", expand=True)
+        mem_nb.add(f_dv, text="Devirt")
+
+        # Reiter: Env (WS-E3-Steuerflaeche: gefaelschte /proc/self/maps + VFS + config -> native.os_attach)
+        f_env = ttk.Frame(mem_nb)
+        eb = ttk.Frame(f_env); eb.pack(side="top", fill="x")
+        ttk.Label(eb, text="entry:").pack(side="left", padx=(2, 1))
+        self.env_entry_var = tk.StringVar(value="JNI_OnLoad")
+        ttk.Entry(eb, textvariable=self.env_entry_var, width=13).pack(side="left")
+        ttk.Label(eb, text="budget:").pack(side="left", padx=(6, 1))
+        self.env_budget_var = tk.StringVar(value="200000")
+        ttk.Entry(eb, textvariable=self.env_budget_var, width=8).pack(side="left")
+        self.btn_env_run = ttk.Button(eb, text="🌐 Env anhängen & laufen", width=22)
+        self.btn_env_run.pack(side="left", padx=6)
+        eb2 = ttk.Frame(f_env); eb2.pack(side="top", fill="x")
+        ttk.Label(eb2, text="vfs:").pack(side="left", padx=(2, 1))
+        self.env_vfs_var = tk.StringVar(value='{"/sys/fs/selinux/enforce": "0"}')
+        ttk.Entry(eb2, textvariable=self.env_vfs_var, width=32).pack(side="left")
+        ttk.Label(eb2, text="config:").pack(side="left", padx=(6, 1))
+        self.env_cfg_var = tk.StringVar(value='{"uid": 10234}')
+        ttk.Entry(eb2, textvariable=self.env_cfg_var, width=18).pack(side="left")
+        em = ttk.Frame(f_env); em.pack(side="top", fill="x")
+        ttk.Label(em, text="maps (leer=Default):").pack(side="left", padx=(2, 1))
+        self.env_maps = tk.Text(em, height=3, wrap="none", font=("Consolas", 9))
+        self.env_maps.pack(side="left", fill="x", expand=True)
+        er = ttk.Frame(f_env); er.pack(side="top", fill="both", expand=True)
+        self.env_text = tk.Text(er, wrap="none", height=8, font=("Consolas", 9), state="disabled")
+        eys = ttk.Scrollbar(er, orient="vertical", command=self.env_text.yview)
+        self.env_text.configure(yscrollcommand=eys.set)
+        eys.pack(side="right", fill="y")
+        self.env_text.pack(side="left", fill="both", expand=True)
+        mem_nb.add(f_env, text="Env")
+
+        # Reiter: Java/Dalvik (J1: Smali parsen + Dalvik-Methode ausfuehren -> native.dalvik_run)
+        f_java = ttk.Frame(mem_nb)
+        jb = ttk.Frame(f_java); jb.pack(side="top", fill="x")
+        ttk.Label(jb, text="Methode (leer=erste):").pack(side="left", padx=(2, 1))
+        self.java_name_var = tk.StringVar(value="")
+        ttk.Entry(jb, textvariable=self.java_name_var, width=14).pack(side="left")
+        ttk.Label(jb, text="args (JSON):").pack(side="left", padx=(6, 1))
+        self.java_args_var = tk.StringVar(value="[]")
+        ttk.Entry(jb, textvariable=self.java_args_var, width=16).pack(side="left")
+        self.btn_java_run = ttk.Button(jb, text="\u25b6 Dalvik ausf\u00fchren", width=18)
+        self.btn_java_run.pack(side="left", padx=6)
+        jm = ttk.Frame(f_java); jm.pack(side="top", fill="both", expand=True)
+        ttk.Label(jm, text="Smali (.class oder .method):").pack(side="top", anchor="w", padx=2)
+        self.java_src = tk.Text(jm, height=8, wrap="none", font=("Consolas", 9))
+        self.java_src.pack(side="top", fill="both", expand=True)
+        self.java_src.insert("1.0",
+                             "# Smali hier einfuegen (J1: Opcodes/Objektmodell/Intra-Invoke)\n"
+                             ".method public static dbl(I)I\n    .locals 1\n"
+                             "    add-int v0, p0, p0\n    return v0\n.end method\n")
+        jd = ttk.Frame(f_java); jd.pack(side="top", fill="x")
+        ttk.Label(jd, text="DEX:").pack(side="left", padx=(2, 1))
+        self.dex_path_var = tk.StringVar(value="")
+        ttk.Entry(jd, textvariable=self.dex_path_var, width=26).pack(side="left")
+        ttk.Label(jd, text="Methode (Lcls;->name(sig)ret):").pack(side="left", padx=(6, 1))
+        self.dex_method_var = tk.StringVar(value="")
+        ttk.Entry(jd, textvariable=self.dex_method_var, width=28).pack(side="left")
+        self.btn_dex_run = ttk.Button(jd, text="\u25b6 DEX laden & ausf\u00fchren", width=20)
+        self.btn_dex_run.pack(side="left", padx=6)
+        jg = ttk.Frame(f_java); jg.pack(side="top", fill="x")
+        ttk.Label(jg, text="Debug BP (pc JSON):").pack(side="left", padx=(2, 1))
+        self.jdbg_bp_var = tk.StringVar(value="[]")
+        ttk.Entry(jg, textvariable=self.jdbg_bp_var, width=14).pack(side="left")
+        ttk.Label(jg, text="set_regs (JSON):").pack(side="left", padx=(6, 1))
+        self.jdbg_regs_var = tk.StringVar(value="{}")
+        ttk.Entry(jg, textvariable=self.jdbg_regs_var, width=14).pack(side="left")
+        self.btn_jdbg_run = ttk.Button(jg, text="\u2699 Debug", width=10)
+        self.btn_jdbg_run.pack(side="left", padx=6)
+        jr = ttk.Frame(f_java); jr.pack(side="top", fill="both", expand=True)
+        self.java_text = tk.Text(jr, wrap="none", height=7, font=("Consolas", 9), state="disabled")
+        jys = ttk.Scrollbar(jr, orient="vertical", command=self.java_text.yview)
+        self.java_text.configure(yscrollcommand=jys.set)
+        jys.pack(side="right", fill="y")
+        self.java_text.pack(side="left", fill="both", expand=True)
+        mem_nb.add(f_java, text="Java/Dalvik")
+        self._build_debugger_tab(mem_nb)
+
         # C-Dekompilat als eigene, einklappbare 4. Spalte ganz rechts (#167)
         self._c_host = ttk.Frame(paned)
         paned.add(self._c_host, weight=2)
@@ -296,6 +472,127 @@ class NativeStudioTab(ttk.Frame):
         self._c_col_visible = True
         self._build_c_drawer()
         self.append_status("Bereit. '📥 .so laden' → Funktion im Outline doppelklicken → Entry/Args setzen → '▶ Run'.")
+
+    def _build_debugger_tab(self, mem_nb):
+        """X1/MS-6: interaktive Debugger-Perspektive ueber der DalvikVM.
+        Nutzt den Smali-Text aus dem Reiter 'Java/Dalvik'; haelt eine LIVE JavaDebugger-Sitzung."""
+        f_dbg = ttk.Frame(mem_nb)
+        # Zeile 1: Transport + Zeitreise
+        d1 = ttk.Frame(f_dbg); d1.pack(side="top", fill="x")
+        self.btn_jdb_start = ttk.Button(d1, text="Start", width=8)
+        self.btn_jdb_step = ttk.Button(d1, text="Step In", width=8)
+        self.btn_jdb_over = ttk.Button(d1, text="Step Over", width=10)
+        self.btn_jdb_out = ttk.Button(d1, text="Step Out", width=9)
+        self.btn_jdb_cont = ttk.Button(d1, text="Continue", width=9)
+        self.btn_jdb_stop = ttk.Button(d1, text="Stop", width=7)
+        for b in (self.btn_jdb_start, self.btn_jdb_step, self.btn_jdb_over, self.btn_jdb_out,
+                  self.btn_jdb_cont, self.btn_jdb_stop):
+            b.pack(side="left", padx=2)
+        ttk.Label(d1, text="Goto Schritt:").pack(side="left", padx=(10, 1))
+        self.jdb_goto_var = tk.StringVar(value="0")
+        ttk.Entry(d1, textvariable=self.jdb_goto_var, width=8).pack(side="left")
+        self.btn_jdb_goto = ttk.Button(d1, text="Goto", width=7)
+        self.btn_jdb_goto.pack(side="left", padx=2)
+        # Zeile 2: Methode/args/Halt am Eintritt
+        d2 = ttk.Frame(f_dbg); d2.pack(side="top", fill="x")
+        ttk.Label(d2, text="Methode (leer=erste):").pack(side="left", padx=(2, 1))
+        self.jdb_name_var = tk.StringVar(value="")
+        ttk.Entry(d2, textvariable=self.jdb_name_var, width=14).pack(side="left")
+        ttk.Label(d2, text="args (JSON):").pack(side="left", padx=(6, 1))
+        self.jdb_args_var = tk.StringVar(value="[]")
+        ttk.Entry(d2, textvariable=self.jdb_args_var, width=14).pack(side="left")
+        self.jdb_entry_stop = tk.BooleanVar(value=True)
+        ttk.Checkbutton(d2, text="Halt am Eintritt", variable=self.jdb_entry_stop).pack(side="left", padx=(8, 0))
+        # Zeile 3: Breakpoints
+        d3 = ttk.Frame(f_dbg); d3.pack(side="top", fill="x")
+        ttk.Label(d3, text="BP pc:").pack(side="left", padx=(2, 1))
+        self.jdb_bpadd_var = tk.StringVar(value="")
+        ttk.Entry(d3, textvariable=self.jdb_bpadd_var, width=8).pack(side="left")
+        self.btn_jdb_addbp = ttk.Button(d3, text="+ BP", width=6)
+        self.btn_jdb_addbp.pack(side="left", padx=2)
+        self.btn_jdb_clrbp = ttk.Button(d3, text="BP leeren", width=10)
+        self.btn_jdb_clrbp.pack(side="left", padx=2)
+        self.jdb_bp_lbl = ttk.Label(d3, text="BP: -")
+        self.jdb_bp_lbl.pack(side="left", padx=(8, 0))
+        # Zeile 4: Mutation (Register setzen an der Haltestelle)
+        d4 = ttk.Frame(f_dbg); d4.pack(side="top", fill="x")
+        ttk.Label(d4, text="Reg idx:").pack(side="left", padx=(2, 1))
+        self.jdb_setreg_i = tk.StringVar(value="")
+        ttk.Entry(d4, textvariable=self.jdb_setreg_i, width=5).pack(side="left")
+        ttk.Label(d4, text="Wert (int):").pack(side="left", padx=(6, 1))
+        self.jdb_setreg_v = tk.StringVar(value="")
+        ttk.Entry(d4, textvariable=self.jdb_setreg_v, width=10).pack(side="left")
+        self.btn_jdb_setreg = ttk.Button(d4, text="Set Reg", width=8)
+        self.btn_jdb_setreg.pack(side="left", padx=2)
+        # Zeile 5: Studio-Quelle + Zone (Punkt 1 der Brücke)
+        d6 = ttk.Frame(f_dbg); d6.pack(side="top", fill="x")
+        ttk.Label(d6, text="Zonen-Wurzel:").pack(side="left", padx=(2, 1))
+        self.jdb_zone_root = tk.StringVar(value="")
+        ttk.Entry(d6, textvariable=self.jdb_zone_root, width=30).pack(side="left")
+        ttk.Label(d6, text="Zone:").pack(side="left", padx=(6, 1))
+        self.jdb_zone_var = tk.StringVar(value="original")
+        ttk.Combobox(d6, textvariable=self.jdb_zone_var, width=10,
+                     values=("original", "patched"), state="readonly").pack(side="left")
+        self.jdb_lazy_zone = tk.BooleanVar(value=False)
+        ttk.Checkbutton(d6, text="Callees lazy aus Zone", variable=self.jdb_lazy_zone).pack(side="left", padx=(8, 0))
+        # Zeile 6: eine Klasse aus der Zone in die Quelle laden + App-Lifecycle starten
+        d7 = ttk.Frame(f_dbg); d7.pack(side="top", fill="x")
+        ttk.Label(d7, text="relpath/Deskriptor:").pack(side="left", padx=(2, 1))
+        self.jdb_relpath_var = tk.StringVar(value="")
+        ttk.Entry(d7, textvariable=self.jdb_relpath_var, width=28).pack(side="left")
+        self.btn_jdb_studio_load = ttk.Button(d7, text="Aus Studio laden", width=16)
+        self.btn_jdb_studio_load.pack(side="left", padx=4)
+        ttk.Label(d7, text="App-Entry:").pack(side="left", padx=(8, 1))
+        self.jdb_entry_var = tk.StringVar(value="")
+        ttk.Entry(d7, textvariable=self.jdb_entry_var, width=24).pack(side="left")
+        self.btn_jdb_lifecycle = ttk.Button(d7, text="App-Lifecycle", width=14)
+        self.btn_jdb_lifecycle.pack(side="left", padx=4)
+        # Statuszeile
+        self.jdb_status_lbl = ttk.Label(f_dbg, text="idle", anchor="w", font=("Consolas", 9))
+        self.jdb_status_lbl.pack(side="top", fill="x", padx=2, pady=(4, 2))
+        # Anzeige: Register (links) + Timeline (rechts)
+        d5 = ttk.Frame(f_dbg); d5.pack(side="top", fill="both", expand=True)
+        rl = ttk.Frame(d5); rl.pack(side="left", fill="both", expand=True)
+        ttk.Label(rl, text="Register (Haltestelle)").pack(side="top", anchor="w")
+        self.jdb_reg_tree = ttk.Treeview(rl, columns=("v",), show="tree headings", height=10)
+        self.jdb_reg_tree.heading("#0", text="Reg"); self.jdb_reg_tree.column("#0", width=60, stretch=False)
+        self.jdb_reg_tree.heading("v", text="Wert"); self.jdb_reg_tree.column("v", width=200)
+        self.jdb_reg_tree.pack(side="left", fill="both", expand=True)
+        tlf = ttk.Frame(d5); tlf.pack(side="left", fill="both", expand=True)
+        ttk.Label(tlf, text="Timeline (letzte Schritte)").pack(side="top", anchor="w")
+        self.jdb_tl_tree = ttk.Treeview(tlf, columns=("pc", "op"), show="tree headings", height=10)
+        self.jdb_tl_tree.heading("#0", text="Step"); self.jdb_tl_tree.column("#0", width=60, stretch=False)
+        self.jdb_tl_tree.heading("pc", text="pc"); self.jdb_tl_tree.column("pc", width=50)
+        self.jdb_tl_tree.heading("op", text="op"); self.jdb_tl_tree.column("op", width=170)
+        self.jdb_tl_tree.pack(side="left", fill="both", expand=True)
+        mem_nb.add(f_dbg, text="Debugger")
+
+    def set_jdb_status(self, st):
+        """X1: Statuszeile des interaktiven Debuggers aus inspect()/state()-dict."""
+        if not isinstance(st, dict):
+            self.jdb_status_lbl.config(text=str(st)); return
+        txt = ("mode=%s  step=%s  %s->%s  pc=%s op=%s  depth=%s  result=%r%s"
+               % (st.get("mode"), st.get("step"), st.get("cls"), st.get("name"),
+                  st.get("pc"), st.get("op"), st.get("depth"), st.get("result"),
+                  ("  ERR=%s" % st.get("error")) if st.get("error") else ""))
+        self.jdb_status_lbl.config(text=txt)
+        bps = st.get("breakpoints")
+        if bps is not None:
+            self.jdb_bp_lbl.config(text="BP: " + (", ".join(str(b[3]) for b in bps) if bps else "-"))
+
+    def set_jdb_registers(self, regs):
+        t = self.jdb_reg_tree
+        for i in t.get_children():
+            t.delete(i)
+        for i, v in enumerate(regs or []):
+            t.insert("", "end", text="v%d" % i, values=(repr(v),))
+
+    def set_jdb_timeline(self, rows):
+        t = self.jdb_tl_tree
+        for i in t.get_children():
+            t.delete(i)
+        for r in (rows or []):
+            t.insert("", "end", text=str(r.get("step")), values=(r.get("pc"), r.get("op")))
 
     def _build_run_panel(self, parent):
         body = ttk.Frame(parent); body.pack(side="top", fill="both", expand=True, padx=4, pady=3)
@@ -317,19 +614,25 @@ class NativeStudioTab(ttk.Frame):
         self.btn_dbg_step = ttk.Button(runbar, text="⏭ Step", width=8)
         self.btn_dbg_instr = ttk.Button(runbar, text="⏱ Instr", width=8)
         self.btn_dbg_resume = ttk.Button(runbar, text="⏩ Resume", width=10)
-        self.btn_dbg_sync = ttk.Button(runbar, text="⬆ An KI", width=9)
-        self.btn_dbg_load = ttk.Button(runbar, text="⬇ Von KI", width=9)
-        self.btn_dbg_status = ttk.Button(runbar, text="⇅ Abgleich", width=11)
-        # Reihenfolge (links→rechts): Debug-Steuerung | Teilen (An KI / Von KI / Abgleich) | ▶ Run
-        for _b in (self.btn_dbg_status, self.btn_dbg_load, self.btn_dbg_sync,
-                   self.btn_dbg_resume, self.btn_dbg_instr, self.btn_dbg_step, self.btn_dbg_start):
+        # (KI-Austausch jetzt zentral in der App-Titelleiste — Debug-KI-Buttons entfernt)
+        # Reihenfolge (links→rechts): Debug-Steuerung | ▶ Run (KI-Austausch jetzt zentral oben)
+        for _b in (self.btn_dbg_resume, self.btn_dbg_instr, self.btn_dbg_step, self.btn_dbg_start):
             _b.pack(side="right", padx=2)
-        _add_tooltip(self.btn_dbg_sync, "⬆ An KI: deinen Debug-Stand in die geteilte Sitzung schreiben (push, fuer die KI lesbar). Warnt, wenn die KI inzwischen weiter ist.")
-        _add_tooltip(self.btn_dbg_load, "⬇ Von KI: den geteilten Stand (ggf. von der KI fortgeschrieben) in deine GUI laden (pull).")
-        _add_tooltip(self.btn_dbg_status, "⇅ Abgleich: vergleicht deinen Stand mit der geteilten Sitzung — wer ist neuer?")
         self.btn_jni = ttk.Button(runbar, text="⚡ JNI", width=7)
         self.btn_jni.pack(side="left", padx=1)
         _add_tooltip(self.btn_jni, "⚡ JNI: JNI_OnLoad mit der Fake-JNIEnv-Fassade laufen lassen und die JNI-Call-Liste fuellen (Doppelklick auf eine Zeile: Smali + Klassifizierung + Vorschlag).")
+        self.btn_disp = ttk.Button(runbar, text="🎯 Disp", width=7)
+        self.btn_disp.pack(side="left", padx=1)
+        _add_tooltip(self.btn_disp, "🎯 Dispatch-Trace: JNI_OnLoad laufen lassen und jeden CFF-vtable-Dispatch listen (Slot/idx/col/Handler). Leere Slots (Trap) rot, Fassaden-Taint gelb.")
+        self.btn_surv = ttk.Button(runbar, text="🛡 Surv", width=7)
+        self.btn_surv.pack(side="left", padx=1)
+        _add_tooltip(self.btn_surv, "🛡 Survival-Lauf: JNI_OnLoad ueber die Anti-Tamper-Trap hinaus; zeigt die rohen Detection-Syscalls im Reiter 'Syscalls'. Doppelklick auf eine Zeile setzt die geraeteechte Rueckgabe (Policy).")
+        self.btn_devirt = ttk.Button(runbar, text="🧩 Devirt", width=8)
+        self.btn_devirt.pack(side="left", padx=1)
+        _add_tooltip(self.btn_devirt, "🧩 Devirt: OLLVM-geflachte Funktion aus dem Entry-Feld (JNI_OnLoad/onSearchResult/getOptionsList/Hex) entflachen -> Handler-Sequenz + de-flattened Pseudocode im Reiter 'Devirt'.")
+        self.btn_devirt_static = ttk.Button(runbar, text="🗺 Statisch", width=10)
+        self.btn_devirt_static.pack(side="left", padx=1)
+        _add_tooltip(self.btn_devirt_static, "🗺 Statischer Devirt: Dispatch-Graph der Entry-Funktion OHNE Lauf der Zielfunktion (1D-madd-Tabelle 0x134f48 + 2D-smaddl-Vtable 0x137740) -> Bloecke/Branch-Points/Traps im Reiter 'Devirt'. Rein statisch aus Disasm + .data-Keys.")
         self.btn_snap_load = ttk.Button(runbar, text="📂 Snapshot", width=12)
         self.btn_snap_save = ttk.Button(runbar, text="💾 Snapshot", width=12)
         self.btn_snap_load.pack(side="left", padx=2)
@@ -401,6 +704,61 @@ class NativeStudioTab(ttk.Frame):
             ret = r.get("final", r.get("proposed", ""))
             t.insert("", "end", values=(r.get("fn", ""), tgt, r.get("category") or "", ret))
 
+    def set_devirt(self, text):
+        """Fuellt den Devirt-Reiter (read-only Pseudocode-Pane)."""
+        t = self.devirt_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("1.0", text or "")
+        t.configure(state="disabled")
+
+    def set_env_result(self, text):
+        """Fuellt den Env-Reiter (read-only Ergebnis von native.os_attach)."""
+        t = self.env_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("1.0", text or "")
+        t.configure(state="disabled")
+
+    def set_java_result(self, text):
+        """Fuellt den Java/Dalvik-Reiter (read-only Ergebnis von native.dalvik_run)."""
+        t = self.java_text
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        t.insert("1.0", text or "")
+        t.configure(state="disabled")
+
+    def set_syscalls(self, rows):
+        """Fuellt den Syscalls-Reiter aus den survive_run-Ergebnissen (Doppelklick -> Policy)."""
+        t = self.sys_tree
+        for _i in t.get_children():
+            t.delete(_i)
+        self._sys_rows = list(rows or [])
+        for r in self._sys_rows:
+            t.insert("", "end", values=(r.get("nr"), r.get("name", ""), r.get("path") or "",
+                                        r.get("args", ""), r.get("ret", "")))
+
+    def _on_syscall_edit(self, _e=None):
+        sel = self.sys_tree.selection()
+        if not sel:
+            return
+        idx = self.sys_tree.index(sel[0])
+        if 0 <= idx < len(self._sys_rows) and hasattr(self.controller, "set_syscall_return"):
+            self.controller.set_syscall_return(self._sys_rows[idx])
+
+    def set_dispatch_trace(self, log, summary=None):
+        """Fuellt den Dispatch-Reiter aus dem CFF-Dispatch-Trace-Log (leere Slots rot, Taint gelb)."""
+        t = self.disp_tree
+        for _i in t.get_children():
+            t.delete(_i)
+        for n, e in enumerate(log or []):
+            empty = e.get("empty"); vt = e.get("val_taint") or e.get("x20_taint")
+            flag = ("LEER/TRAP" if empty else ("Taint" if vt else ""))
+            tag = ("empty",) if empty else (("taint",) if vt else ())
+            t.insert("", "end", tags=tag, values=(
+                n, hex(int(e.get("pc", 0))), hex(int(e.get("slot", 0))), e.get("idx1"),
+                e.get("col"), hex(int(e.get("val", 0))), flag))
+
     def _on_jni_popup(self, _e=None):
         sel = self.jni_tree.selection()
         if not sel:
@@ -450,10 +808,28 @@ class NativeStudioTab(ttk.Frame):
         self.btn_dbg_instr.config(command=self.controller.dbg_step_insn)
         self.btn_dbg_resume.config(command=self.controller.dbg_resume)
         self.btn_trace_py.config(command=self.controller.dbg_lift_python)
-        self.btn_dbg_sync.config(command=self.controller.dbg_sync)
-        self.btn_dbg_load.config(command=self.controller.dbg_load_session)
-        self.btn_dbg_status.config(command=self.controller.dbg_status)
+        # (KI-Austausch-Buttons zentralisiert — Bindings entfernt)
         self.btn_jni.config(command=self.controller.jni_run)
+        self.btn_disp.config(command=self.controller.dispatch_trace_run)
+        self.btn_surv.config(command=self.controller.survive_run)
+        self.btn_devirt.config(command=self.controller.devirt_run)
+        self.btn_devirt_static.config(command=self.controller.devirt_static_run)
+        self.btn_env_run.config(command=self.controller.os_attach_run)
+        self.btn_java_run.config(command=self.controller.dalvik_run)
+        self.btn_dex_run.config(command=self.controller.dex_run)
+        self.btn_jdbg_run.config(command=self.controller.jdebug_run)
+        self.btn_jdb_start.config(command=self.controller.jdb_start)
+        self.btn_jdb_step.config(command=self.controller.jdb_step)
+        self.btn_jdb_over.config(command=self.controller.jdb_step_over)
+        self.btn_jdb_out.config(command=self.controller.jdb_step_out)
+        self.btn_jdb_studio_load.config(command=self.controller.jdb_studio_load)
+        self.btn_jdb_lifecycle.config(command=self.controller.jdb_lifecycle)
+        self.btn_jdb_cont.config(command=self.controller.jdb_cont)
+        self.btn_jdb_stop.config(command=self.controller.jdb_stop)
+        self.btn_jdb_goto.config(command=self.controller.jdb_goto)
+        self.btn_jdb_addbp.config(command=self.controller.jdb_addbp)
+        self.btn_jdb_clrbp.config(command=self.controller.jdb_clrbp)
+        self.btn_jdb_setreg.config(command=self.controller.jdb_setreg)
         self.btn_snap_save.config(command=self.controller.snapshot_save)
         self.btn_snap_load.config(command=self.controller.snapshot_set_load)
         self.btn_favorites.config(command=self._open_favorites_popup)

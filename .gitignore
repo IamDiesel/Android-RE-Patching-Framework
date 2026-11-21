@@ -23,6 +23,7 @@ Helper/
 data/exec_backups/
 data/native*
 data/SUCCLOG_SESSION_KEY
+data/
 
 # Device Logs
 trace.txt
@@ -81,3 +82,16 @@ native_plugins/
 secrets/
 data/active_session.json
 data/mcp_audit.jsonl
+
+# S3-Hermes portabler Host (grosse Binaries, reproduzierbar via build_host.sh)
+tools/rn_hermes_host/dist/
+
+# Gläserner App-Emulations-Cache, App-Daten, Forks & Projektstände (strikt lokal)
+data/vfs_selfcache/
+data/vfs_appdata/
+data/projects/
+data/instances/
+data/glass_flight.jsonl
+data/debug_config.json
+data/gui_cmd_queue.json
+

@@ -3,6 +3,9 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import pytest
+pytest.importorskip("tkinter")  # headless Device-VM hat kein tkinter -> sauberer Skip statt Collection-Error
+
 from ui.controllers.workspace_controller import WorkspaceController
 
 
@@ -25,7 +28,12 @@ class MockApp:
         self.history = MockHistory()
 
 
-def test_save_session_result():
+def test_save_session_result(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "ui.controllers.workspace_controller.messagebox.showinfo",
+        lambda *a, **k: calls.append((a, k)),
+    )
     app = MockApp()
     controller = WorkspaceController(None, app)
 
@@ -33,6 +41,7 @@ def test_save_session_result():
     controller.save_session_result("MyPatch", "1.0", "WORKING", "Lookin good", [{"type": "hex"}])
 
     assert len(app.history.records) == 1
+    assert len(calls) == 1
     record = app.history.records[0]
 
     assert record["name"] == "MyPatch"

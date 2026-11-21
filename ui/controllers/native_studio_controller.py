@@ -33,6 +33,11 @@ class NativeStudioController:
         self._decoder = None
         self.index = None          # NativeIndex des zuletzt geladenen Images
         self._session_id = str(os.getpid())
+        # X1/MS-6: Live-Sitzung des interaktiven Java-Debuggers
+        self._jdb = None
+        self._jdb_bps = []
+        self._jdb_busy = False
+        self._jdb_target_sig = None
         # Navigations-Historie (baum-basiert, nach Smali-Studio-Vorbild)
         self.history_nodes = {}
         self.history_root_id = None
@@ -279,6 +284,7 @@ class NativeStudioController:
     # ---- Debugger: Trace / Step / Lift (#GUI1) ----------------------------
     _DBG_BUDGET = 4000  # Fallback-Budget (Bloecke), wenn kein gueltiges maxins-Feld
     _DBG_SESSION = "secrets/probe/out/dbg"  # geteilter Sitzungsordner (Mensch + KI)
+    _STUDIO_SESSION = "secrets/probe/out/studio"  # geteilter Studio-Zustand (Lib+Eingaben+Ergebnis)
 
     def _dbg_budget(self):
         """Budget (Bloecke) fuer Resume/Auto-Lift aus dem Run-Panel-Feld 'maxins';
@@ -380,6 +386,765 @@ class NativeStudioController:
             self._log(f"Plugin-Aktion '{action}' (Plugin {plugin or '?'}) nicht implementiert.")
         except Exception as e:
             self._log(f"Plugin-Aktion FEHLER: {e!r}")
+
+    _SYS_NR = {56: "openat", 57: "close", 63: "read", 64: "write", 48: "faccessat",
+               79: "newfstatat", 78: "readlinkat", 61: "getdents64", 172: "getpid",
+               178: "gettid", 173: "getppid", 174: "getuid", 167: "prctl", 117: "ptrace",
+               169: "gettimeofday", 113: "clock_gettime", 129: "kill", 131: "tgkill",
+               93: "exit", 94: "exit_group", 220: "clone", 98: "futex", 222: "mmap",
+               226: "mprotect", 160: "uname", 179: "sysinfo", 198: "socket", 203: "connect",
+               233: "madvise", 101: "nanosleep", 43: "statfs"}
+
+    def _syscall_policy_path(self):
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        return os.path.join(root, "secrets", "probe", "out", "syscall_policy.json")
+
+    def _load_syscall_policy(self):
+        import json
+        try:
+            with open(self._syscall_policy_path(), encoding="utf-8") as f:
+                p = json.load(f)
+            if isinstance(p, dict):
+                p.setdefault("default_ret", 0); p.setdefault("by_nr", {})
+                return p
+        except Exception:
+            pass
+        return {"default_ret": 0, "by_nr": {}}
+
+    def _save_syscall_policy(self, pol):
+        import os, json
+        path = self._syscall_policy_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(pol, f, indent=2)
+
+    def set_syscall_return(self, row):
+        """Doppelklick im Syscalls-Reiter: geraeteechte Rueckgabe fuer diese Syscall-Nr setzen (Policy)."""
+        import tkinter.simpledialog as sd
+        nr = row.get("nr")
+        if nr is None:
+            return
+        pol = self._load_syscall_policy()
+        cur = pol.get("by_nr", {}).get(str(nr))
+        cur_ret = cur.get("ret") if isinstance(cur, dict) else (cur if cur is not None else pol.get("default_ret", 0))
+        val = sd.askstring("Syscall-Policy",
+                           f"Rueckgabe (x0) fuer {self._SYS_NR.get(nr, 'sys_%d' % nr)} (nr {nr}):\n"
+                           f"Zahl (0x.. erlaubt). Leer = loeschen.", initialvalue=str(cur_ret))
+        if val is None:
+            return
+        pol.setdefault("by_nr", {})
+        if val.strip() == "":
+            pol["by_nr"].pop(str(nr), None)
+            self._log(f"🛡 Policy: Rueckgabe fuer nr {nr} geloescht.")
+        else:
+            try:
+                pol["by_nr"][str(nr)] = int(val, 0)
+            except Exception:
+                self._log("🛡 Policy: ungueltige Zahl."); return
+            self._log(f"🛡 Policy: nr {nr} ({self._SYS_NR.get(nr, '?')}) -> {val}. 🛡 Surv erneut klicken zum Anwenden.")
+        self._save_syscall_policy(pol)
+
+    def devirt_run(self):
+        """🧩 Devirt: OLLVM-geflachte Funktion (Entry-Feld, Default onSearchResult) entflachen und
+        de-flattened Pseudocode zeigen. Nutzt tools.native_devirt (baut eigene Engine)."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return
+        cfg = self.tab.get_run_config()
+        entry = (cfg.get("entry") or "").strip() or "onSearchResult"
+        budget = max(self._dbg_budget(), 4000000)
+
+        def _iv(var, dflt):
+            try:
+                return int(str(getattr(self.tab, var).get()).strip())
+            except Exception:
+                return dflt
+        runs = max(1, _iv("devirt_runs_var", 4))
+        lift_max = max(0, _iv("devirt_liftmax_var", 25000))
+        self._log("🧩 Devirt '%s' gestartet (Budget %d, runs=%d, lift_max=%d) — Hintergrund …"
+                  % (entry, budget, runs, lift_max))
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_devirt(None, entry=entry, budget=budget,
+                                        runs=runs, lift_max=lift_max)
+                if not r.get("ok"):
+                    self._log("🧩 Devirt: %s" % r.get("hinweis", "Fehler")); return
+                out = ["# Devirt %s (%s)  stop=%s" % (r.get("entry"), r.get("fn"), r.get("stop")),
+                       "# %s" % r.get("note", "")]
+                if r.get("inputs"):
+                    out.append("# Eingaben: %s" % ", ".join(repr(x) for x in r.get("inputs")))
+                out += ["",
+                        "## Handler-Sequenz (%d Dispatches, %d eindeutig, %d Branch-Points):"
+                        % (r.get("n_dispatches", 0), r.get("n_unique", 0),
+                           r.get("n_branch_points", 0)),
+                        "  " + " -> ".join(r.get("sequence", []))]
+                bps = r.get("branch_points") or []
+                if bps:
+                    out += ["", "## Branch-Points (Verzweigung + Index-Entscheidung [idx1][col]):"]
+                    for bp in bps:
+                        succ = ", ".join("%s (x%s/r%s)" % (s["target"], s["count"], s["runs"])
+                                         for s in bp.get("successors", []))
+                        out.append("  %s  ->  %s" % (bp["handler"], succ))
+                        for row in bp.get("index_table", []):
+                            out.append("       %s -> %s  (x%s, r%s)"
+                                       % (row["index"], row["target"], row["count"], row["runs"]))
+                _mode = r.get("lift_mode")
+                _code = r.get("python") if _mode == "runnable" else r.get("pseudocode")
+                if _mode in ("skipped_large", "skipped_off"):
+                    out += ["", "## Python-Lift uebersprungen (%s; Spur=%s Instr., lift_max=%s)"
+                            % (_mode, r.get("lift_trace_len"), r.get("lift_max"))]
+                else:
+                    _hdr = "## De-flattened %s (%s Bloecke, %s Besuche):" % (
+                        "Python [ausfuehrbar]" if _mode == "runnable" else "Pseudocode",
+                        r.get("lift_unique"), r.get("lift_visits"))
+                    out += ["", _hdr, _code or r.get("lift_error") or "(kein Code)"]
+                text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_devirt(t))
+                self._log("🧩 Devirt '%s': %d Handler, %d Branch-Points, lift=%s."
+                          % (entry, r.get("n_unique", 0), r.get("n_branch_points", 0), _mode))
+            except Exception as e:
+                self._log("🧩 Devirt FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def devirt_static_run(self):
+        """🗺 Statischer Devirt: Dispatch-Graph der Entry-Funktion OHNE Lauf der Zielfunktion
+        (1D-madd 0x134f48 + 2D-smaddl-Vtable 0x137740). Nutzt tools.native_devirt_static;
+        Ausgabe im Devirt-Reiter (set_devirt)."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return
+        cfg = self.tab.get_run_config()
+        entry = (cfg.get("entry") or "").strip() or "onSearchResult"
+        self._log("🗺 Statischer Devirt '%s' gestartet (ohne Lauf der Zielfunktion) — Hintergrund …"
+                  % entry)
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_devirt_static(None, entry=entry, max_blocks=400)
+                if not r.get("ok"):
+                    self._log("🗺 Statischer Devirt: %s" % r.get("hinweis", "Fehler")); return
+                blocks = r.get("blocks") or {}
+                out = ["# Statischer Dispatch-Graph  %s (%s)"
+                       % (r.get("entry_name"), r.get("entry_addr")),
+                       "# %s" % r.get("note", ""), "",
+                       "## Bloecke (%d) - Typ [vtable] -> Nachfolger:" % r.get("n_blocks", 0)]
+                for addr, b in blocks.items():
+                    succ = ", ".join(b.get("successors") or []) or "-"
+                    tbl = (" [vtable %s]" % b["table"]) if b.get("table") else ""
+                    out.append("  %-10s %-7s%s -> %s" % (addr, b.get("node_type", "?"), tbl, succ))
+                bps = r.get("branch_points") or []
+                if bps:
+                    out += ["", "## Branch-Points (%d, registerabhaengige Auswahl):" % len(bps),
+                            "  " + ", ".join(bps)]
+                traps = r.get("traps") or []
+                if traps:
+                    out += ["", "## Traps (%d, leerer Slot / Anti-Tamper):" % len(traps),
+                            "  " + ", ".join(traps)]
+                out += ["", "# Hinweis: statisch = deterministische Kanten; die Branch-Auswahl "
+                        "braucht einen Trace (🧩 Devirt). Hybrid = Skelett statisch + Auswahl dynamisch."]
+                text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_devirt(t))
+                self._log("🗺 Statischer Devirt '%s': %d Bloecke, %d Branch-Points, %d Trap(s)."
+                          % (entry, r.get("n_blocks", 0), r.get("n_branch_points", 0),
+                             r.get("n_traps", 0)))
+            except Exception as e:
+                self._log("🗺 Statischer Devirt FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def os_attach_run(self):
+        """🌐 Env/Syscall-Substrat (N2) anhaengen und die Entry-Funktion unter kontrollierter
+        Fake-Umgebung laufen lassen (gefaelschte /proc/self/maps + VFS + konvergierter Syscall-Pfad).
+        Nutzt tools.native_os_attach; Ausgabe im Env-Reiter (set_env_result). WS-E3-Steuerflaeche."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return
+        entry = (self.tab.env_entry_var.get() or "").strip() or "JNI_OnLoad"
+        try:
+            budget = int((self.tab.env_budget_var.get() or "200000").strip())
+        except Exception:
+            budget = 200000
+        vfs = (self.tab.env_vfs_var.get() or "").strip() or None
+        config = (self.tab.env_cfg_var.get() or "").strip() or None
+        maps = self.tab.env_maps.get("1.0", "end").strip() or None
+        self._log("🌐 Env anhaengen + laufen '%s' (budget=%d) — Hintergrund …" % (entry, budget))
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_os_attach(None, entry=entry, maps=maps, vfs=vfs,
+                                           config=config, budget=budget)
+                if not r.get("ok"):
+                    self._log("🌐 Env: %s" % r.get("hinweis", "Fehler")); return
+                env = r.get("env") or {}
+                sc = r.get("syscalls") or {}
+                out = ["# Env/Syscall-Substrat (N2) — %s  stop=%s  steps=%s"
+                       % (entry, r.get("stop"), r.get("steps")),
+                       "# maps=%s B  vfs=%s  config=%s"
+                       % (env.get("maps_bytes"), env.get("vfs"), env.get("config")),
+                       "",
+                       "## Syscalls: %d (handler=%d, policy=%d, default=%d)  mmaps=%d  fds=%d"
+                       % (sc.get("calls", 0), sc.get("by_handler", 0), sc.get("by_policy", 0),
+                          sc.get("by_default", 0), sc.get("mmaps", 0), sc.get("open_fds", 0)),
+                       "## survived dead-dispatches: %d" % r.get("survived_dead_dispatches", 0)]
+                jni = r.get("jni") or {}
+                if jni:
+                    out += ["## JNI: calls=%s natives=%s" % (jni.get("calls"), jni.get("natives"))]
+                out += ["", "# WS-E3: die gefaelschte Umgebung steuert, welchen Pfad der RASP nimmt.",
+                        "# Hohe budgets koennen in den nativen Krypto-Decrypt lenken (langsam, kein Hang)."]
+                if r.get("stop") == "budget" and sc.get("calls", 0) == 0 and not (jni.get("natives") or 0):
+                    out += ["",
+                            "# Kein Ergebnis: Registrierung (59 natives) + Syscalls liegen erst bei ~217k",
+                            "#   Steps, hinter der langsamen NEON-Krypto-Init. Zwei Wege:",
+                            "#   - Budget erhoehen (>= ~218k) und durchlaufen lassen -> genuines 'done'",
+                            "#     (handler-bediente Syscalls), aber langsam (Minuten; kein Hang, es",
+                            "#     rechnet die Entschluesselung real aus).",
+                            "#   - '🛡 Surv' (survive_run): ueberspringt die NEON-Krypto-Init -> das",
+                            "#     identische 'done' (59 natives + 3 Syscalls, 9 survived) in ~3 s."]
+                text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_env_result(t))
+                self._log("🌐 Env '%s': stop=%s, %d Syscalls, %d survived."
+                          % (entry, r.get("stop"), sc.get("calls", 0),
+                             r.get("survived_dead_dispatches", 0)))
+            except Exception as e:
+                self._log("🌐 Env FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def dalvik_run(self):
+        """\u25b6 J1: Smali aus dem Java/Dalvik-Reiter parsen und eine Dalvik-Methode ausfuehren
+        (Register-VM: Opcodes/Objektmodell/Intra-Invoke). Nutzt tools.native_dalvik_run; kein .so noetig."""
+        smali = self.tab.java_src.get("1.0", "end").strip()
+        if not smali:
+            self._log("Java/Dalvik: kein Smali-Text."); return
+        name = (self.tab.java_name_var.get() or "").strip() or None
+        args = (self.tab.java_args_var.get() or "").strip() or "[]"
+        self._log("\u25b6 Dalvik ausfuehren (%s) \u2014 Hintergrund \u2026" % (name or "erste Methode"))
+
+        def _mw(ms):
+            return ["  %s->%s%s  (nregs=%s nargs=%s)"
+                    % (m["cls"], m["name"], m["sig"], m["nregs"], m["nargs"]) for m in ms]
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_dalvik_run(None, smali=smali, name=name, args=args)
+                if not r.get("ok"):
+                    out = ["# Dalvik: %s" % r.get("hinweis", "Fehler")]
+                    if r.get("methods"):
+                        out += ["", "## registrierte Methoden:"] + _mw(r["methods"])
+                    text = "\n".join(out)
+                    self.app.after(0, lambda t=text: self.tab.set_java_result(t))
+                    self._log("\u25b6 Dalvik: %s" % r.get("hinweis", "Fehler")); return
+                called = r.get("called") or {}
+                out = ["# Dalvik-Lauf \u2014 %s->%s%s  args=%s"
+                       % (called.get("cls"), called.get("name"), called.get("sig"), called.get("args")),
+                       "## Ergebnis: %r" % (r.get("result"),), "",
+                       "## registrierte Methoden:"] + _mw(r.get("methods", []))
+                cov = r.get("coverage") or {}
+                if cov:
+                    out += ["", "## Opcode-Coverage: "
+                            + ", ".join("%s=%d" % (k, vv) for k, vv in sorted(cov.items()))]
+                if r.get("missing"):
+                    out += ["## nicht aufgeloeste Aufrufe: "
+                            + ", ".join("%s->%s%s" % (x["cls"], x["name"], x["sig"]) for x in r["missing"])]
+                text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_java_result(t))
+                self._log("\u25b6 Dalvik '%s': result=%r" % (called.get("name"), r.get("result")))
+            except Exception as e:
+                self._log("\u25b6 Dalvik FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def dex_run(self):
+        """J3/MS-4: ein DEX laden und eine Methode ausfuehren (DalvikVM + android.*-Stubs)."""
+        dex_path = (self.tab.dex_path_var.get() or "").strip()
+        spec = (self.tab.dex_method_var.get() or "").strip()
+        args = (self.tab.java_args_var.get() or "").strip() or "[]"
+        if not dex_path or "->" not in spec or "(" not in spec:
+            self._log("DEX: Pfad + Methode 'Lcls;->name(sig)ret' noetig."); return
+        cls, right = spec.split("->", 1)
+        name = right[:right.index("(")]
+        sig = right[right.index("("):]
+        self._log("> DEX ausfuehren %s->%s%s ..." % (cls, name, sig))
+
+        def _fm(xs):
+            return ["  %s->%s%s" % (x["cls"], x["name"], x["sig"]) for x in xs]
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_dex_run(None, dex_path=dex_path, cls=cls, name=name, sig=sig, args=args)
+                if not r.get("ok"):
+                    out = ["# DEX: %s" % r.get("hinweis", "Fehler")]
+                    if r.get("methods"):
+                        out += ["", "## Methoden der Klasse:"] + ["  %s%s" % (m["name"], m["sig"]) for m in r["methods"]]
+                else:
+                    called = r.get("called") or {}; dx = r.get("dex") or {}
+                    out = ["# DEX-Lauf  %s->%s%s  args=%s"
+                           % (called.get("cls"), called.get("name"), called.get("sig"), called.get("args")),
+                           "# dex: v%s  classes=%s  methods=%s"
+                           % (dx.get("version"), dx.get("classes"), dx.get("methods")),
+                           "## Ergebnis: %r" % (r.get("result"),)]
+                    fm = r.get("framework_missing") or []
+                    if fm:
+                        out += ["## nicht aufgeloeste Framework-Aufrufe (Coverage-Loop):"] + _fm(fm)
+                text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_java_result(t))
+                self._log("> DEX: %s" % ("ok" if r.get("ok") else r.get("hinweis")))
+            except Exception as e:
+                self._log("> DEX FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def jdebug_run(self):
+        """X1/MS-6: Smali aus dem Java/Dalvik-Reiter unter dem glaesernen Java-Debugger ausfuehren
+        (skriptbasiert: Breakpoints beobachten + optional Register mutieren)."""
+        smali = self.tab.java_src.get("1.0", "end").strip()
+        if not smali:
+            self._log("Debug: kein Smali-Text."); return
+        name = (self.tab.java_name_var.get() or "").strip() or None
+        args = (self.tab.java_args_var.get() or "").strip() or "[]"
+        bps = (self.tab.jdbg_bp_var.get() or "").strip() or "[]"
+        regs = (self.tab.jdbg_regs_var.get() or "").strip() or "{}"
+        self._log("> Java-Debug (%s) \u2026" % (name or "erste Methode"))
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_jdbg_run(None, smali=smali, name=name, args=args,
+                                          breakpoints=bps, set_regs=regs)
+                if not r.get("ok"):
+                    text = "# Debug: %s" % r.get("hinweis", "Fehler")
+                else:
+                    out = ["# Java-Debug  result=%r  mode=%s  timeline=%s"
+                           % (r.get("result"), r.get("mode"), r.get("timeline_len")),
+                           "## Breakpoint-Beobachtungen:"]
+                    for o in r.get("observations", []):
+                        out.append("  step=%s pc=%s regs=%s"
+                                   % (o.get("step"), o.get("pc"), o.get("registers")))
+                    text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_java_result(t))
+                self._log("> Java-Debug: %s" % ("ok" if r.get("ok") else r.get("hinweis")))
+            except Exception as e:
+                self._log("> Java-Debug FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    # ===== X1/MS-6: interaktive Debugger-Perspektive (Live-Sitzung) =========
+    def _jdb_build_vm(self):
+        """Baut aus dem Smali im Reiter 'Java/Dalvik' eine DalvikVM + Methodenliste (zielagnostisch)."""
+        from core.java.dalvik import DalvikVM
+        from core.java import smali as Sm
+        smali = self.tab.java_src.get("1.0", "end").strip()
+        if not smali:
+            raise ValueError("kein Smali-Text im Reiter 'Java/Dalvik'")
+        vm = DalvikVM()
+        mds = Sm.parse_class(smali)[1] if ".class" in smali else [Sm.parse_method(smali)]
+        for md in mds:
+            vm.register(md)
+        return vm, mds
+
+    def _jdb_target(self, mds):
+        name = (self.tab.jdb_name_var.get() or "").strip()
+        if name:
+            for md in mds:
+                if md.name == name:
+                    return md
+            raise ValueError("Methode '%s' nicht gefunden" % name)
+        return mds[0]
+
+    def _jdb_inspect(self):
+        d = self._jdb
+        ins = d.inspect()
+        ins["_tl"] = d.timeline[-40:]
+        return ins
+
+    def _jdb_set_buttons(self, mode):
+        paused = (mode == "paused")
+        def _s(btn, on):
+            try:
+                btn.config(state=("normal" if on else "disabled"))
+            except Exception:
+                pass
+        _s(self.tab.btn_jdb_start, True)
+        _s(self.tab.btn_jdb_step, paused)
+        _s(self.tab.btn_jdb_over, paused)
+        _s(self.tab.btn_jdb_out, paused)
+        _s(self.tab.btn_jdb_cont, paused)
+        _s(self.tab.btn_jdb_stop, paused)
+        _s(self.tab.btn_jdb_goto, self._jdb is not None)
+        _s(self.tab.btn_jdb_setreg, paused)
+
+    def _jdb_refresh(self, ins):
+        def _u():
+            self.tab.set_jdb_status(ins)
+            self.tab.set_jdb_registers(ins.get("registers", []))
+            self.tab.set_jdb_timeline(ins.get("_tl", []))
+            self._jdb_set_buttons(ins.get("mode"))
+        self.app.after(0, _u)
+
+    def _jdb_async(self, fn, label):
+        """Debugger-Operation im Worker-Thread ausfuehren (tkinter bleibt reaktiv), dann UI refreshen."""
+        if self._jdb_busy:
+            self._log("Debugger beschaeftigt, bitte warten."); return
+        self._jdb_busy = True
+
+        def _w():
+            try:
+                fn()
+                ins = self._jdb_inspect() if self._jdb else {"mode": "idle"}
+                self._jdb_refresh(ins)
+                self._log("> Debugger: %s -> %s" % (label, ins.get("mode")))
+            except Exception as e:
+                self._log("> Debugger FEHLER (%s): %r" % (label, e))
+            finally:
+                self._jdb_busy = False
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def jdb_start(self):
+        import json
+        try:
+            vm, mds = self._jdb_build_vm()
+            md = self._jdb_target(mds)
+            argtxt = (self.tab.jdb_args_var.get() or "[]").strip() or "[]"
+            args = json.loads(argtxt)
+            if not isinstance(args, list):
+                raise ValueError("args muss eine JSON-Liste sein")
+        except Exception as e:
+            self._log("> Debugger Start abgebrochen: %r" % e); return
+        from core.java.debug import JavaDebugger
+        if self.tab.jdb_lazy_zone.get():
+            root = self._jdb_resolve_root()
+            if root:
+                try:
+                    from core.java.class_provider import StudioClassProvider
+                    zone = self.tab.jdb_zone_var.get() or "original"
+                    vm.class_provider = StudioClassProvider(root, zone=zone)
+                    self._log("> Callees lazy aus Zone '%s': %s" % (zone, root))
+                except Exception as e:
+                    self._log("> Zonen-Provider nicht gesetzt: %r" % e)
+            else:
+                self._log("> Lazy-Zone aktiv, aber keine Zonen-Wurzel gesetzt/aufloesbar.")
+        self._jdb = JavaDebugger(vm)
+        self._jdb_target_sig = (md.cls, md.name, md.sig)
+        for pc in self._jdb_bps:
+            self._jdb.add_breakpoint(md.cls, md.name, md.sig, pc)
+        stop_entry = bool(self.tab.jdb_entry_stop.get())
+        self._log("> Debugger Start: %s->%s%s (BP=%s, Halt@Eintritt=%s)"
+                  % (md.cls, md.name, md.sig, self._jdb_bps, stop_entry))
+        self._jdb_async(lambda: self._jdb.start(md.cls, md.name, md.sig, tuple(args),
+                                                stop_at_entry=stop_entry), "start")
+
+    def jdb_step(self):
+        if not self._jdb:
+            self._log("Kein Debugger-Lauf aktiv (erst Start)."); return
+        self._jdb_async(lambda: self._jdb.step(), "step")
+
+    def jdb_step_over(self):
+        if not self._jdb:
+            self._log("Kein Debugger-Lauf aktiv (erst Start)."); return
+        self._jdb_async(lambda: self._jdb.step_over(), "step_over")
+
+    def jdb_step_out(self):
+        if not self._jdb:
+            self._log("Kein Debugger-Lauf aktiv (erst Start)."); return
+        self._jdb_async(lambda: self._jdb.step_out(), "step_out")
+
+    def jdb_cont(self):
+        if not self._jdb:
+            self._log("Kein Debugger-Lauf aktiv (erst Start)."); return
+        self._jdb_async(lambda: self._jdb.cont(), "cont")
+
+    def jdb_stop(self):
+        if not self._jdb:
+            return
+        self._jdb_async(lambda: self._jdb.stop(), "stop")
+
+    def jdb_goto(self):
+        if not self._jdb:
+            self._log("Kein Debugger-Lauf aktiv (erst Start)."); return
+        try:
+            n = int((self.tab.jdb_goto_var.get() or "0").strip())
+        except Exception:
+            self._log("Goto: ungueltige Schrittnummer."); return
+        self._jdb_async(lambda: self._jdb.goto(n), "goto %d" % n)
+
+    def jdb_addbp(self):
+        try:
+            pc = int((self.tab.jdb_bpadd_var.get() or "").strip())
+        except Exception:
+            self._log("BP: ungueltiger pc (ganze Zahl erwartet)."); return
+        self._jdb_bps = sorted(set(self._jdb_bps + [pc]))
+        if self._jdb and self._jdb_target_sig:
+            c0, n0, s0 = self._jdb_target_sig
+            self._jdb.add_breakpoint(c0, n0, s0, pc)
+            self._jdb_refresh(self._jdb_inspect())
+        self._log("> BP gesetzt: pc=%d (aktive: %s)" % (pc, self._jdb_bps))
+
+    def jdb_clrbp(self):
+        self._jdb_bps = []
+        if self._jdb:
+            self._jdb.clear_breakpoints()
+            self._jdb_refresh(self._jdb_inspect())
+        self._log("> BP geleert.")
+
+    def jdb_setreg(self):
+        if not self._jdb:
+            self._log("Kein Debugger-Lauf aktiv."); return
+        try:
+            i = int((self.tab.jdb_setreg_i.get() or "").strip())
+            v = int((self.tab.jdb_setreg_v.get() or "").strip())
+        except Exception:
+            self._log("Set Reg: idx und Wert muessen ganze Zahlen sein."); return
+        ok = self._jdb.set_register(i, v)
+        self._jdb_refresh(self._jdb_inspect())
+        self._log("> set_register(%d, %d) -> %s" % (i, v, ok))
+
+    def _jdb_resolve_root(self):
+        """Zonen-Wurzel: Feldwert, sonst best-effort aus der App-Config."""
+        root = (self.tab.jdb_zone_root.get() or "").strip()
+        if root:
+            return root
+        try:
+            cfg = self.app.cfg.config
+            for k in ("APP_SOURCE_DIR", "UNPACKED_DIR", "BASE_DIR"):
+                v = cfg.get(k)
+                if v:
+                    return v
+        except Exception:
+            pass
+        return ""
+
+    def jdb_studio_load(self):
+        """Punkt 1: eine Klasse aus der Zonen-Wurzel in die Quelle (java_src) laden.
+        relpath = Dateipfad relativ zur Wurzel ODER Deskriptor Lcom/foo/Bar;."""
+        import os
+        import glob
+        root = self._jdb_resolve_root()
+        if not root:
+            self._log("Studio laden: keine Zonen-Wurzel gesetzt."); return
+        rel = (self.tab.jdb_relpath_var.get() or "").strip()
+        if not rel:
+            self._log("Studio laden: relpath/Deskriptor fehlt."); return
+        cands = []
+        if rel.startswith("L") and rel.endswith(";"):
+            sub = rel[1:-1].split("/")
+            roots = sorted(glob.glob(os.path.join(root, "smali*"))) or [root]
+            for d in roots:
+                cands.append(os.path.join(d, *sub) + ".smali")
+        else:
+            cands.append(os.path.join(root, rel))
+            cands.append(rel)
+        for p in cands:
+            if os.path.isfile(p):
+                try:
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        txt = f.read()
+                except Exception as e:
+                    self._log("> Studio laden FEHLER: %r" % e); return
+                self.tab.java_src.delete("1.0", "end")
+                self.tab.java_src.insert("1.0", txt)
+                self._log("> Aus Studio geladen: %s (%d Zeichen)" % (p, len(txt)))
+                return
+        self._log("> Studio laden: Datei nicht gefunden (%s)" % (cands[0] if cands else rel))
+
+    def jdb_lifecycle(self):
+        """MS-4 (erste Slice): ganze App am Lifecycle-Einstieg starten (Entry-Deskriptor, Zone)."""
+        root = self._jdb_resolve_root()
+        entry = (self.tab.jdb_entry_var.get() or "").strip()
+        zone = self.tab.jdb_zone_var.get() or "original"
+        if not root:
+            self._log("App-Lifecycle: keine Zonen-Wurzel gesetzt."); return
+        if not entry:
+            self._log("App-Lifecycle: App-Entry-Deskriptor fehlt (Lcom/foo/MainActivity;)."); return
+        self._log("> App-Lifecycle (%s, Zone %s) \u2026" % (entry, zone))
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_app_lifecycle_run(None, studio_root=root, zone=zone, entry=entry)
+                if not r.get("ok"):
+                    text = "# App-Lifecycle: %s" % r.get("hinweis", "Fehler")
+                else:
+                    out = ["# App-Lifecycle  entry=%s  zone=%s" % (r.get("entry"), r.get("zone")),
+                           "## aufgerufen:"]
+                    for cc in r.get("called", []):
+                        out.append("  %s%s" % (cc.get("m"), cc.get("sig")))
+                    out.append("## uebersprungen (nicht definiert):")
+                    for sdef in r.get("skipped", []):
+                        out.append("  %s%s  (%s)" % (sdef.get("m"), sdef.get("sig"), sdef.get("grund")))
+                    if r.get("missing"):
+                        out.append("## ungeloest (fehlende Stubs/Callees):")
+                        for mm in r.get("missing", []):
+                            out.append("  %s->%s%s" % (mm.get("cls"), mm.get("name"), mm.get("sig")))
+                    text = "\n".join(out)
+                self.app.after(0, lambda t=text: self.tab.set_java_result(t))
+                self._log("> App-Lifecycle: %s" % ("ok" if r.get("ok") else r.get("hinweis")))
+            except Exception as e:
+                self._log("> App-Lifecycle FEHLER: %r" % e)
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def _recipe_path(self):
+        import os
+        return os.path.join("secrets", "probe", "out", "workflow_recipes.json")
+
+    def list_recipes(self):
+        """Gespeicherte Workflow-Rezepte (Name + Workflow + Params)."""
+        import json, os
+        p = self._recipe_path()
+        try:
+            if os.path.isfile(p):
+                return json.load(open(p, encoding="utf-8"))
+        except Exception:
+            pass
+        return []
+
+    def save_recipe(self, name, workflow, params):
+        """Speichert/ersetzt ein Rezept lokal (secrets/probe/out/workflow_recipes.json)."""
+        import json, os
+        recs = [r for r in self.list_recipes() if r.get("name") != name]
+        recs.append({"name": name, "workflow": workflow, "params": params})
+        try:
+            os.makedirs(os.path.dirname(self._recipe_path()), exist_ok=True)
+            with open(self._recipe_path(), "w", encoding="utf-8") as f:
+                json.dump(recs, f, indent=2, ensure_ascii=False)
+            self._log("⭐ Rezept '%s' gespeichert." % name)
+        except Exception as e:
+            self._log("Rezept-Speichern FEHLER: %r" % e)
+        return recs
+
+    def workflow_meta(self):
+        """Workflow-Registry fuer die GUI (Rail + Formularfelder)."""
+        try:
+            from mcp_server import tools
+            return tools.native_workflow_meta(None)
+        except Exception as e:
+            self._log("Workflow-Meta FEHLER: %r" % e)
+            return {"order": [], "workflows": {}}
+
+    def run_workflow(self, name, params, on_done):
+        """Fuehrt einen Workflow im Hintergrund aus; Ergebnis geht an on_done (UI-Thread)."""
+        self._log("⚙ Workflow '%s' gestartet (%s) …" % (name, params))
+
+        def _w():
+            try:
+                from mcp_server import tools
+                r = tools.native_workflow(None, name, params)
+            except Exception as e:
+                r = {"ok": False, "hinweis": "Workflow-Fehler: %r" % e, "workflow": name}
+            try:
+                self.app.after(0, lambda rr=r: on_done(rr))
+            except Exception:
+                on_done(r)
+            self._log("⚙ Workflow '%s': ok=%s" % (name, r.get("ok") if isinstance(r, dict) else "?"))
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def survive_run(self):
+        """🛡 Survival-Lauf: JNI_OnLoad ueber die Anti-Tamper-Trap hinaus (tote Dispatches ueberleben),
+        rohe Detection-Syscalls gemaess Policy aufzeichnen. Budget = maxins-Feld."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return
+        if not self._require_capstone():
+            return
+        _budget = self._dbg_budget()
+        self._log("🛡 Survival-Lauf gestartet (Budget %d) — Hintergrund …" % _budget)
+
+        def _w():
+            try:
+                from services.native_emu_service import NativeEmuService
+                from services.native_ffi_service import NativeFfiService
+                from services.native_trace_service import NativeTraceService
+                from services import native_jni_env_service as Jm
+                from services.native_jni_env_service import NativeJniEnvService
+                svc = NativeEmuService(publish=False); eng = svc.new_engine()
+                svc.load_image(eng, self.image, apply_relocs=True)
+                ffi = NativeFfiService(publish=False); ffi.wire_imports(eng, self.image)
+                jni = NativeJniEnvService(publish=False); jni.install(eng, ffi, set_entry_reg=None)
+                pol = self._load_syscall_policy()
+                ffi.install_syscall_hook(eng, returns=(pol.get("by_nr") or {}),
+                                         default_ret=int(pol.get("default_ret", 0)))
+                tr = NativeTraceService(publish=False)
+                tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+                cfg = self.tab.get_run_config()
+                entry = svc.resolve_entry(cfg.get("entry") or "JNI_OnLoad", self.image)
+                tr.begin(eng, entry, args=[Jm.VM_OBJ], faithful=True)
+                r = tr.run(eng, breakpoints=[], maxins=_budget, mode="block")
+                slog = ffi.get_syscall_log(eng); sv = tr.survive_get(eng)
+                c = eng.cpu
+
+                def cstr(a, maxn=160):
+                    try:
+                        a = int(a)
+                        if not a:
+                            return None
+                        out = bytearray()
+                        for _ in range(maxn):
+                            b = c.m.rb(a, 1); a += 1
+                            if not b or b[0] == 0:
+                                break
+                            if b[0] < 0x20 or b[0] > 0x7e:
+                                return None
+                            out.append(b[0])
+                        return out.decode("ascii", "replace") if out else None
+                    except Exception:
+                        return None
+                rows = []
+                for e in slog[:300]:
+                    ar = e.get("args", [])
+                    p = (cstr(ar[1]) if len(ar) > 1 else None) or (cstr(ar[0]) if ar else None)
+                    rows.append({"nr": e["nr"], "name": self._SYS_NR.get(e["nr"], "sys_%d" % e["nr"]),
+                                 "path": p, "args": " ".join(hex(x) for x in ar[:3]), "ret": hex(e.get("ret", 0))})
+                self.app.after(0, lambda: self.tab.set_syscalls(rows))
+                self._log("🛡 Survival: stop @%s · %d tote Dispatches ueberlebt · %d Syscalls (Doppelklick = Policy)."
+                          % (r.get("pc_hex"), len(sv), len(slog)))
+            except Exception as e:
+                self._log(f"🛡 Survival FEHLER: {e!r}")
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def dispatch_trace_run(self):
+        """🎯 Dispatch-Trace: JNI_OnLoad mit CFF-Dispatch-Tracer; jeden vtable-Dispatch listen
+        (Slot/idx1/col/Handler/leer/Taint). Markiert Divergenz (Taint) und Trap (leerer Slot).
+        Budget = maxins-Feld."""
+        if self.image is None:
+            self._log("Erst eine .so laden (kein Image)."); return
+        if not self._require_capstone():
+            return
+        _budget = self._dbg_budget()
+        self._log("🎯 Dispatch-Trace gestartet (Budget %d) — laeuft im Hintergrund …" % _budget)
+
+        def _w():
+            try:
+                from services.native_emu_service import NativeEmuService
+                from services.native_ffi_service import NativeFfiService
+                from services.native_trace_service import NativeTraceService
+                from services import native_jni_env_service as Jm
+                from services.native_jni_env_service import NativeJniEnvService
+                svc = NativeEmuService(publish=False); eng = svc.new_engine()
+                svc.load_image(eng, self.image, apply_relocs=True)
+                ffi = NativeFfiService(publish=False); ffi.wire_imports(eng, self.image)
+                jni = NativeJniEnvService(publish=False); jni.install(eng, ffi, set_entry_reg=None)
+                cfg = self.tab.get_run_config()
+                entry = svc.resolve_entry(cfg.get("entry") or "JNI_OnLoad", self.image)
+                tr = NativeTraceService(publish=False)
+                tr.dispatch_trace_enable(eng)
+                tr.begin(eng, entry, args=[Jm.VM_OBJ], faithful=True)
+                r = tr.run(eng, breakpoints=[], maxins=_budget, mode="block")
+                tr.dispatch_trace_disable(eng)
+                log = tr.dispatch_trace_get(eng); summ = tr.dispatch_trace_summary(eng)
+                self.app.after(0, lambda: self.tab.set_dispatch_trace(log, summ))
+                self._log("🎯 Dispatch-Trace: %d Dispatches · %d leer (Trap) · %d getaintet · stop @%s"
+                          % (summ["dispatches"], summ["empty_fetches"], summ["tainted"], r.get("pc_hex")))
+            except Exception as e:
+                self._log(f"🎯 Dispatch-Trace FEHLER: {e!r}")
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
 
     def jni_run(self):
         """⚡ JNI: JNI_OnLoad mit der Fake-JNIEnv-Fassade (Reloc+Imports) laufen lassen,
@@ -574,6 +1339,227 @@ class NativeStudioController:
                 pass
         self._dbg_bps = out
 
+    def workflow_load_active_lib(self, then=None):
+        """Laedt die aktive Workflow-Lib (secrets/probe/out/active_lib.txt) ins Image — fuer die Kontext-Zone."""
+        import os
+        path = None
+        try:
+            p = os.path.join("secrets", "probe", "out", "active_lib.txt")
+            if os.path.isfile(p):
+                path = (open(p, encoding="utf-8").read().strip() or None)
+        except Exception:
+            path = None
+        if not path:
+            path = getattr(self, "image_path", None)
+        if not path or not os.path.isfile(path):
+            self._log("Kontext: keine aktive Lib gefunden — erst 'Oeffnen' im Workflow (oder '.so laden').")
+            if then:
+                try:
+                    then()
+                except Exception:
+                    pass
+            return
+        same = (os.path.basename(path) == os.path.basename(getattr(self, "image_path", "") or ""))
+        if same and self.image is not None:
+            if then:
+                try:
+                    then()
+                except Exception:
+                    pass
+            return
+        self._log(f"Kontext: lade aktive Lib {os.path.basename(path)} …")
+        self._load_so(path, then=then)
+
+    def workflow_functions(self):
+        """(name, 0xaddr)-Liste der geladenen Lib — benannte Symbole + Index-Funktionen (Kontext-Zone)."""
+        out = []
+        seen = set()
+        try:
+            img = getattr(self, "image", None)
+            if img is not None:
+                for n, sy in getattr(img, "dynsyms", {}).items():
+                    v = getattr(sy, "value", 0)
+                    if v and n and v not in seen:
+                        seen.add(v); out.append((n, f"0x{v:x}"))
+        except Exception:
+            pass
+        try:
+            idx = getattr(self, "index", None)
+            if idx is not None and getattr(idx, "syms", None):
+                for a, n in idx.syms:
+                    if a and n and a not in seen:
+                        seen.add(a); out.append((n, f"0x{a:x}"))
+        except Exception:
+            pass
+        out.sort(key=lambda t: t[0].lower())
+        return out
+
+    def workflow_disasm(self, addr, count=40):
+        """Disassembliert count Instruktionen ab addr der geladenen Lib -> Text (Workflow-Klick)."""
+        try:
+            a = addr if isinstance(addr, int) else int(str(addr), 0)
+        except Exception:
+            return None
+        if self.image is None:
+            return None
+        try:
+            rows = self._disasm_rows(a, int(count), mark_addr=a)
+        except Exception as e:
+            return "Disasm-Fehler: %r" % e
+        lines = []
+        for r in rows:
+            try:
+                lines.append("%s %-10s %-9s %-7s %s" % (r[0] or " ", r[1], r[2], r[3], r[4]))
+            except Exception:
+                lines.append(str(r))
+        return "\n".join(lines) if lines else None
+
+    def _studio_inputs(self):
+        """Aktuelle GUI-Eingaben fuer die geteilte Studio-Sitzung sammeln (Main-Thread)."""
+        entry = ""
+        try:
+            entry = self.tab.run_entry.get().strip()
+        except Exception:
+            pass
+        relocs = False
+        try:
+            relocs = bool(self.tab.var_relocs.get())
+        except Exception:
+            pass
+        budget = 0
+        try:
+            budget = int(self._dbg_budget())
+        except Exception:
+            pass
+        wf = None
+        try:
+            wp = getattr(self.tab, "workflow_panel", None)
+            wf = getattr(wp, "_active", None) if wp is not None else None
+        except Exception:
+            pass
+        return {"entry": entry, "relocs": relocs, "budget": budget, "active_workflow": wf}
+
+    def studio_session_status(self):
+        """⇅ Abgleich: geteilten Studio-Zustand mit deinem letzten Stand vergleichen (read-only)."""
+        import os as _os
+        dash = "—"
+        def _w():
+            try:
+                from services.native_studio_session_service import NativeStudioSessionService
+                pk = NativeStudioSessionService().peek(self._STUDIO_SESSION)
+            except Exception as e:
+                self._log(f"⇅ Abgleich (Studio) FEHLER: {e!r}"); return
+            sess = pk.get("session")
+            if not sess:
+                self._log("⇅ Abgleich (Studio): keine geteilte Sitzung (noch kein ⬆ Zustand→KI)."); return
+            fseq = int(sess.get("seq", 0) or 0)
+            base = int(getattr(self, "_studio_base_seq", 0) or 0)
+            res = pk.get("result") or {}
+            _src = (res.get("source") or res.get("workflow")) if isinstance(res, dict) else None
+            rinfo = (" · Ergebnis: " + str(_src)) if _src else ""
+            lib = sess.get("lib")
+            libn = _os.path.basename(lib) if lib else dash
+            entry = (sess.get("inputs") or {}).get("entry") or dash
+            if fseq > base:
+                rel = f"geteilt ist NEUER (seq {fseq} > dein {base}) → ⬇ Zustand←KI"
+            else:
+                rel = f"du bist auf dem geteilten Stand (seq {base}) → ⬆ Zustand→KI zum Teilen"
+            self._log(f"⇅ Abgleich (Studio): seq {fseq} · writer {sess.get('writer')} · "
+                      f"lib {libn} · entry {entry} · {sess.get('ts')}{rinfo}  →  {rel}")
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def studio_session_push(self):
+        """⬆ Zustand→KI: Lib + Eingaben in die geteilte Studio-Sitzung schreiben (Clobber-Schutz)."""
+        import os as _os
+        dash = "—"
+        from services.native_studio_session_service import NativeStudioSessionService
+        svc = NativeStudioSessionService()
+        lib = getattr(self, "image_path", None)
+        inputs = self._studio_inputs()
+        try:
+            fsess = svc.peek(self._STUDIO_SESSION, with_result=False).get("session") or {}
+        except Exception:
+            fsess = {}
+        base = int(getattr(self, "_studio_base_seq", 0) or 0)
+        fseq = int(fsess.get("seq", 0) or 0)
+        force = False
+        if fsess and fseq > base:
+            try:
+                from tkinter import messagebox
+                force = messagebox.askyesno("Studio-Zustand teilen",
+                    f"Die geteilte Sitzung wurde seit deinem letzten Abgleich fortgeschrieben "
+                    f"(seq {fseq} > {base}, writer {fsess.get('writer')}).\n\nTrotzdem ueberschreiben?")
+            except Exception:
+                force = False
+            if not force:
+                self._log("⬆ Zustand→KI abgebrochen (Konflikt — erst ⇅ Abgleich / ⬇ Zustand←KI)."); return
+        def _w():
+            r = svc.save(self._STUDIO_SESSION, lib=lib, inputs=inputs, writer="gui",
+                         base_seq=(None if force else base), force=force)
+            libn = _os.path.basename(lib) if lib else dash
+            entry = inputs.get("entry") or dash
+            if r.get("ok"):
+                self._studio_base_seq = int(r.get("seq", 0) or 0)
+                self._log(f"⬆ Zustand→KI: geteilt (seq {r['seq']}, lib {libn}, entry {entry}). "
+                          f"KI liest mit native.session_get.")
+            elif r.get("why") == "conflict":
+                self._log(f"⬆ Zustand→KI: Konflikt (geteilt seq {r.get('file_seq')}) — erst ⬇ Zustand←KI.")
+            else:
+                self._log(f"⬆ Zustand→KI FEHLER: {r}")
+        import threading
+        threading.Thread(target=_w, daemon=True).start()
+
+    def studio_session_pull(self):
+        """⬇ Zustand←KI: geteilten Studio-Zustand holen (Lib-Autoload, Eingaben fuellen, Ergebnis ins Log)."""
+        import os as _os
+        dash = "—"
+        from services.native_studio_session_service import NativeStudioSessionService
+        svc = NativeStudioSessionService()
+        try:
+            pk = svc.peek(self._STUDIO_SESSION)
+        except Exception as e:
+            self._log(f"⬇ Zustand←KI FEHLER: {e!r}"); return
+        sess = pk.get("session")
+        if not sess:
+            self._log("⬇ Zustand←KI: keine geteilte Sitzung vorhanden."); return
+        inputs = sess.get("inputs") or {}
+        res = pk.get("result") or {}
+        libpath = self._resolve_lib(sess.get("lib"))
+        def _apply():
+            try:
+                if inputs.get("entry"):
+                    self.tab.run_entry.delete(0, "end"); self.tab.run_entry.insert(0, str(inputs["entry"]))
+            except Exception:
+                pass
+            try:
+                if "relocs" in inputs:
+                    self.tab.var_relocs.set(bool(inputs["relocs"]))
+            except Exception:
+                pass
+            self._studio_base_seq = int(sess.get("seq", 0) or 0)
+            rinfo = ""
+            if isinstance(res, dict) and res:
+                secs = res.get("sections") or []
+                src = res.get("source") or res.get("workflow") or "?"
+                if secs:
+                    body = ", ".join(s.get("title", "?") for s in secs)
+                else:
+                    body = "ok" if res.get("ok") else "siehe result.json"
+                rinfo = f" · Ergebnis [{src}]: {body}"
+            libn = _os.path.basename(sess.get("lib")) if sess.get("lib") else dash
+            entry = inputs.get("entry") or dash
+            self._log(f"⬇ Zustand←KI: uebernommen (seq {sess.get('seq')}, writer {sess.get('writer')}, "
+                      f"lib {libn}, entry {entry}){rinfo}")
+            wf = inputs.get("active_workflow")
+            if wf:
+                self._log(f"  → aktiver Workflow laut Sitzung: {wf} (im ⚡ Workflow-Tab waehlbar).")
+        if libpath and _os.path.basename(libpath) != _os.path.basename(getattr(self, "image_path", "") or ""):
+            self._log(f"⬇ Zustand←KI: lade Sitzungs-Lib {_os.path.basename(libpath)} …")
+            self._load_so(libpath, then=lambda: self.app.after(0, _apply))
+        else:
+            self.app.after(0, _apply)
+
     def dbg_status(self):
         """⇅ Abgleich: vergleicht deinen Stand mit der geteilten Sitzung (wer ist neuer?)."""
         def _w():
@@ -758,10 +1744,36 @@ class NativeStudioController:
         self.app.after(0, lambda: self.tab.set_memory(a, data))
 
 
+    def _default_app_dir(self):
+        try:
+            d = self.app.cfg.paths.get("APP_SOURCE_DIR") if (self.app and hasattr(self.app, "cfg")) else None
+            if d and os.path.isdir(d):
+                return d
+        except Exception:
+            pass
+        return None
+
+    def on_app_changed(self, pkg=None):
+        """Setzt Native-Studio-Zustand beim App-Wechsel zurueck."""
+        self.image = None
+        self.image_path = None
+        self.index = None
+        self._short2addr = None
+        self._last_engine = None
+        self._snapshot_path = None
+        self._outline_base_rows = []
+        if getattr(self, "tab", None) is not None and hasattr(self.tab, "clear"):
+            try:
+                self.tab.clear()
+            except Exception:
+                pass
+
     def load_so_dialog(self):
         """Datei wählen (Main-Thread), dann im Hintergrund parsen."""
+        init_dir = self._default_app_dir()
         path = filedialog.askopenfilename(
             title="Native Bibliothek / ELF laden (Original bzw. Analyse-Arbeitsbereich)",
+            initialdir=init_dir,
             filetypes=[("ELF/.so", "*.so *.bin *.elf"), ("Alle Dateien", "*.*")])
         if not path:
             return
@@ -845,6 +1857,7 @@ class NativeStudioController:
             return
         packed = filedialog.askopenfilename(
             title="APK oder gepackte .so wählen",
+            initialdir=self._default_app_dir(),
             filetypes=[("APK oder .so", "*.apk *.so"), ("Alle Dateien", "*.*")])
         if not packed:
             return

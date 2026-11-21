@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
             {"name": "Extract APK (tar)", "type": "cmd", "cmd": "tar -xf \"..\\{SPLIT_NAME}.zip\" -C .",
              "cwd": "{EXTRACT_DIR}"},
             {"name": "Apply Hex Patches", "type": "anchor_patch"},
+            {"name": "Apply LibCarve Patches", "type": "libcarve_patch", "target": "extract"},
             {"name": "Repack APK (jar)", "type": "cmd",
              "cmd": "jar c0f \"{SPLIT_NAME}.apk\" AndroidManifest.xml lib stamp-cert-sha256 META-INF",
              "cwd": "{EXTRACT_DIR}"},
@@ -69,6 +70,7 @@ DEFAULT_CONFIG = {
             {"name": "Mirror Original Workspace", "type": "mirror_workspace"},
             {"name": "Apply Smali Patches", "type": "smart_patch"},
             {"name": "Inject Custom Libs", "type": "inject_custom_libs"},
+            {"name": "Apply LibCarve Patches", "type": "libcarve_patch"},
             {"name": "Inject Added Libs", "type": "inject_added_libs"},
             {"name": "Inject Frida Gadget", "type": "inject_frida"},
             {"name": "Manifest & Build (Dynamic Strategy)", "type": "manifest_and_build"},
@@ -125,8 +127,26 @@ class ConfigManager:
                     self.config["PIPELINES"]["PREPARE_WORKSPACE"] = DEFAULT_CONFIG["PIPELINES"]["PREPARE_WORKSPACE"]
 
                 current_native_steps = [s.get("name") for s in self.config["PIPELINES"].get("BUILD_NATIVE", [])]
-                if "Inject Frida Gadget" not in current_native_steps or "Apply LSPatch" not in current_native_steps or "Inject Custom Libs" not in current_native_steps or "Inject Added Libs" not in current_native_steps:
+                current_native_types = [s.get("type") for s in self.config["PIPELINES"].get("BUILD_NATIVE", [])]
+                if (
+                    "Inject Frida Gadget" not in current_native_steps
+                    or "Apply LSPatch" not in current_native_steps
+                    or "Inject Custom Libs" not in current_native_steps
+                    or "Inject Added Libs" not in current_native_steps
+                    or "libcarve_patch" not in current_native_types
+                ):
                     self.config["PIPELINES"]["BUILD_NATIVE"] = DEFAULT_CONFIG["PIPELINES"]["BUILD_NATIVE"]
+
+                flutter_pipe = self.config["PIPELINES"].get("BUILD_FLUTTER")
+                if isinstance(flutter_pipe, list) and "libcarve_patch" not in [s.get("type") for s in flutter_pipe]:
+                    inserted = False
+                    for idx, st in enumerate(flutter_pipe):
+                        if st.get("type") == "anchor_patch":
+                            flutter_pipe.insert(idx + 1, {"name": "Apply LibCarve Patches", "type": "libcarve_patch", "target": "extract"})
+                            inserted = True
+                            break
+                    if not inserted:
+                        flutter_pipe.append({"name": "Apply LibCarve Patches", "type": "libcarve_patch", "target": "extract"})
 
                 # LibForge/ExeDeploy: neue Keys robust nachziehen (bestehende config.json)
                 for _k in ("NDK_DIR", "DEFAULT_ABI", "DEFAULT_API_LEVEL", "NDK_FALLBACK_VERSION",

@@ -1,6 +1,7 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox, simpledialog
 
+from services.favorite_service import get_shared_favorites
 from ui.widgets.c_editor_widget import CCodeEditorWidget
 from ui.controllers.lib_forge_controller import LibForgeController
 
@@ -111,6 +112,21 @@ class LibForgeTab(ttk.Frame):
         act.pack(fill="x", pady=2)
         ttk.Button(act, text="⚙️ Compile / Recompile", command=self.controller.compile_selected).pack(side="left", padx=2)
         ttk.Button(act, text="💾 Speichern", command=self.controller.save_editor).pack(side="left", padx=2)
+        ttk.Button(act, text="🧬 In Native Studio öffnen", command=self.open_in_native_studio).pack(side="left", padx=4)
+        ttk.Button(act, text="▶️ Live im Simulator testen", command=self.run_live_in_simulator).pack(side="left", padx=4)
+        mb_fav = ttk.Menubutton(act, text="⭐ Favoriten ▾")
+        fav_menu = tk.Menu(mb_fav, tearoff=0)
+        fav_menu.add_command(label="⭐ Aktuelle Lib als neuen Favoriten speichern",
+                             command=self.save_current_as_favorite)
+        fav_menu.add_command(label="➕ Aktuelle Lib zu bestehendem Favoriten hinzufügen...",
+                             command=self.append_current_to_favorite)
+        fav_menu.add_command(label="📦 Aktive Workspace-Patches als Kombi-Favorit sichern",
+                             command=self.save_workspace_bundle_as_favorite)
+        fav_menu.add_separator()
+        fav_menu.add_command(label="🗂 Favoriten-Manager öffnen (Filter: LibForge)",
+                             command=self.open_favorites_manager)
+        mb_fav.config(menu=fav_menu)
+        mb_fav.pack(side="left", padx=4)
         self.lbl_status = ttk.Label(act, text="", font=("Segoe UI", 9, "bold"))
         self.lbl_status.pack(side="left", padx=10)
 
@@ -273,3 +289,115 @@ class LibForgeTab(ttk.Frame):
     def show_build_error(self, err):
         # Fehler landet bereits in der Konsole; hier zusaetzlich kompakt anzeigen
         self._set_hint_text("BUILD-FEHLER:\n" + (err or "").strip())
+
+    def open_in_native_studio(self):
+        """Oeffnet die aktuell ausgewaehlte gebaute/importierte .so im Native Studio (Paket 6B)."""
+        lib = self.current_lib()
+        if not lib or not getattr(lib, "so_relpath", ""):
+            self.set_status("Bitte erst kompilieren oder .so importieren.", "red")
+            return
+        sp = self.mgr.abspath(lib.so_relpath)
+        ns = getattr(self.app, "native_studio", None)
+        ctrl = getattr(ns, "controller", None) if ns is not None else None
+        if ctrl is not None and sp:
+            try:
+                ctrl._load_so(sp)
+                if hasattr(self.app, "notebook") and ns is not None:
+                    self.app.notebook.select(ns)
+                self.app.log(f"[*] LibForge -> Native Studio: {sp}")
+            except Exception as e:
+                self.app.log(f"[!] Native Studio oeffnen FEHLER: {e!r}")
+
+    def run_live_in_simulator(self):
+        """Startet die App im Simulator mit aktiven LibForge-/Workspace-Patches ('live', ohne Build)."""
+        dbg_ctrl = getattr(getattr(self.app, "debugger_tab", None), "ctrl", None)
+        if dbg_ctrl is not None and hasattr(dbg_ctrl, "run_live_with_patches"):
+            dbg_ctrl.run_live_with_patches()
+
+    # ---------------- Favoriten-Integration ----------------
+    def lib_to_patch_dict(self, lib) -> dict:
+        """Serialisiert eine LibForge-NativeLib in das einheitliche Favoriten-Patch-Schema."""
+        return {
+            "type": "libforge",
+            "name": getattr(lib, "name", "") or "",
+            "version": getattr(lib, "version", "1.0") or "1.0",
+            "description": getattr(lib, "description", "") or "",
+            "origin": getattr(lib, "origin", "built") or "built",
+            "source_code": getattr(lib, "source_code", "") or "",
+            "abi": getattr(lib, "abi", "arm64-v8a") or "arm64-v8a",
+            "api_level": int(getattr(lib, "api_level", 30) or 30),
+            "link_libs": getattr(lib, "link_libs", "log dl") or "log dl",
+            "extra_flags": getattr(lib, "extra_flags", "") or "",
+            "output_kind": getattr(lib, "output_kind", "shared") or "shared",
+            "so_relpath": getattr(lib, "so_relpath", "") or "",
+        }
+
+    def get_active_libforge_patches(self, include_selected_if_none: bool = False) -> list:
+        """Liefert alle aktiven LibForge-Libs (optional Fallback auf aktuell ausgewaehlte Lib)."""
+        cur = self.current_lib()
+        if cur is not None and not self._loading:
+            try:
+                self.sync_editor_into(cur)
+            except Exception:
+                pass
+        out = [self.lib_to_patch_dict(l) for l in self.mgr.get_all() if getattr(l, "active", False)]
+        if not out and include_selected_if_none and cur is not None:
+            out.append(self.lib_to_patch_dict(cur))
+        return out
+
+    def save_current_as_favorite(self):
+        lib = self.current_lib()
+        if lib is None:
+            return messagebox.showinfo("LibForge Favoriten", "Bitte zuerst eine Bibliothek auswählen oder anlegen.")
+        self.sync_editor_into(lib)
+        name = simpledialog.askstring("Als Favorit speichern", "Name für den LibForge-Favoriten:",
+                                      initialvalue=f"lib{lib.name or 'custom'}", parent=self)
+        if not name or not name.strip():
+            return
+        patch = self.lib_to_patch_dict(lib)
+        fav = {
+            "name": name.strip(),
+            "version": patch["version"],
+            "description": f"[v{patch['version']}] LibForge lib{patch['name']}.so ({patch['abi']})",
+            "patches": [patch],
+        }
+        get_shared_favorites(self.app).add_favorite(fav)
+        self.app.log(f"[+] LibForge-Favorit '{name.strip()}' gespeichert.")
+
+    def append_current_to_favorite(self):
+        lib = self.current_lib()
+        if lib is None:
+            return messagebox.showinfo("LibForge Favoriten", "Bitte zuerst eine Bibliothek auswählen.")
+        self.sync_editor_into(lib)
+        fav_svc = get_shared_favorites(self.app)
+        if not fav_svc.favs:
+            return self.save_current_as_favorite()
+        from ui.dialogs.favorite_patches_dialog import choose_existing_favorite_dialog
+        idx = choose_existing_favorite_dialog(self.winfo_toplevel(), fav_svc,
+                                              title="LibForge-Lib zu Favorit hinzufügen")
+        if idx is None:
+            return
+        fav = fav_svc.favs[idx]
+        patches = fav.setdefault("patches", [])
+        patch = self.lib_to_patch_dict(lib)
+        for i, ex in enumerate(patches):
+            if ex.get("type") == "libforge" and ex.get("name") == patch["name"]:
+                patches[i] = patch
+                break
+        else:
+            patches.append(patch)
+        fav_svc.save_favs()
+        self.app.log(f"[+] LibForge-Lib '{lib.name}' zu Favorit '{fav.get('name', '')}' hinzugefügt.")
+
+    def save_workspace_bundle_as_favorite(self):
+        ws = getattr(self.app, "workspace_tab", None)
+        ctrl = getattr(ws, "controller", None)
+        if ctrl is not None:
+            ctrl.save_current_as_favorite()
+
+    def open_favorites_manager(self):
+        ws = getattr(self.app, "workspace_tab", None)
+        if ws is None:
+            return
+        from ui.dialogs.favorite_patches_dialog import FavoritePatchesDialog
+        FavoritePatchesDialog(self.winfo_toplevel(), ws, initial_filter="LibForge")

@@ -26,6 +26,16 @@ def _candidates(cfg):
         p = None
     if p:
         cands.append(p)
+    # Projekt-lokale portable Ghidra-Installation (tools/ghidra/...)
+    try:
+        base_dir = cfg.config.get("BASE_DIR") if cfg else None
+    except Exception:
+        base_dir = None
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for root_base in (base_dir, repo_dir):
+        if root_base:
+            cands.extend(sorted(glob.glob(os.path.join(root_base, "tools", "ghidra*", "support", exe))))
+            cands.extend(sorted(glob.glob(os.path.join(root_base, "tools", "ghidra", "ghidra*", "support", exe))))
     for env in ("GHIDRA_HOME", "GHIDRA_INSTALL_DIR"):
         d = os.environ.get(env)
         if d:

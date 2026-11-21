@@ -53,7 +53,7 @@ class NativeGlobalSearchWindow(tk.Toplevel):
         self.ent = ttk.Entry(top, width=42)
         self.ent.pack(side="left", padx=6)
         self.mode = tk.StringVar(value="func")
-        for txt, val in (("Funktion", "func"), ("String", "str"), ("Adresse", "addr")):
+        for txt, val in (("Funktion", "func"), ("String", "str"), ("Adresse", "addr"), ("ASM/Kante", "asm"), ("Wildcard-AOB", "aob")):
             ttk.Radiobutton(top, text=txt, value=val, variable=self.mode).pack(side="left", padx=3)
         ttk.Button(top, text="Suchen", command=self.do_search).pack(side="left", padx=6)
         self.lbl = ttk.Label(self, text=f"{len(self.index.syms)} Symbole indiziert. Doppelklick = dorthin springen.")
@@ -99,6 +99,23 @@ class NativeGlobalSearchWindow(tk.Toplevel):
             for a, n in hits[:2000]:
                 self.tree.insert("", "end", values=("func", f"0x{a:x}", n))
             self.lbl.config(text=f"{len(hits)} Funktions-/Symboltreffer (max. 2000 gezeigt).")
+            return
+        if mode == "asm":
+            hits = self.index.search(term.lower(), limit=1500)
+            for src, mnem, tgt in hits:
+                fn = self.index.func_at(src) or "?"
+                self.tree.insert("", "end", values=("asm", f"0x{src:x}", f"[{fn}]  {mnem} -> 0x{tgt:x}"))
+            self.lbl.config(text=f"{len(hits)} Instruktions-/Kanten-Treffer (max. 1500 gezeigt).")
+            return
+        if mode == "aob":
+            if hasattr(self.index, "search_aob"):
+                hits = self.index.search_aob(self.image, term, exec_only=False, limit=500)
+            else:
+                hits = []
+            for a in hits:
+                fn = self.index.func_at(a) or "?"
+                self.tree.insert("", "end", values=("aob", f"0x{a:x}", f"[{fn}]  Pattern: {term}"))
+            self.lbl.config(text=f"{len(hits)} Byte-Pattern-Treffer (z. B. 'FD 7B ?? A9').")
             return
         # strings
         self.lbl.config(text="Scanne Strings in den Segmenten …")

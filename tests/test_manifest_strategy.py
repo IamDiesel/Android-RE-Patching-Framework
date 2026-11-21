@@ -35,7 +35,7 @@ def test_smali_only_strategy(monkeypatch):
     strategy = SmaliOnlyStrategy()
 
     # Monkeypatch fängt Systembefehle ab und schreibt stattdessen in die History
-    monkeypatch.setattr(apk_steps, "inject_nsc", lambda ctx: setattr(ctx, 'nsc_injected', True) or True)
+    monkeypatch.setattr(apk_steps, "apply_manifest_patches", lambda ctx: setattr(ctx, 'nsc_injected', True) or True)
     monkeypatch.setattr(apk_steps, "run_build_cmd", lambda cmd, ctx: ctx.cmd_history.append(ctx.format_cmd(cmd)) or True)
 
     strategy.patch_manifest(engine)
@@ -49,7 +49,7 @@ def test_apkeditor_strategy(monkeypatch):
     engine = MockEngine()
     strategy = ApkEditorStrategy()
 
-    monkeypatch.setattr(apk_steps, "inject_nsc", lambda ctx: setattr(ctx, 'nsc_injected', True) or True)
+    monkeypatch.setattr(apk_steps, "apply_manifest_patches", lambda ctx: setattr(ctx, 'nsc_injected', True) or True)
     monkeypatch.setattr(apk_steps, "run_build_cmd", lambda cmd, ctx: ctx.cmd_history.append(ctx.format_cmd(cmd)) or True)
 
     strategy.patch_manifest(engine)

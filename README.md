@@ -37,7 +37,12 @@ The framework is organized into a strictly modular directory structure, separati
 │   │
 │   ├── application/                    # Global state and communication
 │   │   ├── event_bus.py                # Central Pub/Sub event bus for decoupled messaging[cite: 65]
-│   │   └── session_state.py            # Holds active patches (Hex, Smali, Libs)[cite: 66]
+│   │   ├── ki_exchange_model.py        # Shared Human<->AI tab sync coordinator (⬆ An KI / ⬇ Von KI / ⇅ Abgleich)
+│   │   └── session_state.py            # Holds active patches (Hex, Smali, LibCarve, Libs)[cite: 66]
+│   │
+│   ├── java/                           # Transparent Dalvik/ART Glass Debugger & Fusion VFS 2.0
+│   │   ├── fusion_loader.py            # Unified Java<->Native loader (Prio-1 VFS overlays & self_cache)
+│   │   └── glass_runner.py             # GlassAppRunner: lifecycle execution, View/Net recorders & Forks/Snapshots
 │   │
 │   ├── domain/                         # Domain models and custom exceptions
 │   │   ├── exceptions.py               # PatchConflictException for build interruption[cite: 64]
@@ -66,6 +71,7 @@ The framework is organized into a strictly modular directory structure, separati
 │       └── arm64mini.py                # Frozen CPU/Mem contract (shared with lipy 'ale_pure')
 │
 ├── services/                           # Stateless background services
+│   ├── active_session_service.py       # Konfliktsichere Persistenz aller aktiven Session-Patches (inkl. LibCarve)
 │   ├── adb_network_service.py          # ADB proxy routing and mitmproxy certificate pushing[cite: 30]
 │   ├── api_db_service.py               # SQLite database operations for intercepted HTTP traffic[cite: 26]
 │   ├── callgraph_service.py            # RAM-based Callgraph edge/node relationship mapping[cite: 27]
@@ -90,18 +96,27 @@ The framework is organized into a strictly modular directory structure, separati
 │   ├── smali_struct_service.py         # Physical creation and injection of predefined Smali templates[cite: 44]
 │   ├── xref_service.py                 # Cross-Reference resolution for incoming method calls[cite: 45]
 │   ├── ghidra_service.py               # Ghidra headless decompile (Java scripts, stream+cancel+cache)
+│   ├── flutter_api_extractor_service.py # Optional static Cognito/GraphQL/REST extractor (flutter_assets + libapp.so)
+│   ├── ki_workspace_sync_service.py    # Mensch<->KI Sync fuer Workspace & API Inspector (seq + is_dirty Clobber-Schutz)
+│   ├── libcarve_compiler_service.py    # ARM64 ASM + NDK clang C-Cave Recompiler + 16-KB ELF64 Segment Injection
+│   ├── libcarve_pattern_service.py     # Relocation-masked Wildcard-AOB signature generator & multi-stage matcher
 │   ├── native_emu_service.py           # Emulation service wrapping core/native (events, run/snapshot)
+│   ├── workspace_overlay_service.py    # Zero-Build RAM/VFS 2.0 overlay collector for Smali/LibForge/LibCarve/Hex
 │   ├── native_bridge/                  # On-device native helper bridge (README_native_bridge.md)
 │   └── ghidra_scripts/                 # GhidraScripts: DecompileOne.java, SpeedAnalysis.java
+│
+├── mcp_server/                         # Model Context Protocol server (stdio + streamable HTTP, Groups A–N)
 │
 ├── ui/                                 # Graphical User Interface (MVC Implementation)
 │   ├── utils.py                        # Global UI utilities (e.g., Treeview copy-to-clipboard formatting)[cite: 23]
 │   │
 │   ├── controllers/                    # Logic handlers receiving UI events
+│   │   ├── debugger_controller.py          # Glass Dalvik+ARM64 debugger & Zero-Build live overlay controller
 │   │   ├── device_file_manager_controller.py # File transfer and directory navigation coordinator[cite: 10]
 │   │   ├── favorite_patches_controller.py    # Patch loading and conflict handling via FuzzyMatcher[cite: 7]
 │   │   ├── frida_manager_controller.py       # Frida mode switching and device synchronization[cite: 8]
 │   │   ├── fuzzy_match_controller.py         # Fuzzy search execution and side-by-side diffing[cite: 9]
+│   │   ├── lib_carve_controller.py           # LibCarve controller (Outline/XREF/Graphs/Decompile/Patch/Compile)
 │   │   ├── smali_cg_controller.py            # Treeview manipulation and live-filtering for Callgraphs[cite: 11]
 │   │   ├── smali_studio_controller.py        # Central hub for static analysis and XREF delegation[cite: 12]
 │   │   ├── workspace_controller.py           # Main pipeline executor (Build, Flash, Uninstall)[cite: 13]
@@ -110,25 +125,30 @@ The framework is organized into a strictly modular directory structure, separati
 │   ├── dialogs/                        # Popup windows and configuration dialogs
 │   │   ├── column_dialogs.py           # Customization dialogs for API columns and visibility[cite: 4]
 │   │   ├── favorite_patches_dialog.py  # Manager UI for saved patch sets and live previews[cite: 5]
+│   │   ├── flutter_api_extract_dialog.py # Optional preview/import dialog for static Flutter/Dart API templates
 │   │   ├── frida_manager_dialog.py     # IDE-like editor with Drawer-Pattern for Frida scripts[cite: 6]
 │   │   ├── fuzzy_matcher_dialog.py     # Conflict resolution UI for structural Smali deviations[cite: 1]
 │   │   ├── global_search_dialog.py     # Standalone real-time search window for the RAM index[cite: 2]
 │   │   ├── struct_dialog.py            # Generator UI for creating new Smali classes from templates[cite: 3]
-│   │   └── native_search_dialog.py     # Global search window over the NativeIndex (symbol/string/addr)
+│   │   ├── native_fuzzy_match_dialog.py # Conflict resolution UI for relocated native Wildcard-AOB matches
+│   │   └── native_search_dialog.py     # Global search window over NativeIndex (Symbol/String/Addr/ASM/AOB)
 │   │
 │   ├── tabs/                           # Main notebook sections
 │   │   ├── api_inspector_tab.py        # HTTP traffic table, proxy controls, and ADB network routing[cite: 21]
 │   │   ├── app_manager_tab.py          # Lists installed packages and handles ADB pull operations[cite: 20]
+│   │   ├── debugger_tab.py             # Glass Debugger UI (Zone, Overlays, Disasm/Smali, Screen/Net/Timeline)
 │   │   ├── device_file_manager_tab.py  # Treeview file explorer with asynchronous download progress[cite: 14]
 │   │   ├── history_tab.py              # Visualizes past patching sessions and test results[cite: 15]
 │   │   ├── launcher_logger_tab.py      # App launch intent controls and live color-coded console[cite: 16]
+│   │   ├── lib_carve_tab.py            # Workspace subtab 🔪 LibCarve (C / ASM / ELF Patch Studio)
 │   │   ├── settings_tab.py             # Form for base paths and JSON-based pipeline customization[cite: 17]
 │   │   ├── smali_studio_tab.py         # Static analyzer interface (Editor, Outline, Callgraph, Data flows)[cite: 18]
-│   │   ├── workspace_tab.py            # Pipeline controls, Hex/Lib patches, and strategy configuration[cite: 19]
+│   │   ├── workspace_tab.py            # Pipeline controls, Hex/Lib/LibForge/LibCarve/Smali Studio[cite: 19]
 │   │   ├── analyse_tab.py              # "Analyse" container hosting API Inspector + Native Studio
 │   │   └── native_studio_tab.py        # Native Studio UI: Outline, Disasm table, Run-Panel, C-tabs
 │   │
 │   └── widgets/                        # Reusable custom UI components
+│       ├── libcarve_editor_widget.py   # Split editor (Original ASM/C/Hex + Edit ASM/C-Cave/Hex) with lazy highlighting
 │       └── smali_editor_widget.py      # Editor with viewport-based (debounced) regex syntax highlighting[cite: 22]
 │
 ├── data/                               # Persistent JSON data, snippets, profiles, and SQLite databases
@@ -194,7 +214,7 @@ An integrated text editor for Dalvik bytecode manipulation.
 
 ### 4.3 Patch Management & Build Pipeline
 
-Coordinates source code modifications and dynamically reconstructs the application. Supported modifications include **Smali Patches**, **Hex Patches**, and **Native Library Replacements** (`.so` exchange).
+Coordinates source code modifications and dynamically reconstructs the application. Supported modifications include **Smali Patches**, **Hex Patches**, **LibCarve Patches** (`ARM64 ASM` / `C-Cave` / `Hex` mit Wildcard-AOB via `libcarve_patch`), **Native Library Replacements** (`.so` exchange), and **LibForge Additive Libraries** (`inject_added_libs`).
 
 * **Manifest & Build Strategies:** The pipeline supports diverse decompilation/build strategies (`apktool`, `apkeditor`, `aapt2`). It handles Split-APK merging automatically and manipulates the `AndroidManifest.xml` on the fly to inject the Network Security Config (NSC) or the `android:debuggable` flag.
 * **LSPatch Injection:** Automates the integration of Non-Root Xposed modules (like `TrustMeAlready`) into the target application by dynamically invoking the `lspatch.jar` during the build sequence.
@@ -282,16 +302,18 @@ Ein `OUTPUT_KIND = executable`-Target wird nicht per `loadLibrary` injiziert, so
 * **Nicht gerootet / Datenschutz:** ausschließlich `adb` + `run-as`, niemals `su`; Capture-Dateien
   bleiben durch geräteinternes Staging auf dem Gerät (Ergebnis-`pull` nur explizit).
 
-### 4.10 MCP-Server (KI-Agent-Steuerung)
+### 4.10 MCP-Server (KI-Agent-Steuerung & Mensch-KI-Sync)
 
-Exponiert das Framework über das **Model Context Protocol** (`mcp_server/`), sodass ein KI-Client (z. B. Claude Desktop) Analyse und Vorbereitung fernsteuern kann — im **Prepare-&-Observe-Betriebsmodell**: der Agent bereitet vor und beobachtet, der Nutzer baut/flasht/startet in der GUI.
+Exponiert das Framework über das **Model Context Protocol** (`mcp_server/`), sodass ein KI-Client (z. B. Claude Desktop) Analyse und Vorbereitung fernsteuern kann — im **Prepare-&-Observe-Betriebsmodell**: der Agent bereitet vor und beobachtet, der Nutzer baut/flasht/startet in der GUI (oder prüft Patches direkt über `native.glass_run` mit `zone="live"`).
 
 * **Zwei Transporte:** ein **stdio-Server** (vom Desktop-Client gespawnt) und ein optionaler **HTTP-Server** (`127.0.0.1`, verwaltet über die GUI-Seite „🔌 MCP“). Beide teilen `config.json`.
-* **Gating in drei Stufen (`registry.py` + `gating.py`):** **P** (Prepare) und **O** (Observe) sind frei; **G** (Gated — Bauen/Flashen/Starten, File Manager, Löschen, Gerätesync) braucht Pro-Tool-Schalter **+** Kategorie-Freigabe (`caps`) **+** `confirm=true`. Jeder Aufruf läuft durch `runtime.run` (Gating → Ausführung unter EventBus-Sammler → Audit `data/mcp_audit.jsonl`); GUI-Rechte werden pro Aufruf frisch eingelesen.
-* **Tool-Katalog (Gruppen A–M):** Workspace/Config, Smali-Analyse, LibForge, Patch-Favoriten, Build/Flash, File Manager, Executables (ExeDeploy), Capture/Logs, DAST/API, Historie, Selbstauskunft und **Frida** (14 Tools: Config/Betriebsmodi/App-Start/Netz/ScriptDir, Build-Toggle `INJECT_FRIDA`, Skripte + Collections inkl. Versionierung, Aktiv-Setzen, gated Gerätesync).
-* **Gruppe M — Native (`native.*`, 23 Tools):** statische Analyse und In-Process-Emulation nativer AArch64-`.so`: `targets`/`unpack` (P, entschlüsseln via Plugin)/`status`, dann `load`/`index` (XREF/CallGraph, SHA-gegateter Cache)/`search`/`xref`/`disasm`/`read_bytes`/`callgraph`/`decompile` (Ghidra-C, gecacht)/`functions`/`strings`; **Emulation:** `run` (Args/Pointer/Buffer/Stubs → Register/ret/Out-Puffer) + `run_break` (bis Breakpoint am Block-Eintritt → Pause-Zustand pc/Register); **Lifter:** `lift` (Basisblock/Funktion → Python, bbsrc); **Debug/Verify:** `run_break`/`step`/`resume` (Breakpoints am Block-Eintritt + Session-Zustand), `verify` (Bit-Exakt-Regression gegen Golden), `coverage` (Mnemonics/Slow-Pfad/Unknown), `snapshot` (P, Zustand sichern/laden), `resolveptr` (Reloc/Zeiger statisch auflösen), `rebase` (Offsets über Lib-Versionen). Statik + In-Process-Emulation (Laufzeit/Hooking am Gerät → `frida.*`); zielspezifische Entschlüsselung lebt in git-ignorierten `native_plugins/` + `data/native/`.
+* **Gating in drei Stufen (`registry.py` + `gating.py`):** **P** (Prepare) und **O** (Observe) sind frei; **G** (Gated — Bauen/Flashen/Starten, File Manager, Löschen, Gerätesync, Session-Write) braucht Pro-Tool-Schalter **+** Kategorie-Freigabe (`caps`) **+** `confirm=true`. Jeder Aufruf läuft durch `runtime.run` (Gating → Ausführung unter EventBus-Sammler → Audit `data/mcp_audit.jsonl`); GUI-Rechte werden pro Aufruf frisch eingelesen.
+* **Tool-Katalog (Gruppen A–N):** Workspace/Config, Smali-Analyse, LibForge, Patch-Favoriten (inkl. `type="libcarve"`), Build/Flash, File Manager, Executables (ExeDeploy), Capture/Logs, DAST/API (inkl. `api.extract_flutter_static` und `api.import_templates`), Historie, Selbstauskunft, **Frida** (14 Tools), **Gruppe M — Native** sowie **Gruppe N — LibCarve**.
+* **Gruppe M — Native (`native.*`, 23+ Tools):** statische Analyse und In-Process-Emulation nativer AArch64-`.so`: `targets`/`unpack` (P, entschlüsseln via Plugin)/`status`, dann `load`/`index` (XREF/CallGraph, SHA-gegateter Cache)/`search`/`xref`/`disasm`/`read_bytes`/`callgraph`/`decompile` (Ghidra-C, gecacht)/`functions`/`strings`; **Emulation:** `run` + `run_break`; **Lifter:** `lift`; **Debug/Verify/Glass:** `step`/`resume`/`verify`/`coverage`/`snapshot`/`resolveptr`/`rebase` sowie `native.glass_run` (`zone="original|live|destination"`), `native.glass_state`, `native.glass_control`, `native.glass_fork`, `native.net_log` und `native.ui_*`. Statik + Emulation/Simulation (Laufzeit/Hooking am Gerät → `frida.*`); zielspezifische Entschlüsselung lebt in git-ignorierten `native_plugins/` + `data/native/`.
+* **Gruppe N — LibCarve (`libcarve.*`, 20 Tools):** vollständige MCP-Parität zum LibCarve-Studio: `libcarve.libs`, `libcarve.outline`, `libcarve.search` (`func|str|asm|aob|addr`), `libcarve.inspect_func`, `libcarve.decompile`, `libcarve.xrefs`, `libcarve.callgraph`, `libcarve.datagraph`, `libcarve.match_pattern`, `libcarve.assemble_preview` (Dry-Run + Budget-Check), `libcarve.patch_list`/`patch_add`/`patch_update`/`patch_remove`, `libcarve.cave_save`, `libcarve.annotate`, `libcarve.gui_focus`, `libcarve.session_get` sowie gated `libcarve.session_set` (`session_write`) und `libcarve.compile` (`build`).
+* **`🤖 KI-Sync` (`KiExchangeModel` & `KiWorkspaceSyncService`):** In der oberen Fensterleiste stehen **⬆ An KI**, **⬇ Von KI**, **⇅ Abgleich** und **Reiter ▾** bereit. Neben *Native Studio* und *Debugger* sind auch **🔧 Workspace** (inkl. LibCarve-Fokus, Editor-Entwürfen in `data/ki_exchange/workspace_sync.json` mit `seq`-Konflikterkennung und `is_dirty`-Überschreibschutz) und **🌐 API Inspector** (`api_sync.json`) voll verdrahtet.
 * **Versionierungs-Disziplin (Pflicht):** Libs, Patch-Favoriten **und** Frida-Skripte/Collections tragen `version` + `description` (als `[vX]` in die Beschreibung gespiegelt). Bugfix am selben Pfad → `*.update` mit Versions-Bump; neuer Ansatz → `*.create`/`*.add` (Original bleibt unangetastet). Ohne Bump: Warnung, aber Speichern (warn-but-allow).
-* **Konfliktsichere Persistenz (`core/infrastructure/json_store.py`):** GUI und MCP laufen als getrennte Prozesse. Alle JSON-Stores (`native_libs.json`, `favorite_patches.json`, `frida_scripts.json`) sowie `config.json` schreiben **atomar** (Temp + `os.replace`) und mergen per **Three-Way-Merge** (key = `id`/`name`) gegen die frische Platten-Version — parallele Änderungen gehen nicht verloren. Ein **mtime-gated Reload** (`reload_if_changed`) macht Fremd-Änderungen sofort sichtbar; die GUI hat je einen **„🔄 Aktualisieren“-Button** (LibForge, Favoriten- und Frida-Dialog).
+* **Konfliktsichere Persistenz (`core/infrastructure/json_store.py`):** GUI und MCP laufen als getrennte Prozesse. Alle JSON-Stores (`native_libs.json`, `favorite_patches.json`, `active_session.json`, `frida_scripts.json`) sowie `config.json` schreiben **atomar** (Temp + `os.replace`) und mergen per **Three-Way-Merge** (key = `id`/`name`) bzw. synchronisieren per mtime-gesteuertem Reload (`reload_if_changed`) — parallele Änderungen gehen nicht verloren.
 * **Nicht gerootet / Datenschutz:** dieselben `adb`/`run-as`-Grenzen wie die GUI; personenbezogene Werte/Schlüssel bleiben lokal (Tools liefern Labels/Längen/Booleans statt Klartext).
 
 ### 4.11 Native Studio (AArch64-Analyse & Emulation)
@@ -303,3 +325,39 @@ Statische Analyse **und** In-Process-Emulation nativer AArch64-Bibliotheken (`.s
 * **Ghidra-Decompile (`services/ghidra_service.py` + `ghidra_scripts/*.java`):** Headless-Decompile einzelner Funktionen als **native Java-GhidraScripts** (Jython ist in Ghidra 12.x entfernt), mit Live-Streaming, **⏹ Abbrechen** und per-Funktion-Cache (`func_<vaddr>.c`). Das C öffnet als **Tabs** (ein Tab je Funktion) mit klickbaren `FUN_`/`LAB_`/`DAT_`-Sprüngen, C-Syntax-Highlighting und Mouseover-Tooltip (vollqualifizierte Signatur).
 * **MCP:** dieselben statischen **und Emulations**-Fähigkeiten über **Gruppe M (`native.*`, inkl. `run`/`run_break`)** fernsteuerbar (siehe 4.10).
 * **IP-Trennung:** zielspezifische Entschlüsselung/Daten bleiben in git-ignorierten `native_plugins/` + `data/native/`; das Framework selbst bleibt generisch.
+
+### 4.12 LibCarve (Native C / ASM / ELF Decompiler & Patch Studio)
+
+Gegenstück zu Smali Studio und LibForge für **bestehende native `.so`-Bibliotheken** — integriert als eigener Reiter **`🔪 LibCarve (C / ASM)`** im Workspace direkt neben **`🛠 LibForge`** (der bestehende **Hex Patcher (Flutter / C++)** bleibt unverändert erhalten).
+
+* **Analyse & RAM-Index (`core/native/loader.py`, `core/native/nindex.py` `_FMT=5`):** Entdeckt Bibliotheken automatisch aus der entpackten APK sowie `data/vfs_selfcache/` (selbst-entpackte `.so`-Dateien). Baut einen gecachten RAM-Index mit Exports, JNI-Funktionen, Imports, synthetischen Stripped-`sub_<hex>`-Funktionen, ausgehendem Call-Graph, Data-Graph (String-/Reloc-Zugriffen via `ADRP`/`ADD`/`LDR`) sowie 16-KB-Alignment- und W^X-Segment-Prüfung (`elf_summary()`).
+* **Smali-Studio-Parität in der GUI (`lib_carve_tab.py`, `lib_carve_controller.py`, `libcarve_editor_widget.py`):**
+  * **Linkes Notebook:** `Outline` (inkl. Filter), `Call Graph`, `Data Graph`, `Eigene Caves` (wiederverwendbare Vorlagen), Branch-`Historie` (`◀`/`▶`).
+  * **Rechtes Notebook:** `Bibliothek` (ELF64-Segmente & Sprung zum Java-JNI-Pendant im Smali Studio), `XREF (Incoming)`, `Calls (Outgoing)` sowie `🔍 Globale Suche` (Symbol, String, Adresse, `ASM/Kante`, `Wildcard-AOB`).
+  * **Split-Editor:** Oben schreibgeschützte Ansicht (`Split ASM+C`, `ASM`, `Decompiled C` via `GhidraService`, `Hex`); unten editierbares Patch-Feld (`ARM64 ASM`, `C-Cave`, `Hex`) mit debounced Viewport-Lazy-Highlighting und Live-Byte-Budget-Anzeige.
+* **3-stufiger Recompiler (`LibCarveCompilerService`):**
+  1. Kurze `ARM64 ASM`-Patches (`<= Originalgröße`): In-Place-Überschreibung mit automatischem `NOP`-Padding.
+  2. Längere `ASM`-Blöcke: Automatisches 16-KB-ausgerichtetes `PF_R|PF_X`-Cave-Segment am ELF64-Ende + Branch-Trampolin.
+  3. **`C-Cave`:** Kompiliert C-Code per NDK `clang` (`-fPIC -nostdlib`), verlinkt ein neues `PT_LOAD`-Segment (16-KB-aligned für Android 15/16) und leitet den Hook sauber um.
+* **Favoriten & Wildcard-AOB-Matching (`LibCarvePatternService`, `NativeFuzzyMatchDialog`):** Speichert zu jedem Patch eine relokations-tolerante Wildcard-Signatur (`??` über PC-relative Offsets bei `ADRP`/`BL`/`ADD`/`LDR`) plus Anker-Strings. Beim Laden auf neue App-Versionen greift die 3-stufige Auflösung (Symbol → AOB → Anker-Fuzzy) inkl. Kandidaten-Dialog.
+* **Build- & Studio-Brücken:** Direkt-Shortcuts zu Debugger (`🐞 Debugger`, `🔴 BP`, `▶️ Live testen`) und physische Integration in `BUILD_NATIVE` & `BUILD_FLUTTER` über `ApplyLibCarvePatchesStep` (`"libcarve_patch"`).
+
+### 4.13 Gläserner Debugger, Sandbox-Management & Zero-Build Live-Overlays
+
+Führt Dalvik-Smali und native AArch64-Bibliotheken gemeinsam unter einem transparenten VFS 2.0 (`GlassAppRunner`, `NativeFusionLoader`, `DebuggerController`) aus:
+
+* **Drei Ausführungs-Stände (`Stand` in Topbar / `Zone` im Debugger):**
+  * **`Original` (`zone="original"`):** Unveränderter Code aus `source/` ohne aktive Workspace-Patches.
+  * **`Live-Patches` (`zone="live"` — Zero-Build):** Überlagert sauberes `source/` mit allen aktiven Änderungen aus **Smali Studio**, **LibForge**, **LibCarve**, **Hex Patcher** und **Native Lib Replacer** direkt im RAM / VFS 2.0 (`WorkspaceOverlayResolver`). Es ist **kein APK-Build** erforderlich; `source/` und saubere `self_cache`-Dateien auf Disk bleiben unangetastet. `NativeFusionLoader._find_vfs_overlay` lädt gepatchte `.so`-Overlays mit **Priorität 1** noch vor `self_cache`.
+  * **`Build-Stand` (`zone="destination"`):** Führt den physisch nach `destination/` gebauten APK-Stand ohne doppelte RAM-Overlays aus.
+  * Über `⚙ Optionen ▾` lassen sich *Smali Studio*, *LibCarve* und *LibForge/Hex* für `Zone = live` einzeln zu-/abschalten; das manuelle Eingabefeld `Wurzel:` überschreibt bei Bedarf jede automatische Zonen-Auflösung.
+* **Sandbox-Management vs. `🤖 KI-Sync`:**
+  * **Links (`Fork` / `Merge` / `Projekt`):** Isolierte lokale Parallel-Instanzen im VFS (`main` vs. Forks unter `data/projects/`) für App-Daten-/Patch-Experimente des Nutzers.
+  * **Rechts (`🤖 KI-Sync`):** Austausch zwischen GUI-Tabs und KI/MCP über `data/ki_exchange/` (`⬆ An KI`, `⬇ Von KI`, `⇅ Abgleich`, `Reiter ▾`).
+
+### 4.14 Statischer Flutter/Dart-API-Extractor (Optional)
+
+Optionales Analyse-Werkzeug im Debugger (`⚙ Optionen ▾ → 🔍 Statische Flutter/Engine-APIs extrahieren…`, `Netz`-Toolbar `🔍 Engine-APIs…` sowie MCP `api.extract_flutter_static` / `api.import_templates`):
+
+* Scannt rein statisch und ohne den 27-MB-Flutter-Engine-Boot `assets/flutter_assets/.env*`, JSON-Configs, `strings.xml` und Strings aus `libapp.so`.
+* Erkennt **AWS Cognito Auth**, **AppSync / GraphQL** Queries/Mutations/API-Keys und **REST**-Endpunkte und präsentiert sie vor dem Import als editierbare Checkbox-Vorlagen im `FlutterApiExtractDialog`. Erst auf explizite Bestätigung werden die ausgewählten Vorlagen in `api_traffic.db` (API Inspector) geschrieben.

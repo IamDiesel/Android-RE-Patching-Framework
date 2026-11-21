@@ -138,7 +138,8 @@ _CLASS_PATTERNS = [
 
 
 class _JniState:
-    __slots__ = ("handles", "next_handle", "calls", "natives", "classes", "max_calls")
+    __slots__ = ("handles", "next_handle", "calls", "natives", "classes", "max_calls",
+                 "pending_exc", "exc_handle", "exc_events")
 
     def __init__(self):
         self.handles: Dict[int, dict] = {}   # id -> {kind, cls, name, sig, category, proposed, ret}
@@ -147,6 +148,9 @@ class _JniState:
         self.natives: List[dict] = []        # RegisterNatives-Landkarte
         self.classes: Dict[int, str] = {}    # jclass-handle -> classname
         self.max_calls = 100000
+        self.pending_exc: Optional[dict] = None  # {type, detail, handle} oder None (ART-Pending-Exception)
+        self.exc_handle = 0                  # aktuelles jthrowable-Handle (0 == keins)
+        self.exc_events: List[dict] = []     # Historie gesetzter/gecleareter Exceptions (Beobachtung)
 
 
 class NativeJniEnvService:
@@ -218,6 +222,22 @@ class NativeJniEnvService:
         d.update(kw)
         self.st.handles[hid] = d
         return hid
+
+    # ================= JNI-Exception-Zustand (ART-treu) =================
+    def _set_pending(self, kind: str, detail: str = "") -> int:
+        """Setzt eine Pending-Exception (wie ART nach einem fehlgeschlagenen Lookup) und gibt das
+        jthrowable-Handle zurueck. ExceptionCheck/Occurred spiegeln den Zustand bis ExceptionClear."""
+        h = self._new_handle("jthrowable", exc=kind, detail=detail)
+        self.st.pending_exc = {"type": kind, "detail": detail, "handle": h}
+        self.st.exc_handle = h
+        self.st.exc_events.append({"set": kind, "detail": detail, "handle": hex(h)})
+        return h
+
+    def _clear_pending(self):
+        if self.st.pending_exc is not None:
+            self.st.exc_events.append({"clear": self.st.pending_exc.get("type")})
+        self.st.pending_exc = None
+        self.st.exc_handle = 0
 
     # ================= Smali-Resolver (Stufe 1) =================
     def _class_file(self, classname: str) -> Optional[str]:
@@ -340,10 +360,21 @@ class NativeJniEnvService:
         elif name == "FindClass":
             cls = self._cstr(cpu, x[1])
             cf = self._class_file(cls)
+            if not cls:
+                # ART-treu: FindClass("") -> NULL + Pending-Exception (NoClassDefFoundError).
+                # Rueckgabe 0 (statt Nicht-Null-Handle) liefert dem OLLVM-Dispatcher den echten
+                # Index (const - 0) und damit den not-found-Zweig statt des NULL-Slots (vgl. 0x39414).
+                self._set_pending("NoClassDefFoundError", "(empty name)")
+                self._log({**info, "class": "", "resolved": False, "handle": "0x0", "null": True,
+                           "exception": "NoClassDefFoundError", "name_ptr": hex(int(x[1]) & _M64),
+                           "lr": hex(int(cpu.lr) & _M64), "x23": hex(int(x[23]) & _M64)})
+                return 0
             hid = self._new_handle("jclass", cls=cls, file=cf)
             self.st.classes[hid] = cls
             ret = hid
-            self._log({**info, "class": cls, "resolved": bool(cf), "handle": hex(hid), "name_ptr": hex(int(x[1]) & _M64), "lr": hex(int(cpu.lr) & _M64), "x23": hex(int(x[23]) & _M64)})
+            self._log({**info, "class": cls, "resolved": bool(cf), "handle": hex(hid),
+                       "name_ptr": hex(int(x[1]) & _M64), "lr": hex(int(cpu.lr) & _M64),
+                       "x23": hex(int(x[23]) & _M64)})
             return ret & _M64
         elif name in ("GetMethodID", "GetStaticMethodID"):
             clsh = int(x[1]) & _M64
@@ -395,6 +426,23 @@ class NativeJniEnvService:
             mid = int(x[2]) & _M64
             h = self.st.handles.get(mid, {})
             cls = h.get("cls", "?"); mname = h.get("name", "?"); sig = h.get("sig", "?")
+            # --- J2: native->Java-Rueckruf, falls eine JavaRuntime eine registrierte Dalvik-Methode
+            #     bereitstellt. Default-off (keine Runtime -> unveraenderter RASP-Policy-Pfad). ---
+            rt = getattr(self, "java_runtime", None)
+            if (rt is not None and cls not in (None, "?") and mname not in (None, "?")
+                    and sig not in (None, "?") and rt.has_method(cls, mname, sig)):
+                try:
+                    from core.java.runtime import sig_argcount
+                    na = sig_argcount(sig)
+                    jstatic = "Static" in name
+                    argwords = [int(x[3 + i]) & _M64 for i in range(na)]
+                    jret = rt.call_from_native(cls, mname, sig, argwords, jstatic)
+                    self._log({**info, "class": cls, "method": mname, "sig": sig,
+                               "j2": True, "ret": int(jret) & _M64})
+                    return int(jret) & _M64
+                except Exception as e:
+                    self._log({**info, "class": cls, "method": mname, "sig": sig,
+                               "j2_error": repr(e)})   # Fallthrough auf die RASP-Policy
             proposed = h.get("proposed", 0); cat = h.get("category")
             final, overridden, pending = self._apply_policy(cls, mname, sig, proposed, cat)
             ret = final
@@ -402,7 +450,17 @@ class NativeJniEnvService:
                        "proposed": proposed, "final": final, "overridden": overridden,
                        "pending": pending})
             return ret & _M64
-        elif name in ("ExceptionCheck", "ExceptionOccurred"):
+        elif name == "ExceptionCheck":
+            ret = 1 if self.st.pending_exc else 0
+        elif name == "ExceptionOccurred":
+            ret = self.st.exc_handle if self.st.pending_exc else 0
+        elif name == "ExceptionClear":
+            self._clear_pending()
+            ret = 0
+        elif name == "ExceptionDescribe":
+            ret = 0  # ART loggt die Exception (ohne zu clearen); wir protokollieren nur
+        elif name in ("Throw", "ThrowNew"):
+            self._set_pending(name)  # native setzt selbst eine Exception -> Pending markieren
             ret = 0
         elif name == "GetJavaVM":                       # (env, JavaVM** vm) -> 0
             cpu.m.wb(int(x[1]) & _M64, VM_OBJ.to_bytes(8, "little"))
@@ -423,6 +481,52 @@ class NativeJniEnvService:
         elif name == "GetStringUTFLength":
             h = self.st.handles.get(int(x[1]) & _M64, {})
             ret = len((h.get("text", "") or "").encode("utf-8"))
+        elif name == "NewByteArray":
+            n = int(x[1]) & 0xffffffff
+            ret = self._new_handle("jbyteArray", data=bytearray(n))
+        elif name == "GetArrayLength":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            d = h.get("data")
+            ret = len(d) if d is not None else int(h.get("length", 0))
+        elif name == "GetByteArrayElements":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            d = h.get("data") or bytearray()
+            ptr = self._alloc(cpu, bytes(d))
+            h["elem_ptr"] = ptr
+            if x[2]:
+                cpu.m.wb(int(x[2]) & _M64, (0).to_bytes(1, "little"))  # isCopy=false
+            ret = ptr
+        elif name == "ReleaseByteArrayElements":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            d = h.get("data")
+            mode = int(x[3]) & 0xffffffff
+            ptr = int(x[2]) & _M64
+            if d is not None and mode != 2 and ptr:      # 2 = JNI_ABORT
+                h["data"] = bytearray(cpu.m.rb(ptr, len(d)))
+            ret = 0
+        elif name == "GetByteArrayRegion":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            d = h.get("data") or bytearray()
+            start = int(x[2]) & 0xffffffff
+            n = int(x[3]) & 0xffffffff
+            buf = int(x[4]) & _M64
+            if buf:
+                cpu.m.wb(buf, bytes(d[start:start + n]))
+            ret = 0
+        elif name == "SetByteArrayRegion":
+            h = self.st.handles.get(int(x[1]) & _M64, {})
+            d = h.get("data")
+            if d is None:
+                d = bytearray(); h["data"] = d
+            start = int(x[2]) & 0xffffffff
+            n = int(x[3]) & 0xffffffff
+            buf = int(x[4]) & _M64
+            if buf:
+                chunk = cpu.m.rb(buf, n)
+                if start + n > len(d):
+                    d.extend(b"\x00" * (start + n - len(d)))
+                d[start:start + n] = chunk
+            ret = 0
         elif name.startswith("Get") and name.endswith("Field"):
             ret = 0
         else:
@@ -442,7 +546,9 @@ class NativeJniEnvService:
         cats = Counter(c.get("category") for c in self.st.calls if c.get("category"))
         fns = Counter(c.get("fn") for c in self.st.calls)
         return {"calls": len(self.st.calls), "natives": len(self.st.natives),
-                "by_fn": dict(fns), "by_category": dict(cats)}
+                "by_fn": dict(fns), "by_category": dict(cats),
+                "exc_events": list(self.st.exc_events),
+                "pending_exc": (self.st.pending_exc or {}).get("type")}
 
     def smali_of(self, cls, name, sig):
         """Fuer das GUI-Popup: Smali-Body + Klassifizierung + Vorschlag + Datei/Zeile."""

@@ -71,9 +71,21 @@ class APIInspectorTab(ttk.Frame):
         filter_bar = ttk.Frame(self)
         filter_bar.pack(fill="x", padx=5, pady=2)
         ttk.Label(filter_bar, text="Filter (URL/Method):").pack(side="left")
-        self.ent_filter = ttk.Entry(filter_bar, width=40)
+        self.ent_filter = ttk.Entry(filter_bar, width=32)
         self.ent_filter.pack(side="left", padx=5)
         self.ent_filter.bind("<KeyRelease>", lambda e: self.refresh_list(force_rebuild=True))
+        ttk.Separator(filter_bar, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Label(filter_bar, text="Glass-Netz:").pack(side="left")
+        self._nc_mode = tk.StringVar(value="online")
+        ttk.Combobox(filter_bar, textvariable=self._nc_mode, width=10, state="readonly",
+                     values=("online", "throttled", "offline", "timeout")).pack(side="left", padx=2)
+        ttk.Label(filter_bar, text="ms:").pack(side="left")
+        self._nc_lat = tk.StringVar(value="0")
+        ttk.Entry(filter_bar, textvariable=self._nc_lat, width=5).pack(side="left", padx=2)
+        ttk.Label(filter_bar, text="kbit/s:").pack(side="left")
+        self._nc_kbps = tk.StringVar(value="0")
+        ttk.Entry(filter_bar, textvariable=self._nc_kbps, width=6).pack(side="left", padx=2)
+        ttk.Button(filter_bar, text="Anwenden", command=self.apply_net_condition).pack(side="left", padx=3)
 
         self.paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
         self.paned.pack(fill="both", expand=True, padx=5, pady=5)
@@ -396,6 +408,25 @@ class APIInspectorTab(ttk.Frame):
         r = self.load_rules()
         del r[idx]
         self.save_rules(r)
+
+    def apply_net_condition(self):
+        """Uebertraegt die gewaehlten Glass-Box-Netzbedingungen (Online/Gedrosselt/Offline/Timeout)
+        in den laufenden DebuggerController + OS-8."""
+        dbg_ctrl = getattr(getattr(self.master, "master", None), "debugger_tab", None)
+        ctrl = getattr(dbg_ctrl, "ctrl", None)
+        if ctrl is None:
+            # Falls APIInspectorTab ueber ReFrameworkApp laeuft: suche ctrl am Toplevel
+            try:
+                top = self.winfo_toplevel()
+                ctrl = getattr(getattr(top, "debugger_tab", None), "ctrl", None)
+            except Exception:
+                ctrl = None
+        mode = self._nc_mode.get() if hasattr(self, "_nc_mode") else "online"
+        lat = self._nc_lat.get() if hasattr(self, "_nc_lat") else 0
+        kbps = self._nc_kbps.get() if hasattr(self, "_nc_kbps") else 0
+        if ctrl is not None and hasattr(ctrl, "set_net_condition"):
+            ctrl.set_net_condition(mode=mode, latency_ms=lat, kbps=kbps)
+        self.log(f"[API] Netz-Simulation gesetzt: mode={mode} latency={lat}ms kbps={kbps}")
 
     def refresh_rules(self):
         for i in self.rules_tree.get_children(): self.rules_tree.delete(i)

@@ -10,11 +10,16 @@ import re
 import glob
 import json
 import shutil
+import threading
 
 from core.infrastructure.command_runner import CommandRunner
 from services.patch_service import PatchService
 from core.application.session_state import SessionState
+from core.native.unpack import sha8
+from services.native_annotations_service import NativeAnnotationsService
 from mcp_server import registry
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _adb(ctx) -> str:
@@ -451,7 +456,12 @@ def lib_update(ctx, lib_id, source_code=None, abi=None, api_level=None,
 
 
 # ============================================================ D: Patches/Favoriten
-_FAV_FIELDS = ("type", "file", "orig", "edit", "patch", "ram", "base", "target", "source", "scope")
+_FAV_FIELDS = (
+    "type", "file", "orig", "edit", "patch", "ram", "base", "target", "source", "scope",
+    "abi", "vaddr", "func", "orig_size", "mode", "auto_nop", "orig_hex", "aob", "anchor_strings", "rel_offset",
+    "name", "version", "description", "origin", "source_code", "api_level", "link_libs",
+    "extra_flags", "output_kind", "so_relpath",
+)
 
 
 def _fav_index(fav_service, ref):
@@ -485,10 +495,21 @@ def _normalize_favorite(favorite):
     for p in favorite["patches"]:
         t = p.get("type", "smali")
         p["type"] = t
-        if t not in ("smali", "hex", "lib_replace", "new_file"):
+        if t not in ("smali", "hex", "lib_replace", "new_file", "libcarve", "libforge"):
             raise ValueError(f"unbekannter patch type: {t}")
         if t == "smali":
             p.setdefault("scope", "method")
+        if t == "libcarve":
+            p.setdefault("mode", "asm")
+            p.setdefault("abi", "arm64-v8a")
+            p.setdefault("auto_nop", True)
+        if t == "libforge":
+            p.setdefault("abi", "arm64-v8a")
+            p.setdefault("output_kind", "shared")
+            p.setdefault("origin", "built")
+            p.setdefault("link_libs", "log dl")
+            if not p.get("name"):
+                raise ValueError("libforge patch braucht 'name'")
         if t == "new_file":
             p.setdefault("scope", "new_file")
             if not p.get("file") or not p.get("edit"):
@@ -498,18 +519,31 @@ def _normalize_favorite(favorite):
     return favorite
 
 
-def favorites_list(ctx):
+def favorites_list(ctx, tool_type: str = ""):
     favs = ctx.favorites().favs
     if not favs:
         return "keine Favoriten"
+    flt = str(tool_type or "").strip().lower()
     out = []
     for i, f in enumerate(favs):
         patches = f.get("patches", [f])
+        types = [str(p.get("type", "smali") or "smali") for p in patches]
+        canon = {("smali" if t == "new_file" else t.lower()) for t in types}
+        is_multi = len(canon) > 1
+        if flt:
+            if flt in ("kombi", "multi", "multi-tool"):
+                if not is_multi:
+                    continue
+            else:
+                norm_flt = "smali" if flt in ("smali", "new_file") else ("lib_replace" if flt in ("lib-replace", "lib_replace") else flt)
+                if norm_flt not in canon and flt not in [t.lower() for t in types]:
+                    continue
         out.append({"index": i, "name": f.get("name", "(ohne Name)"),
                     "version": f.get("version", "1.0"),
                     "description": f.get("description", ""),
                     "patch_count": len(patches),
-                    "types": [p.get("type", "smali") for p in patches]})
+                    "types": types,
+                    "is_multi_tool": is_multi})
     return out
 
 
@@ -553,6 +587,71 @@ def favorites_delete(ctx, ref):
     name = fs.favs[i].get("name", "(ohne Name)")
     fs.delete_favorite(i)
     return f"Favorit [{i}] '{name}' geloescht."
+
+
+def favorites_append(ctx, ref, patch_json):
+    """Hängt einen oder mehrere Patches an einen bestehenden Favoriten an (Multi-Tool)."""
+    fs = ctx.favorites()
+    i = _fav_index(fs, ref)
+    if i < 0:
+        return f"[Fehler] Favorit '{ref}' nicht gefunden."
+    incoming = _normalize_favorite(patch_json)
+    fav = fs.favs[i]
+    if not isinstance(fav.get("patches"), list):
+        fav["patches"] = [{k: fav[k] for k in fav if k in _FAV_FIELDS}]
+        for k in ("file", "orig", "edit"):
+            fav.pop(k, None)
+    for np in incoming["patches"]:
+        fav["patches"].append(dict(np))
+    fs.save_favs()
+    types = [p.get("type", "smali") for p in fav["patches"]]
+    return {
+        "index": i,
+        "name": fav.get("name", "(ohne Name)"),
+        "appended": len(incoming["patches"]),
+        "patch_count": len(fav["patches"]),
+        "types": types,
+        "is_multi_tool": len(set("smali" if t == "new_file" else t for t in types)) > 1,
+    }
+
+
+def favorites_combine(ctx, refs, name, version="1.0", description=""):
+    """Kombiniert >= 2 bestehende Favoriten zu einem neuen Multi-Tool-Favoriten."""
+    fs = ctx.favorites()
+    if isinstance(refs, str):
+        refs_list = json.loads(refs)
+    else:
+        refs_list = list(refs or [])
+    if len(refs_list) < 2:
+        return "[Fehler] Mindestens 2 Favoriten-Referenzen (Indizes oder Namen) angeben."
+    combined = []
+    resolved_names = []
+    for r in refs_list:
+        idx = _fav_index(fs, r)
+        if idx < 0:
+            return f"[Fehler] Favorit '{r}' nicht gefunden."
+        f = fs.favs[idx]
+        resolved_names.append(f.get("name", f"#{idx}"))
+        for p in f.get("patches", [f]):
+            combined.append(dict(p))
+    ver = str(version or "1.0")
+    desc = description or f"Multi-Tool-Kombi aus {', '.join(resolved_names)}"
+    fav = {
+        "name": str(name or "").strip() or f"Kombi ({len(resolved_names)})",
+        "version": ver,
+        "description": _compose_desc(ver, desc),
+        "patches": combined,
+    }
+    fs.add_favorite(fav)
+    types = [p.get("type", "smali") for p in combined]
+    return {
+        "index": len(fs.favs) - 1,
+        "name": fav["name"],
+        "version": ver,
+        "patch_count": len(combined),
+        "types": types,
+        "is_multi_tool": len(set("smali" if t == "new_file" else t for t in types)) > 1,
+    }
 
 
 _RAM_CACHE = None
@@ -621,6 +720,77 @@ def _apply_one_patch(ctx, p, ram_cache):
         SessionState.active_hex_patches.append(entry)
         return {"ok": True, "kind": "hex", "status": "applied", "ref": entry.get("ram", "")}
 
+    if ptype == "libcarve":
+        entry = {
+            "type": "libcarve",
+            "file": os.path.basename(str(p.get("file") or "").strip()),
+            "abi": str(p.get("abi") or "arm64-v8a"),
+            "vaddr": str(p.get("vaddr") or ""),
+            "func": str(p.get("func") or ""),
+            "orig_size": int(p.get("orig_size") or 0),
+            "mode": str(p.get("mode") or "asm").lower(),
+            "auto_nop": bool(p.get("auto_nop", True)),
+            "orig": str(p.get("orig") or ""),
+            "edit": str(p.get("edit") or p.get("patch") or ""),
+            "orig_hex": str(p.get("orig_hex") or ""),
+            "aob": str(p.get("aob") or ""),
+            "anchor_strings": list(p.get("anchor_strings") or ()),
+            "rel_offset": int(p.get("rel_offset") or 0),
+        }
+        if not entry["file"] or not entry["edit"]:
+            return {"ok": False, "kind": "libcarve", "reason": "file oder edit fehlt"}
+        # Pattern-Match gegen Ziel-.so falls AOB vorhanden und Zieladresse aufgelöst werden soll
+        if entry["aob"] and ctx is not None:
+            try:
+                so_p, img, idx = _lc_resolve_so_and_index(ctx, entry["file"], need_index=True)
+                if img is not None and idx is not None:
+                    from services.libcarve_pattern_service import LibCarvePatternService
+                    m = LibCarvePatternService.match_patch(img, idx, entry)
+                    if m.get("ok") and m.get("vaddr") is not None:
+                        entry["vaddr"] = f"0x{m['vaddr']:x}"
+                        entry["func"] = idx.func_at(m["vaddr"]) or entry["func"]
+            except Exception:
+                pass
+        if not entry["vaddr"]:
+            return {"ok": False, "kind": "libcarve", "reason": "vaddr fehlt / AOB nicht eindeutig gematcht"}
+        if any(
+            e.get("file") == entry["file"] and e.get("vaddr") == entry["vaddr"]
+            and e.get("edit") == entry["edit"]
+            for e in SessionState.active_libcarve_patches
+        ):
+            return {"ok": True, "kind": "libcarve", "status": "already_active", "ref": f"{entry['file']}@{entry['vaddr']}"}
+        SessionState.active_libcarve_patches.append(entry)
+        return {"ok": True, "kind": "libcarve", "status": "applied", "file": entry["file"], "vaddr": entry["vaddr"]}
+
+    if ptype == "libforge":
+        lname = str(p.get("name") or "").strip()
+        if not lname or ctx is None:
+            return {"ok": False, "kind": "libforge", "reason": "name oder Kontext fehlt"}
+        mgr = ctx.libs()
+        lib = next((l for l in mgr.get_all() if l.name == lname), None)
+        if lib is None:
+            lib = mgr.create(name=lname, origin=str(p.get("origin") or "built"))
+        lib.version = str(p.get("version") or "1.0")
+        lib.description = str(p.get("description") or "")
+        if lib.origin != "imported":
+            lib.source_code = str(p.get("source_code") or lib.source_code or "")
+        lib.abi = str(p.get("abi") or "arm64-v8a")
+        try:
+            lib.api_level = int(p.get("api_level") or 30)
+        except (ValueError, TypeError):
+            lib.api_level = 30
+        lib.link_libs = str(p.get("link_libs") or "log dl")
+        lib.extra_flags = str(p.get("extra_flags") or "")
+        lib.output_kind = str(p.get("output_kind") or "shared")
+        if p.get("so_relpath"):
+            lib.so_relpath = str(p.get("so_relpath"))
+        mgr.update(lib)
+        activated = False
+        if lib.so_relpath and os.path.exists(mgr.abspath(lib.so_relpath)):
+            mgr.set_active(lib.id, True)
+            activated = True
+        return {"ok": True, "kind": "libforge", "status": "applied", "name": lib.name, "active": activated}
+
     # smali / new_file -> gegen den (pristinen) Source-Baum evaluieren
     res = PatchService.evaluate_smali_patch(p, ram_cache, SessionState.active_smali_patches)
     if not res.get("success"):
@@ -647,13 +817,15 @@ def _apply_one_patch(ctx, p, ram_cache):
 
 def _active_view():
     """Kombinierte, stabil indizierte Sicht auf die aktive Patch-Liste.
-    Reihenfolge = SessionState.get_all_patches(): hex, lib_replace, smali."""
+    Reihenfolge = SessionState.get_all_patches(): hex, lib_replace, libcarve, smali."""
     view = []
     gi = 0
     for e in SessionState.active_hex_patches:
         view.append((gi, "hex", SessionState.active_hex_patches, e)); gi += 1
     for e in SessionState.active_lib_replacements:
         view.append((gi, "lib_replace", SessionState.active_lib_replacements, e)); gi += 1
+    for e in SessionState.active_libcarve_patches:
+        view.append((gi, "libcarve", SessionState.active_libcarve_patches, e)); gi += 1
     for e in SessionState.active_smali_patches:
         kind = "new_file" if (e.get("scope") == "new_file" or e.get("type") == "new_file") else "smali"
         view.append((gi, kind, SessionState.active_smali_patches, e)); gi += 1
@@ -684,6 +856,11 @@ def patch_active_list(ctx):
             item["file"] = e.get("file", "")
             item["ram"] = e.get("ram", "")
             item["patch"] = e.get("patch", "")
+        elif kind == "libcarve":
+            item["file"] = e.get("file", "")
+            item["vaddr"] = e.get("vaddr", "")
+            item["func"] = e.get("func", "")
+            item["mode"] = e.get("mode", "asm")
         else:
             item["file"] = e.get("file", "")
             item["scope"] = e.get("scope", "method")
@@ -691,6 +868,7 @@ def patch_active_list(ctx):
     return {"active_count": len(out),
             "counts": {"hex": len(SessionState.active_hex_patches),
                        "lib_replace": len(SessionState.active_lib_replacements),
+                       "libcarve": len(SessionState.active_libcarve_patches),
                        "smali": len(SessionState.active_smali_patches)},
             "patches": out}
 
@@ -701,7 +879,8 @@ def patch_apply(ctx, patch_json):
         fav = _normalize_favorite(patch_json)
     except Exception as e:
         return f"[Fehler] Patch ungueltig: {e}"
-    ram_cache = _smali_ram_cache(ctx)
+    needs_smali = any(p.get("type", "smali") in ("smali", "new_file") for p in fav["patches"])
+    ram_cache = _smali_ram_cache(ctx) if needs_smali else []
     results = [_apply_one_patch(ctx, p, ram_cache) for p in fav["patches"]]
     ok = sum(1 for r in results if r.get("ok"))
     persisted = _persist_active(ctx)
@@ -718,7 +897,8 @@ def patch_apply_favorite(ctx, ref):
         return f"[Fehler] Favorit '{ref}' nicht gefunden."
     fav = fs.favs[i]
     patches = fav.get("patches", [fav])
-    ram_cache = _smali_ram_cache(ctx)
+    needs_smali = any(p.get("type", "smali") in ("smali", "new_file") for p in patches)
+    ram_cache = _smali_ram_cache(ctx) if needs_smali else []
     results = [_apply_one_patch(ctx, p, ram_cache) for p in patches]
     ok = sum(1 for r in results if r.get("ok"))
     persisted = _persist_active(ctx)
@@ -862,6 +1042,54 @@ def api_get(ctx, req_id):
     keys = ["id", "timestamp", "method", "url", "status",
             "req_headers", "req_body", "res_headers", "res_body", "comment"]
     return dict(zip(keys, rows[0]))
+
+
+def _api_rules_path(ctx):
+    if ctx is not None and hasattr(ctx, "cfg") and hasattr(ctx.cfg, "paths"):
+        p = ctx.cfg.paths.get("API_RULES")
+        if p:
+            return p
+    return os.path.join(_REPO, "data", "intercept_rules.json")
+
+
+def api_rules_list(ctx):
+    """Liest die aktiven HTTP Intercept-Regeln (intercept_rules.json)."""
+    p = _api_rules_path(ctx)
+    if not os.path.isfile(p):
+        return {"ok": True, "rules": [], "path": p}
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            rules = json.load(fh) or []
+        return {"ok": True, "rules": rules, "count": len(rules), "path": p}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e), "path": p}
+
+
+def api_rules_set(ctx, rules_json, append=False):
+    """Setzt oder ergaenzt Intercept-Regeln (JSON-Liste von {url_match, action, payload})."""
+    p = _api_rules_path(ctx)
+    try:
+        new_rules = json.loads(rules_json) if isinstance(rules_json, str) else rules_json
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Ungueltiges JSON: {e!r}"}
+    if isinstance(new_rules, dict):
+        new_rules = [new_rules]
+    if not isinstance(new_rules, list):
+        return {"ok": False, "hinweis": "rules_json muss Liste oder Regel-Objekt sein"}
+    final = []
+    if append and os.path.isfile(p):
+        try:
+            with open(p, "r", encoding="utf-8") as fh:
+                cur = json.load(fh) or []
+            if isinstance(cur, list):
+                final.extend(cur)
+        except Exception:
+            pass
+    final.extend(new_rules)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(final, fh, ensure_ascii=False, indent=2)
+    return {"ok": True, "count": len(final), "rules": final, "path": p}
 
 
 def history_list(ctx, limit=20):
@@ -2697,6 +2925,9 @@ def native_resolveptr(ctx, path, addr=None, around=None, radius=64):
 
 # ---- M.xx native.dbg_* (O) — geteilte Debug-Sitzung GUI<->KI --------------------
 _DBG_SESSION_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets", "probe", "out", "dbg")
+_STUDIO_SESSION_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets", "probe", "out", "studio")
+_OS_SESSION_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets", "probe", "out", "os")
+_RECIPES_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets", "probe", "out", "workflow_recipes.json")
 
 
 def _dbg_folder(folder):
@@ -2704,7 +2935,7 @@ def _dbg_folder(folder):
 
 
 def native_dbg_state(ctx, folder=None):
-    """Geteilte Debug-Sitzung ansehen (read-only). O. In der GUI vorher 🔗 Sync."""
+    """Geteilte Debug-Sitzung ansehen (read-only). O. In der GUI vorher ⬆ An KI."""
     try:
         from services.native_debug_session_service import NativeDebugSessionService
     except Exception as e:
@@ -2712,14 +2943,25 @@ def native_dbg_state(ctx, folder=None):
     pk = NativeDebugSessionService().peek(_dbg_folder(folder))
     meta = pk.get("meta")
     if not meta:
-        return {"ok": False, "hinweis": f"keine Sitzung in {_dbg_folder(folder)} — in der GUI erst 🔗 Sync."}
+        return {"ok": False, "hinweis": f"keine Sitzung in {_dbg_folder(folder)} — in der GUI erst ⬆ An KI."}
     tr = pk.get("trace") or []
+    # G-OS-0: OS-Zustand (letzte os_attach-Summary) neben der Debug-Sitzung mitfuehren
+    os_state = None
+    try:
+        import json as _json
+        _fp = os.path.join(_OS_SESSION_FOLDER, "last_summary.json")
+        if os.path.isfile(_fp):
+            with open(_fp, encoding="utf-8") as _f:
+                os_state = (_json.load(_f) or {}).get("summary")
+    except Exception:
+        os_state = None
     return {"ok": True, "folder": _dbg_folder(folder),
             "pc": f"0x{int(meta.get('pc', 0)):x}", "seq": meta.get("seq"), "writer": meta.get("writer"),
             "entry": meta.get("entry"), "relocs": meta.get("relocs"), "mode": meta.get("mode"),
             "flags": meta.get("flags"), "ts": meta.get("ts"),
             "bps": [f"0x{int(b):x}" for b in (meta.get("bps") or [])],
-            "trace_len": len(tr), "trace_tail": [e.get("pc_hex") for e in tr[-10:]]}
+            "trace_len": len(tr), "trace_tail": [e.get("pc_hex") for e in tr[-10:]],
+            "os": os_state}
 
 
 def native_dbg_lift(ctx, folder=None):
@@ -2734,7 +2976,7 @@ def native_dbg_lift(ctx, folder=None):
     eng = svc.new_engine()
     ld = NativeDebugSessionService().load(eng, _dbg_folder(folder))
     if not ld.get("ok"):
-        return {"ok": False, "hinweis": "keine Sitzung — in der GUI erst 🔗 Sync."}
+        return {"ok": False, "hinweis": "keine Sitzung — in der GUI erst ⬆ An KI."}
     lr = NativeTraceDecompileService().lift_to_function(eng)
     if not lr.get("ok"):
         return {"ok": False, "why": lr.get("why"), "residual": lr.get("residual"),
@@ -2863,6 +3105,990 @@ def native_jni_run(ctx, budget=400000, stop_at_rasp=True, lib=None):
             "error": r.get("error")}
 
 
+def native_dispatch_trace(ctx, budget=3000000, run_into_trap=True, lib=None,
+                          vt_base=0x137740, lo=0x136000, hi=0x13a000, cap=1200):
+    """CFF-2D-vtable Dispatch-Tracer: JNI_OnLoad emulieren und jeden vtable-Dispatch
+    (Slot/idx1/col/Wert/leer/Taint/x19/x20) protokollieren. Liefert Summary + erste getaintete
+    Divergenz + ersten leeren Slot (Trap) + Dispatch-Liste. read-only."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+    img = ElfImage.from_file(path)
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    svc.load_image(eng, img, apply_relocs=True)
+    ffi = NativeFfiService(publish=False)
+    ffi.wire_imports(eng, img)
+    jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+    entry = svc.resolve_entry("JNI_OnLoad", img)
+    tr = NativeTraceService(publish=False)
+    tr.dispatch_trace_enable(eng, int(vt_base), int(lo), int(hi))
+    tr.begin(eng, entry, args=[Jm.VM_OBJ], faithful=True)
+    bps = [] if run_into_trap else [0x374e0]
+    r = tr.run(eng, breakpoints=bps, maxins=int(budget), mode="block")
+    tr.dispatch_trace_disable(eng)
+    summ = tr.dispatch_trace_summary(eng)
+    log = tr.dispatch_trace_get(eng)
+
+    def hx(e):
+        return {"pc": hex(e["pc"]), "slot": hex(e["slot"]), "idx1": e["idx1"], "col": e["col"],
+                "val": hex(e["val"]), "empty": e["empty"], "val_taint": e["val_taint"],
+                "x20": hex(e["x20"]), "x20_taint": e["x20_taint"]}
+    sample = [hx(e) for e in log[:int(cap)]]
+    stop = ("done" if r.get("done") else "budget" if r.get("budget")
+            else "trap/error" if r.get("why") == "error"
+            else "paused" if r.get("paused") else "?")
+    return {"ok": True, "stop": stop, "pc": r.get("pc_hex"), "steps": r.get("steps"),
+            "summary": summ, "dispatch_count": len(log), "log": sample}
+
+
+_SYS_AARCH64 = {56: "openat", 57: "close", 63: "read", 64: "write", 62: "lseek", 67: "pread64",
+                48: "faccessat", 79: "newfstatat", 43: "statfs", 44: "fstatfs", 78: "readlinkat",
+                61: "getdents64", 172: "getpid", 178: "gettid", 173: "getppid", 174: "getuid",
+                167: "prctl", 117: "ptrace", 169: "gettimeofday", 113: "clock_gettime",
+                129: "kill", 131: "tgkill", 93: "exit", 94: "exit_group", 220: "clone",
+                98: "futex", 222: "mmap", 226: "mprotect", 215: "munmap", 160: "uname",
+                179: "sysinfo", 198: "socket", 203: "connect", 278: "getrandom", 101: "nanosleep",
+                233: "madvise", 73: "ppoll", 135: "rt_sigprocmask", 134: "rt_sigaction"}
+
+
+def native_survive_run(ctx, budget=8000000, lib=None):
+    """RASP Survival Mode + Syscall-Trace: JNI_OnLoad ueber die Anti-Tamper-Trap hinaus laufen
+    lassen (tote Dispatches ueberleben) und jeden rohen svc-Syscall (nr=x8, args x0-x5) mit
+    aufgeloestem Pfad-Argument aufzeichnen = die Detection-/Reaktions-Syscalls. read-only."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+    img = ElfImage.from_file(path)
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    svc.load_image(eng, img, apply_relocs=True)
+    ffi = NativeFfiService(publish=False)
+    ffi.wire_imports(eng, img)
+    jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+    entry = svc.resolve_entry("JNI_OnLoad", img)
+    tr = NativeTraceService(publish=False)
+    _pol = _load_syscall_policy()
+    ffi.install_syscall_hook(eng, returns=(_pol.get("by_nr") or {}),
+                             default_ret=int(_pol.get("default_ret", 0)))
+    tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+    tr.begin(eng, entry, args=[Jm.VM_OBJ], faithful=True)
+    r = tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")
+    slog = ffi.get_syscall_log(eng)
+    sv = tr.survive_get(eng)
+    c = eng.cpu
+
+    def cstr(a, maxn=160):
+        try:
+            a = int(a)
+            if not a:
+                return None
+            out = bytearray()
+            for _ in range(maxn):
+                b = c.m.rb(a, 1); a += 1
+                if not b or b[0] == 0:
+                    break
+                if b[0] < 0x20 or b[0] > 0x7e:
+                    return None
+                out.append(b[0])
+            return out.decode("ascii", "replace") if out else None
+        except Exception:
+            return None
+
+    syscalls = []
+    for e in slog[:200]:
+        ar = e.get("args", [])
+        p = cstr(ar[1]) if len(ar) > 1 else None
+        if not p and ar:
+            p = cstr(ar[0])
+        syscalls.append({"nr": e["nr"], "name": _SYS_AARCH64.get(e["nr"], f"sys_{e['nr']}"),
+                         "pc": hex(e.get("pc", 0)), "path": p,
+                         "args": [hex(x) for x in ar[:4]]})
+    stop = ("done" if r.get("done") else "survive_cap" if r.get("survive_cap")
+            else "budget" if r.get("budget") else "error" if r.get("why") == "error" else "?")
+    # JNI-Detection-Oberflaeche mitliefern (nicht nur Syscalls): die Fassade ist installiert,
+    # also sind die JNI-Calls hinter der Trap = die JNI-vermittelte Detection sichtbar.
+    try:
+        jsum = jni.summary()
+        jni_out = {"calls": jsum.get("calls"), "natives": jsum.get("natives"),
+                   "by_fn": jsum.get("by_fn"), "by_category": jsum.get("by_category")}
+    except Exception:
+        jni_out = None
+    # Trap-Herkunft: dead_pc/ret_to der ueberlebten Dispatches (Stichprobe)
+    survived = [{"dead_pc": e.get("dead_pc") or e.get("at"), "ret_to": e.get("ret_to")}
+                for e in sv[:40]]
+    return {"ok": True, "stop": stop, "pc": r.get("pc_hex"), "steps": r.get("steps"),
+            "survived_dead_dispatches": len(sv), "survived": survived,
+            "syscall_count": len(slog), "syscalls": syscalls, "jni": jni_out}
+
+
+# Plausible, geraetetypische /proc/self/maps-Stichprobe (Fake-Umgebung, WS-E3).
+_DEFAULT_FAKE_MAPS = (
+    "12c00000-12e00000 rw-p 00000000 00:00 0 [anon:dalvik-main space]\n"
+    "7000000000-7000135000 r-xp 00000000 fd:00 1  /data/app/base.apk!/lib/arm64-v8a/libdb0c.so\n"
+    "7000135000-7000140000 rw-p 00135000 fd:00 1  /data/app/base.apk!/lib/arm64-v8a/libdb0c.so\n"
+    "7fffffe000-8000000000 rw-p 00000000 00:00 0 [stack]\n"
+)
+
+
+def _merge_os_config(cfg_d, net_replay, net_mode, trace, trace_max, syscall_policy):
+    """OS-9-Komfortparameter in ein state.config-dict falten (rein, testbar)."""
+    cfg_d = dict(cfg_d or {})
+    if net_replay is not None:
+        cfg_d["net_replay"] = {str(k): (v.encode("utf-8") if isinstance(v, str) else bytes(v))
+                               for k, v in net_replay.items()}
+        cfg_d.setdefault("net_mode", "replay")
+    if isinstance(net_mode, str) and net_mode.strip():
+        cfg_d["net_mode"] = net_mode.strip()
+    if trace:
+        cfg_d["trace_syscalls"] = True
+        cfg_d["trace_max"] = int(trace_max)
+    if syscall_policy is not None:
+        cfg_d["syscall_policy"] = {str(k): str(v) for k, v in syscall_policy.items()}
+    return cfg_d
+
+
+def native_os_attach(ctx, entry="JNI_OnLoad", maps=None, vfs=None, config=None,
+                     budget=200000, survive=True, lib=None,
+                     net_replay=None, net_mode=None, trace=False, trace_max=4096,
+                     syscall_policy=None):
+    """N2 Env/Syscall-Substrat (native_os_service) anhaengen und eine Funktion unter
+    kontrollierter Fake-Umgebung laufen lassen. Nutzt den KONVERGIERTEN Syscall-Pfad
+    (Seed-Policy -> genuiner FakeEnvironment/VFS/mmap-Handler -> Default) statt des flachen
+    ffi-Hooks = die WS-E3-Steuerflaeche generisch bedienbar. read-only.
+      maps   = gefaelschte /proc/self/maps (str; Default = geraetetypische Stichprobe)
+      vfs    = {pfad: inhalt} (dict oder JSON-String) -> VFS-Backend von openat/read
+      config = {uid,pid,tid,...} (dict oder JSON-String) -> Identitaets-Syscalls
+      entry  = JNI_OnLoad | Hex-Adresse (laeuft mit x0=VM/Env-Fassade, faithful).
+    Hinweis Budget: Default 200k haelt den Lauf schnell (~1-2 s). Hoehere Budgets koennen die
+    genuine Umgebung ueber den Init hinaus in den nativen Krypto-Decrypt lenken (langsame
+    NEON-Step-Emulation) -- das ist ein echter WS-E3-Effekt, kein Hang. Fuer die schnelle, volle
+    Detection-Syscall-Spur bis done nutze 'native.survive_run' (flache Policy)."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services.native_os_service import NativeOsService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    import json
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+
+    def _asdict(v):
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str) and v.strip():
+            try:
+                d = json.loads(v)
+                return d if isinstance(d, dict) else None
+            except Exception:
+                return None
+        return None
+
+    vfs_d = _asdict(vfs) or {}
+    cfg_d = _merge_os_config(_asdict(config) or {}, _asdict(net_replay), net_mode,
+                             trace, trace_max, _asdict(syscall_policy))
+    vfs_b = {str(k): (val.encode("utf-8") if isinstance(val, str) else bytes(val))
+             for k, val in vfs_d.items()}
+    maps_s = maps if isinstance(maps, str) and maps.strip() else _DEFAULT_FAKE_MAPS
+
+    img = ElfImage.from_file(path)
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    svc.load_image(eng, img, apply_relocs=True)
+    ffi = NativeFfiService(publish=False)
+    ffi.wire_imports(eng, img)
+    jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+
+    # N2-Substrat: Env + VFS + konvergierter Syscall-Pfad (Presets bleiben als Seed-Policy wirksam)
+    osv = NativeOsService(publish=False)
+    osv.attach_env(eng, maps=maps_s)
+    if vfs_b:
+        osv.vfs_mount(eng, vfs_b)
+    pol = _load_syscall_policy()
+    seed = {}
+    for k, val in (pol.get("by_nr") or {}).items():
+        try:
+            seed[int(k)] = val
+        except Exception:
+            pass
+    osv.install(eng, seed_policy=seed, default_ret=int(pol.get("default_ret", 0)),
+                config=(cfg_d or None))
+
+    # Entry aufloesen: Symbol zuerst, dann Hex-Adresse
+    entry_addr = None
+    try:
+        entry_addr = svc.resolve_entry(entry, img)
+    except Exception:
+        entry_addr = None
+    if entry_addr is None:
+        try:
+            s = str(entry).strip()
+            if s.lower().startswith("0x"):
+                entry_addr = int(s, 16)
+        except Exception:
+            entry_addr = None
+    if entry_addr is None:
+        return {"ok": False, "hinweis": f"Entry nicht aufloesbar: {entry!r}"}
+
+    tr = NativeTraceService(publish=False)
+    if survive:
+        tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+    tr.begin(eng, int(entry_addr), args=[Jm.VM_OBJ], faithful=True)
+    r = tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")
+    stop = ("done" if r.get("done") else "survive_cap" if r.get("survive_cap")
+            else "budget" if r.get("budget") else "error" if r.get("why") == "error" else "?")
+
+    osum = osv.summary(eng)
+    try:
+        import json as _json, time as _time
+        os.makedirs(_OS_SESSION_FOLDER, exist_ok=True)
+        with open(os.path.join(_OS_SESSION_FOLDER, "last_summary.json"), "w", encoding="utf-8") as _f:
+            _json.dump({"ts": _time.time(), "entry": str(entry), "stop": stop,
+                        "summary": osum}, _f, ensure_ascii=False, indent=2, default=str)
+        from services.native_os_session_service import NativeOsSessionService as _OSS
+        _OSS().save(_OS_SESSION_FOLDER, summary=osum, writer="run")
+    except Exception:
+        pass
+    sv = tr.survive_get(eng)
+    survived = [{"dead_pc": e.get("dead_pc") or e.get("at"), "ret_to": e.get("ret_to")}
+                for e in sv[:40]]
+    try:
+        jsum = jni.summary()
+        jni_out = {"calls": jsum.get("calls"), "natives": jsum.get("natives"),
+                   "by_category": jsum.get("by_category")}
+    except Exception:
+        jni_out = None
+    return {"ok": True, "stop": stop, "pc": r.get("pc_hex"), "steps": r.get("steps"),
+            "env": {"maps_bytes": len(maps_s.encode("utf-8")),
+                    "vfs": sorted(vfs_b.keys()),
+                    "config": {k: cfg_d.get(k) for k in ("uid", "pid", "tid") if k in cfg_d}},
+            "syscalls": osum, "survived_dead_dispatches": len(sv), "survived": survived,
+            "jni": jni_out}
+
+
+def native_os_summary(ctx):
+    """Read-only: letzte OS-Substrat-Summary (coverage/trace/net/threads/signals/auxv/policy) aus der
+    letzten native.os_attach-Session lesen (secrets/probe/out/os/last_summary.json).
+
+    POLICY-EBENEN (wichtig, zwei getrennte Schichten):
+      1) Seed-Policy  — NR-NUMMERN-keyed {default_ret, by_nr}, geraeteechte svc-Rueckgaben
+         (native.syscall_policy_get/set, persistiert). Fuer survive_run/genuine.
+      2) OS-9-Policy  — NAMENS-keyed {name: allow|deny|stub} (config["syscall_policy"], pro Lauf).
+         deny -> -EPERM, stub -> 0. Ueber native.os_attach(syscall_policy=...)."""
+    import json as _json
+    fp = os.path.join(_OS_SESSION_FOLDER, "last_summary.json")
+    if not os.path.isfile(fp):
+        return {"ok": False, "hinweis": "Noch keine os_attach-Session: zuerst native.os_attach laufen lassen."}
+    try:
+        with open(fp, encoding="utf-8") as f:
+            data = _json.load(f)
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Summary nicht lesbar: {e!r}"}
+
+
+def native_os_config_get(ctx):
+    """Read-only: geteilten OS-Inspektor-Zustand (config-Delta + letzte Summary + seq/writer) lesen."""
+    from services.native_os_session_service import NativeOsSessionService
+    sess = NativeOsSessionService().peek(_OS_SESSION_FOLDER).get("session")
+    if not sess:
+        return {"ok": False, "hinweis": "kein OS-Zustand — in der GUI erst '⬆ OS→KI' druecken."}
+    return {"ok": True, **sess}
+
+
+def native_os_config_set(ctx, config=None, base_seq=None, force=False):
+    """OS-Inspektor-config setzen (writer=ki, Clobber-Schutz ueber base_seq). G: os_write.
+    config = {syscall_policy, syscall_overrides, net_replay, net_mode, rand_seed, trace_syscalls,
+    vfs_mounts, ...} (dict oder JSON-String). Der Mensch zieht in der GUI mit '⬇ OS←KI' nach."""
+    import json as _json
+    cfg = config
+    if isinstance(cfg, str) and cfg.strip():
+        try:
+            cfg = _json.loads(cfg)
+        except Exception:
+            return {"ok": False, "hinweis": "config kein gueltiges JSON-Objekt"}
+    if not isinstance(cfg, dict):
+        return {"ok": False, "hinweis": "config fehlt oder ist kein Objekt"}
+    from services.native_os_session_service import NativeOsSessionService
+    return NativeOsSessionService().save(_OS_SESSION_FOLDER, config=cfg, writer="ki",
+                                         base_seq=base_seq, force=bool(force))
+
+
+def _syscall_policy_path():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "secrets", "probe", "out", "syscall_policy.json")
+
+
+# geraeteechte Default-Policy (nicht-root, SELinux vorhanden, plausible IDs)
+_GENUINE_SYSCALL_POLICY = {"default_ret": 0, "by_nr": {
+    "79": {"ret": 0, "zero_arg": 2, "zero_len": 128},   # newfstatat -> existiert, statbuf genullt
+    "48": 0,                                             # faccessat -> ok
+    "172": 12345, "178": 12345, "173": 12300,            # getpid/gettid/getppid
+    "174": 10234,                                        # getuid -> App-UID (nicht root)
+    "113": 0, "169": 0, "160": 0, "179": 0}}             # clock_gettime/gettimeofday/uname/sysinfo
+
+
+def _load_syscall_policy():
+    import json
+    try:
+        with open(_syscall_policy_path(), encoding="utf-8") as f:
+            p = json.load(f)
+        if isinstance(p, dict):
+            p.setdefault("default_ret", 0)
+            p.setdefault("by_nr", {})
+            return p
+    except Exception:
+        pass
+    return {"default_ret": 0, "by_nr": {}}
+
+
+def native_syscall_policy_get(ctx):
+    """Aktuelle Syscall-Policy lesen: {default_ret, by_nr{nr: ret|{ret,zero_arg,zero_len}}}."""
+    return {"ok": True, "path": _syscall_policy_path(), "policy": _load_syscall_policy(),
+            "presets": ["genuine", "clear"]}
+
+
+def native_syscall_policy_set(ctx, policy=None, preset=None):
+    """Syscall-Policy setzen (persistiert). preset='genuine' -> geraeteechte Default-Policy;
+    preset='clear' -> leeren. Sonst policy = Dict oder JSON-String {default_ret, by_nr}."""
+    import json
+    if preset == "genuine":
+        pol = json.loads(json.dumps(_GENUINE_SYSCALL_POLICY))
+    elif preset == "clear":
+        pol = {"default_ret": 0, "by_nr": {}}
+    elif isinstance(policy, str):
+        try:
+            pol = json.loads(policy)
+        except Exception as e:
+            return {"ok": False, "hinweis": f"JSON-Fehler: {e!r}"}
+    elif isinstance(policy, dict):
+        pol = policy
+    else:
+        return {"ok": False, "hinweis": "policy (Dict/JSON) oder preset ('genuine'/'clear') angeben"}
+    if not isinstance(pol, dict):
+        return {"ok": False, "hinweis": "policy muss ein Objekt sein"}
+    pol.setdefault("default_ret", 0)
+    pol.setdefault("by_nr", {})
+    path = _syscall_policy_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(pol, f, indent=2)
+    return {"ok": True, "path": path, "policy": pol}
+
+
+_DEVIRT_FUNCS = {"onSearchResult": 0x3ee94, "getOptionsList": 0x43a48}
+
+
+def native_devirt(ctx, entry="onSearchResult", budget=4000000, lib=None,
+                  input_str="0123456789ABCDEF", max_unique=40, runs=1, lift_max=25000):
+    """Devirtualizer (v2): eine OLLVM-control-flow-flattened Funktion entflachen. entry =
+    'JNI_OnLoad' | 'onSearchResult' | 'getOptionsList' | Hex-Adresse. Fuer Unterfunktionen wird
+    je Lauf zuerst JNI_OnLoad initialisiert (frische Engine), dann die Zielfunktion mit
+    JNI-Konvention entflacht. ``runs`` > 1 fuehrt die Zielfunktion mehrfach mit variierten
+    jstring-Eingaben aus und merged die Dispatch-Logs zu einer **Branch-CFG** (Fan-out +
+    Branch-Points + Index-Entscheidungstabelle). Liefert zusaetzlich ausfuehrbares Python
+    (L2-Lift) aus Lauf 0. read-only."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services.native_devirt_service import NativeDevirtService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+    _pol = _load_syscall_policy()
+    _UNKNOWN = object()
+
+    def _one(inp):
+        """Ein vollstaendiger, unabhaengiger Lauf (frische Engine). Liefert dict oder _UNKNOWN."""
+        img = ElfImage.from_file(path)
+        svc = NativeEmuService(publish=False)
+        eng = svc.new_engine()
+        svc.load_image(eng, img, apply_relocs=True)
+        sp0 = int(eng.cpu.sp)
+        ffi = NativeFfiService(publish=False)
+        ffi.wire_imports(eng, img)
+        jni = NativeJniEnvService(publish=False)
+        jni.install(eng, ffi, set_entry_reg=None)
+        ffi.install_syscall_hook(eng, returns=(_pol.get("by_nr") or {}),
+                                 default_ret=int(_pol.get("default_ret", 0)))
+        entry_jni = svc.resolve_entry("JNI_OnLoad", img)
+        tr = NativeTraceService(publish=False)
+        if entry == "JNI_OnLoad":
+            tr.dispatch_trace_enable(eng)
+            tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+            tr.begin(eng, entry_jni, args=[Jm.VM_OBJ], faithful=True)
+            r = tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")
+            fn = entry_jni
+        else:
+            tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+            tr.begin(eng, entry_jni, args=[Jm.VM_OBJ], faithful=True)
+            tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")   # Init
+            fn = _DEVIRT_FUNCS.get(entry)
+            if fn is None:
+                try:
+                    fn = int(entry, 0)
+                except Exception:
+                    return _UNKNOWN
+            this_h = jni._new_handle("jobject", cls=str(entry))
+            in_h = jni._new_handle("jstring", text=str(inp))
+            tr.dispatch_trace_enable(eng)
+            tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+            tr.begin(eng, fn, args=[Jm.ENV_OBJ, this_h, in_h], sp=sp0, faithful=True)
+            r = tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")
+        return {"log": tr.dispatch_trace_get(eng),
+                "trace": list(getattr(eng, "_trace", []) or []),
+                "stop": r.get("pc_hex"), "fn": fn, "eng": eng}
+
+    def _variants(base, n):
+        cand = [base, base[::-1], "", "FFFFFFFFFFFFFFFF", "0000000000000000",
+                base[:max(1, len(base) // 2)], base + base, "DEADBEEFCAFEBABE"]
+        out = []
+        seen = set()
+        for c in cand:
+            if c not in seen:
+                seen.add(c); out.append(c)
+            if len(out) >= n:
+                break
+        while len(out) < n:
+            out.append(base)
+        return out[:n]
+
+    nruns = max(1, int(runs))
+    if entry == "JNI_OnLoad":
+        nruns = 1                      # Init ist deterministisch -> Mehr-Lauf zeigt keine Zweige
+    inputs = _variants(str(input_str), nruns)
+    results = []
+    for inp in inputs:
+        r1 = _one(inp)
+        if r1 is _UNKNOWN:
+            return {"ok": False, "hinweis": f"Unbekannter entry: {entry}"}
+        results.append(r1)
+    r0 = results[0]
+    eng = r0["eng"]
+    fn = r0["fn"]
+    logs = [x["log"] for x in results]
+
+    svcD = NativeDevirtService(publish=False)
+    # Immer deflatten_multi: erkennt Fan-out auch intra-run (Schleifen, die einen Handler
+    # mehrfach mit verschiedenen Nachfolgern besuchen), nicht nur ueber Eingabe-Variation.
+    dv = svcD.deflatten_multi(eng, logs, max_unique=int(max_unique))
+    if nruns > 1:
+        dv["inputs"] = inputs
+    seq = dv.get("sequence", [])
+    if len(seq) > 150:
+        dv["sequence"] = seq[:150] + ["..."]
+    shown = set(dv.get("unique_handlers", [])[:int(max_unique)])
+    dv["successors"] = {k: v for k, v in dv.get("successors", {}).items() if k in shown}
+    if dv.get("branch_points"):
+        _bps = [bp for bp in dv["branch_points"] if bp["handler"] in shown][:40]
+        for bp in _bps:
+            bp["index_table"] = bp.get("index_table", [])[:20]
+        dv["branch_points"] = _bps
+    # Payload-Hygiene: bei vielen Bloecken nur die Branch-relevanten behalten
+    # (Branch-Point-Handler + deren Nachfolger); voller Disasm via native.disasm/decompile.
+    _keep = set()
+    for _bp in (dv.get("branch_points") or []):
+        _keep.add(_bp["handler"])
+        for _sx in _bp.get("successors", []):
+            if _sx.get("target") != "TRAP":
+                _keep.add(_sx["target"])
+    _blocks = dv.get("blocks") or {}
+    if len(_blocks) > 20 and _keep:
+        dv["blocks"] = {k: v for k, v in _blocks.items() if k in _keep}
+        dv["blocks_hinweis"] = ("auf Branch-relevante Handler eingedampft (%d von %d); "
+                                "voller Disasm via native.disasm/decompile"
+                                % (len(dv["blocks"]), len(_blocks)))
+    try:
+        from services.native_trace_decompile_service import NativeTraceDecompileService
+        _td = NativeTraceDecompileService()
+        _tr0 = [e for e in r0.get("trace", [])
+                if int(e.get("pc", 0)) < 0x7A000000]
+        _lmax = int(lift_max)
+        _do_lift = (_lmax > 0) and (len(_tr0) <= _lmax)
+        _lf = (_td.lift_to_function(eng, trace=_tr0, func_name="lifted") if _do_lift
+               else {"ok": False, "why": "lift_uebersprungen", "residual": len(_tr0)})
+        if not _do_lift:
+            dv["lift_mode"] = "skipped_large" if _lmax > 0 else "skipped_off"
+            dv["lift_trace_len"] = len(_tr0)
+            dv["lift_max"] = _lmax
+        elif _lf.get("ok"):
+            _src = _lf.get("source") or ""
+            dv["python"] = _src if len(_src) <= 60000 else (_src[:_src.rfind(chr(10), 0, 60000)] + "\n# ... (gekuerzt)")
+            dv["lift_mode"] = "runnable"
+            dv["lift_unique"] = _lf.get("unique")
+            dv["lift_visits"] = _lf.get("visits")
+        else:
+            dv["lift_mode"] = "pseudocode"
+            dv["lift_why"] = _lf.get("why")
+            dv["lift_residual"] = _lf.get("residual") or _lf.get("addr")
+            _dc = _td.decompile_trace(eng, _tr0)
+            if _dc.get("ok"):
+                _pc = _dc.get("pseudocode") or ""
+                dv["pseudocode"] = _pc if len(_pc) <= 12000 else (_pc[:12000] + "\n... (gekuerzt)")
+                dv["lift_unique"] = _dc.get("unique")
+                dv["lift_visits"] = _dc.get("visits")
+    except Exception as _e:
+        dv["lift_error"] = repr(_e)
+    dv["entry"] = str(entry)
+    dv["fn"] = hex(int(fn))
+    dv["stop"] = r0.get("stop")
+    dv["n_runs"] = nruns
+    return dv
+
+
+# ====================== Workflow-Schicht (GUI-Refactoring AP2) ======================
+# Deklarative Registry: die GUI baut Workflow-Rail + Eingabeformulare generisch hieraus.
+_WORKFLOWS = {
+    "open_lib": {"label": "Oeffnen", "icon": "📂",
+                 "desc": "Lib laden + indizieren + als AKTIVE Lib setzen.",
+                 "info": ("WAS: Laedt eine native .so (AArch64) ins Studio, baut den XREF/CallGraph-Index "
+                          "und merkt sie als AKTIVE Lib fuer alle folgenden Workflows.\n"
+                          "WIE: ELF parsen (Segmente/Symbole/Entry) + Index (SHA-gegatet gecacht); der Pfad "
+                          "wird nach secrets/probe/out/active_lib.txt geschrieben.\n"
+                          "ANWENDUNG: Feld 'Lib-Pfad' = Pfad zur .so (leer = zuletzt aktive, sonst Default "
+                          "libdb0c). ZUERST ausfuehren, wenn du ein neues Ziel analysierst.\n"
+                          "ERGEBNIS: ELF-Kurzinfo + Index-Status; danach arbeiten run_fn/devirt/gate2/jni "
+                          "automatisch auf dieser Lib."),
+                 "fields": [{"key": "path", "label": "Lib-Pfad", "default": "", "type": "path"}],
+                 "hints": ["jni", "run_fn", "devirt"]},
+    "run_fn":   {"label": "Ausfuehren", "icon": "▶",
+                 "desc": "Eine Funktion emulieren.",
+                 "info": ("WAS: Emuliert eine einzelne Funktion der aktiven Lib im arm64-Emulator (kein "
+                          "Geraet, keine Risiken).\n"
+                          "WIE: Argumente in x0.. gesetzt, ab Entry bis ret/Budget ausgefuehrt; End-Register, "
+                          "Rueckgabewert und beschriebene Out-Puffer werden erfasst.\n"
+                          "ANWENDUNG: 'Entry' = Symbolname oder 0xAddr; 'Args (CSV hex)' z.B. '0x1,0xdead'; "
+                          "'Budget' = max. Instruktionen; 'Lib' leer = aktive Lib.\n"
+                          "ERGEBNIS: Endregister/ret + Out-Puffer. Um eine isolierte Routine zu verstehen."),
+                 "fields": [{"key": "entry", "label": "Entry", "default": "JNI_OnLoad", "type": "str"},
+                            {"key": "args", "label": "Args (CSV hex)", "default": "", "type": "str"},
+                            {"key": "budget", "label": "Budget", "default": 2000000, "type": "int"},
+                            {"key": "lib", "label": "Lib (leer=aktiv)", "default": "", "type": "path"}],
+                 "hints": ["devirt", "gate2"]},
+    "devirt":   {"label": "Devirt", "icon": "🧩",
+                 "desc": "OLLVM entflachen -> Branch-CFG + Python.",
+                 "info": ("WAS: Macht OLLVM-control-flow-flattened Funktionen wieder lesbar (Deflattening).\n"
+                          "WIE: Emuliert die Dispatcher-Schleife ueber mehrere Laeufe mit variierten Eingaben, "
+                          "rekonstruiert eine Branch-CFG (Fan-out, Branch-Points, Index-Entscheidungstabelle) "
+                          "und hebt Lauf 0 nach ausfuehrbarem Python (L2-Lift).\n"
+                          "ANWENDUNG: 'Entry' = JNI_OnLoad/onSearchResult/getOptionsList/0xAddr; 'Runs'>1 "
+                          "variiert Eingaben (mehr Branches); 'Lift-max'=0 = nur CFG; 'Budget' = Limit; "
+                          "'Lib' leer = aktiv.\n"
+                          "ERGEBNIS: Zusammenfassung + Branch-CFG + Python/Pseudocode + Sequenz. "
+                          "VORAUSSETZUNG: Ziel ist OLLVM-flattened."),
+                 "fields": [{"key": "entry", "label": "Entry", "default": "JNI_OnLoad", "type": "str"},
+                            {"key": "runs", "label": "Runs", "default": 4, "type": "int"},
+                            {"key": "lift_max", "label": "Lift-max", "default": 25000, "type": "int"},
+                            {"key": "budget", "label": "Budget", "default": 4000000, "type": "int"},
+                            {"key": "lib", "label": "Lib (leer=aktiv)", "default": "", "type": "path"}],
+                 "hints": ["run_fn", "gate2"]},
+    "gate2":    {"label": "Gate 2", "icon": "🛡",
+                 "desc": "Survival + Detection-Syscalls + Policy.",
+                 "info": ("WAS: Faehrt JNI_OnLoad ueber die RASP/Anti-Tamper-Trap hinaus (Survival Mode) und "
+                          "zeichnet die rohen Detection-Syscalls auf.\n"
+                          "WIE: Tote Dispatches werden ueberlebt; jeder svc (nr=x8, args x0-x5) mit aufgeloestem "
+                          "Pfad-Argument protokolliert = die Erkennungs-/Reaktions-Aufrufe "
+                          "(newfstatat/openat/...).\n"
+                          "ANWENDUNG: 'Policy-Preset' = genuine (geraeteechte Rueckgaben)/clear/eigenes; "
+                          "'Entry' meist JNI_OnLoad; 'Budget' hoch (Survival laeuft lang); 'Lib' leer = aktiv.\n"
+                          "ERGEBNIS: Liste der Detection-Syscalls (Name/pc/Argument) + Anzahl uebersprungener "
+                          "Dispatches. VORAUSSETZUNG: Ziel hat syscall-basierte RASP."),
+                 "fields": [{"key": "entry", "label": "Entry", "default": "JNI_OnLoad", "type": "str"},
+                            {"key": "preset", "label": "Policy-Preset", "default": "genuine", "type": "choice", "options": ["genuine", "clear"]},
+                            {"key": "budget", "label": "Budget", "default": 8000000, "type": "int"},
+                            {"key": "lib", "label": "Lib (leer=aktiv)", "default": "", "type": "path"}],
+                 "hints": ["devirt"]},
+    "jni":      {"label": "JNI-Init", "icon": "⚡",
+                 "desc": "JNI_OnLoad initialisieren (RegisterNatives).",
+                 "info": ("WAS: Emuliert JNI_OnLoad mit Fake-JNIEnv, loest Relocations/Imports auf und faengt "
+                          "RegisterNatives ab = die Zuordnung Java-Methode -> native Funktion.\n"
+                          "WIE: Fake-JNIEnv-Tabelle + Reloc-Wiring, Lauf bis zur RASP-Trap (stop_at_rasp); "
+                          "jeder JNI-Call wird geloggt.\n"
+                          "ANWENDUNG: 'Budget' = Instruktionslimit (JNI-Init ist kurz); 'Lib' leer = aktiv.\n"
+                          "ERGEBNIS: RegisterNatives-Map (Klasse/Methode/Signatur -> Adresse) + JNI-Call-Log. "
+                          "Der Einstieg fuer jede Android-Native-Lib."),
+                 "fields": [{"key": "budget", "label": "Budget", "default": 400000, "type": "int"},
+                            {"key": "lib", "label": "Lib (leer=aktiv)", "default": "", "type": "path"}],
+                 "hints": ["devirt", "run_fn"]},
+}
+_WORKFLOW_ORDER = ["open_lib", "run_fn", "devirt", "gate2", "jni"]
+
+
+def native_devirt_hybrid(ctx, entry="onSearchResult", budget=4000000, lib=None,
+                         input_str="0123456789ABCDEF", max_blocks=400, max_unique=48):
+    """Hybrid-Devirt (N5/M7): statischer Dispatch-Graph (`devirt_static`) ⊕ getracter Branch-Zustand
+    (EIN Lauf mit `dispatch_trace`+`survive`). Loest register-abhaengige Branch-Points und statische
+    Traps/Luecken durch den real genommenen Pfad auf; liefert Coverage + Provenienz je Block.
+    entry = JNI_OnLoad | onSearchResult | getOptionsList | Hex-Adresse. read-only."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services.native_devirt_service import NativeDevirtService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+    _pol = _load_syscall_policy()
+    img = ElfImage.from_file(path)
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    svc.load_image(eng, img, apply_relocs=True)
+    sp0 = int(eng.cpu.sp)
+    ffi = NativeFfiService(publish=False)
+    ffi.wire_imports(eng, img)
+    jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+    ffi.install_syscall_hook(eng, returns=(_pol.get("by_nr") or {}),
+                             default_ret=int(_pol.get("default_ret", 0)))
+    tr = NativeTraceService(publish=False)
+    entry_jni = svc.resolve_entry("JNI_OnLoad", img)
+    if entry == "JNI_OnLoad":
+        fn = entry_jni
+        tr.dispatch_trace_enable(eng)
+        tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+        tr.begin(eng, entry_jni, args=[Jm.VM_OBJ], faithful=True)
+        tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")
+    else:
+        tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+        tr.begin(eng, entry_jni, args=[Jm.VM_OBJ], faithful=True)
+        tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")   # Init
+        fn = _DEVIRT_FUNCS.get(entry)
+        if fn is None:
+            try:
+                fn = int(entry, 0)
+            except Exception:
+                return {"ok": False, "hinweis": f"Unbekannter entry: {entry}"}
+        this_h = jni._new_handle("jobject", cls=str(entry))
+        in_h = jni._new_handle("jstring", text=str(input_str))
+        tr.dispatch_trace_enable(eng)
+        tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+        tr.begin(eng, fn, args=[Jm.ENV_OBJ, this_h, in_h], sp=sp0, faithful=True)
+        tr.run(eng, breakpoints=[], maxins=int(budget), mode="block")
+    log = tr.dispatch_trace_get(eng)
+    svcD = NativeDevirtService(publish=False)
+    # devirt_static erwartet die Zieladresse (int), nicht den Symbolnamen.
+    out = svcD.devirt_hybrid(eng, int(fn), dispatch_logs=[log], max_blocks=int(max_blocks),
+                             max_unique=int(max_unique))
+    out["entry_name"] = entry
+    # Payload-Hygiene: nur die interessanten Bloecke (Branch/Trap/aufgeloest/getracet) zeigen.
+    blocks = out.get("blocks", {})
+    keep = {a: b for a, b in blocks.items()
+            if b.get("is_branch_point") or b.get("resolved")
+            or b.get("node_type") == "traced-only" or b.get("traced_successors")}
+    out["blocks"] = dict(list(keep.items())[:80])
+    out["n_blocks_shown"] = len(out["blocks"])
+    return out
+
+
+def native_devirt_static(ctx, entry="onSearchResult", max_blocks=400, lib=None):
+    """Statischer Devirtualizer: baut den Dispatch-Graphen einer OLLVM-geflachten Funktion
+    **ohne Lauf der Zielfunktion** — rein aus Disasm + den (einmalig per Init gesetzten)
+    .data-State-Keys. Loest 1D-madd-Tabellen (0x134f48) UND 2D-smaddl-Vtable (0x137740) auf;
+    folgt index/direct-Kanten und beiden csel-Branch-Kandidaten, erkennt Traps (leerer Slot).
+    entry = 'JNI_OnLoad' | 'onSearchResult' | 'getOptionsList' | Hex-Adresse. read-only."""
+    try:
+        from core.native.loader import ElfImage
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_trace_service import NativeTraceService
+        from services.native_devirt_service import NativeDevirtService
+        from services import native_jni_env_service as Jm
+        from services.native_jni_env_service import NativeJniEnvService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    path = lib or _jni_lib_path()
+    if not os.path.isfile(path):
+        return {"ok": False, "hinweis": f"Lib fehlt: {path}"}
+    img = ElfImage.from_file(path)
+    svc = NativeEmuService(publish=False)
+    eng = svc.new_engine()
+    svc.load_image(eng, img, apply_relocs=True)
+    ffi = NativeFfiService(publish=False)
+    ffi.wire_imports(eng, img)
+    jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+    _pol = _load_syscall_policy()
+    ffi.install_syscall_hook(eng, returns=(_pol.get("by_nr") or {}),
+                             default_ret=int(_pol.get("default_ret", 0)))
+    entry_jni = svc.resolve_entry("JNI_OnLoad", img)
+    tr = NativeTraceService(publish=False)
+    tr.survive_enable(eng, min_pc=0x1000, cap=50000)
+    tr.begin(eng, entry_jni, args=[Jm.VM_OBJ], faithful=True)
+    tr.run(eng, breakpoints=[], maxins=800000, mode="block")   # Init: .data-State-Keys setzen
+    if entry == "JNI_OnLoad":
+        fn = entry_jni
+    else:
+        fn = _DEVIRT_FUNCS.get(entry)
+        if fn is None:
+            try:
+                fn = int(entry, 0)
+            except Exception:
+                return {"ok": False, "hinweis": f"Entry unbekannt: {entry} "
+                        f"(bekannt: {sorted(_DEVIRT_FUNCS)} oder Hex-Adresse)"}
+    dv = NativeDevirtService(publish=False)
+    g = dv.devirt_static(eng, fn, max_blocks=int(max_blocks))
+    g["entry_name"] = entry
+    g["entry_addr"] = f"0x{int(fn) & ((1 << 64) - 1):x}"
+    return g
+
+
+_ACTIVE_LIB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "secrets", "probe", "out", "active_lib.txt")
+
+
+def _active_lib():
+    """Zuletzt per open_lib gesetzte aktive Lib (Pfad) oder None."""
+    try:
+        with open(_ACTIVE_LIB_PATH, encoding="utf-8") as f:
+            p = f.read().strip()
+        return p or None
+    except Exception:
+        return None
+
+
+def _set_active_lib(path):
+    try:
+        os.makedirs(os.path.dirname(_ACTIVE_LIB_PATH), exist_ok=True)
+        with open(_ACTIVE_LIB_PATH, "w", encoding="utf-8") as f:
+            f.write(str(path or "").strip())
+    except Exception:
+        pass
+
+
+def _wf_lib(params):
+    """Lib fuer einen Workflow aufloesen: explizites Feld 'lib'/'path' -> aktive Lib -> None (Tool-Default)."""
+    v = (params or {}).get("lib") or (params or {}).get("path")
+    if v and str(v).strip():
+        return str(v).strip()
+    return _active_lib()
+
+
+def _studio_folder(folder):
+    return folder or _STUDIO_SESSION_FOLDER
+
+
+def native_session_get(ctx, folder=None):
+    """Geteilten Native-Studio-Zustand ansehen (read-only, O): Lib + Eingaben + letztes Ergebnis."""
+    try:
+        from services.native_studio_session_service import NativeStudioSessionService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    pk = NativeStudioSessionService().peek(_studio_folder(folder))
+    sess = pk.get("session")
+    if not sess:
+        return {"ok": False, "hinweis": f"keine Studio-Sitzung in {_studio_folder(folder)} \u2014 in der GUI erst \u2b06 Zustand\u2192KI."}
+    res = pk.get("result")
+    rsum = None
+    if isinstance(res, dict):
+        secs = res.get("sections") or []
+        rsum = {"source": res.get("source") or res.get("workflow") or res.get("name"),
+                "ok": res.get("ok"),
+                "titles": [s.get("title") for s in secs] if secs else None,
+                "next_hints": res.get("next_hints")}
+    return {"ok": True, "folder": _studio_folder(folder),
+            "lib": sess.get("lib"), "inputs": sess.get("inputs"),
+            "seq": sess.get("seq"), "writer": sess.get("writer"), "ts": sess.get("ts"),
+            "result": res, "result_summary": rsum}
+
+
+def native_session_set(ctx, folder=None, lib=None, inputs=None, run_workflow=None,
+                       base_seq=None, force=False):
+    """Studio-Zustand setzen (writer=ki); optional Workflow ausfuehren. G (Freigabe session_write)."""
+    try:
+        from services.native_studio_session_service import NativeStudioSessionService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Service nicht ladbar: {e!r}"}
+    result = None
+    if run_workflow:
+        try:
+            result = native_workflow(ctx, run_workflow, inputs or {})
+        except Exception as e:
+            result = {"ok": False, "error": repr(e)}
+    r = NativeStudioSessionService().save(_studio_folder(folder), lib=lib, inputs=inputs,
+                                          result=result, writer="ki",
+                                          base_seq=base_seq, force=force)
+    if run_workflow and isinstance(r, dict):
+        r["ran_workflow"] = run_workflow
+        r["workflow_ok"] = result.get("ok") if isinstance(result, dict) else None
+    return r
+
+
+def native_recipe_list(ctx=None):
+    """Gespeicherte Workflow-Rezepte (Name + Workflow + Params) lesen. O."""
+    import json
+    try:
+        with open(_RECIPES_PATH, encoding="utf-8") as f:
+            recs = json.load(f)
+    except Exception:
+        recs = []
+    return {"ok": True, "path": _RECIPES_PATH, "count": len(recs), "recipes": recs}
+
+
+def native_recipe_run(ctx, name=None):
+    """Gespeichertes Rezept ausfuehren = seinen Workflow mit den gespeicherten Params fahren. O."""
+    if not name:
+        return {"ok": False, "hinweis": "name= fehlt (Rezeptname)."}
+    import json
+    try:
+        with open(_RECIPES_PATH, encoding="utf-8") as f:
+            recs = json.load(f)
+    except Exception:
+        recs = []
+    rec = next((r for r in recs if r.get("name") == name), None)
+    if not rec:
+        return {"ok": False, "hinweis": f"Rezept {name!r} nicht gefunden.",
+                "verfuegbar": [r.get("name") for r in recs]}
+    return native_workflow(ctx, rec.get("workflow"), rec.get("params") or {})
+
+
+def native_plugins(ctx=None):
+    """Entdeckte native_plugins/ auflisten: Namen + deklarative GUI-Beitraege (read-only, O)."""
+    try:
+        from core.native import unpack as _u
+        reg = _u.UnpackRegistry()
+        return {"ok": True, "names": reg.names(), "contributions": reg.contributions()}
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Plugin-Registry nicht ladbar: {e!r}"}
+
+
+def _anno_path_sha(ctx, path):
+    from core.native import unpack as _u
+    rp, _img = _native_load_image(ctx, path)
+    ws = _u.plugin_root(_native_base(ctx), _native_plugin_name(ctx))
+    return os.path.join(ws, "annotations.json"), _u.sha8(rp), rp
+
+
+def native_annotations_get(ctx, path):
+    """Annotationen (eigene Namen/Notizen je Adresse) einer Lib lesen (read-only, O)."""
+    try:
+        from services.native_annotations_service import NativeAnnotationsService
+        apath, sha, rp = _anno_path_sha(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    anno = NativeAnnotationsService(apath).all(sha) or {}
+    return {"ok": True, "path": rp, "sha": sha, "count": len(anno), "annotations": anno}
+
+
+def native_annotate(ctx, path, addr, name, note=""):
+    """Eigenen Namen/Notiz fuer eine Adresse setzen (geteilt mit der GUI-Outline). P."""
+    try:
+        from services.native_annotations_service import NativeAnnotationsService
+        apath, sha, rp = _anno_path_sha(ctx, path)
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        a = addr if isinstance(addr, int) else int(str(addr), 0)
+        akey = f"0x{a:x}"
+    except Exception:
+        return {"ok": False, "hinweis": f"addr nicht interpretierbar: {addr!r}"}
+    if not name:
+        return {"ok": False, "hinweis": "name= fehlt."}
+    NativeAnnotationsService(apath).set(sha, akey, str(name), str(note or ""))
+    return {"ok": True, "path": rp, "sha": sha, "addr": akey, "name": name,
+            "note": note or "", "hinweis": "Gesetzt. In der GUI nach Outline-Refresh sichtbar (✎)."}
+
+
+def native_workflow_meta(ctx=None):
+    """Deklarative Workflow-Registry fuer die GUI (Rail + Formulare)."""
+    return {"ok": True, "order": _WORKFLOW_ORDER, "workflows": _WORKFLOWS}
+
+
+def native_workflow(ctx, name=None, params=None):
+    """Fuehrt einen benannten Workflow aus (verkettet bestehende native.*-Tools) und liefert
+    ein einheitliches Ergebnis (+ workflow, next_hints). params: dict oder JSON-String."""
+    import json as _json
+    if isinstance(params, str):
+        try:
+            params = _json.loads(params) if params.strip() else {}
+        except Exception:
+            params = {}
+    params = params or {}
+    name = name or "devirt"
+    meta = _WORKFLOWS.get(name)
+    if not meta:
+        return {"ok": False, "hinweis": "Unbekannter Workflow: %s" % name}
+    lib = _wf_lib(params)   # explizite Lib / aktive Lib / None (-> Tool-Default libdb0c)
+    eff = lib or _jni_lib_path()
+    if not (eff and os.path.isfile(eff)):
+        return {"ok": False, "workflow": name,
+                "hinweis": ("Keine existierende Lib. Erst 'Oeffnen' (open_lib) mit einer .so "
+                            "ausfuehren oder im Feld 'Lib' einen gueltigen Pfad setzen. "
+                            "Aufgeloest: %r" % eff)}
+    try:
+        if name == "devirt":
+            r = native_devirt(ctx, entry=params.get("entry", "JNI_OnLoad"),
+                              budget=int(params.get("budget", 4000000)),
+                              runs=int(params.get("runs", 4)),
+                              lift_max=int(params.get("lift_max", 25000)), lib=lib)
+        elif name == "gate2":
+            if params.get("preset"):
+                native_syscall_policy_set(ctx, preset=params.get("preset"))
+            r = native_survive_run(ctx, budget=int(params.get("budget", 8000000)), lib=lib)
+            r = dict(r) if isinstance(r, dict) else {"ok": True, "result": r}
+            r.setdefault("entry", params.get("entry", "JNI_OnLoad"))
+        elif name == "run_fn":
+            path = lib or _jni_lib_path()
+            args = [int(a, 0) for a in str(params.get("args", "")).split(",") if a.strip()]
+            r = native_run(ctx, path=path, entry=params.get("entry", "JNI_OnLoad"),
+                           args=args or None, maxins=int(params.get("budget", 2000000)))
+        elif name == "open_lib":
+            path = lib or _jni_lib_path()
+            r = {"ok": True, "path": path,
+                 "loaded": native_load(ctx, path=path),
+                 "indexed": native_index(ctx, path=path)}
+            _set_active_lib(path)   # kuenftige Workflows arbeiten auf dieser Lib
+        elif name == "jni":
+            r = native_jni_run(ctx, budget=int(params.get("budget", 400000)), lib=lib)
+        else:
+            return {"ok": False, "hinweis": "Dispatch fehlt: %s" % name}
+    except Exception as e:
+        return {"ok": False, "hinweis": "Workflow-Fehler: %r" % e, "workflow": name}
+    if isinstance(r, dict):
+        r = dict(r)
+        r["workflow"] = name
+        r["next_hints"] = meta["hints"]
+        r["lib"] = lib or _jni_lib_path()
+        r.setdefault("ok", True)
+    return r
+
+
 def native_jni_log(ctx, limit=100):
     """Letzten native.jni_run auslesen: Call-Log + RegisterNatives-Map + Klassifizierungen."""
     jni = globals().get("_LAST_JNI")
@@ -2941,3 +4167,1176 @@ def native_dbg_ckpt_activate(ctx, name):
         return {"ok": False, "hinweis": f"Checkpoint '{name}' unvollstaendig (kein state.pkl.xz)"}
     return {"ok": True, "activated": name, "copied": copied,
             "hinweis": "In der GUI jetzt ⬇ Von KI klicken, um den Checkpoint zu laden."}
+
+
+def native_dalvik_run(ctx, smali=None, cls=None, name=None, sig=None, args=None, maxins=200000):
+    """J1: Smali (.class oder einzelne .method) parsen, im DalvikVM registrieren und eine Methode
+    ausfuehren. Generisch/zielagnostisch, read-only. Liefert Ergebnis, registrierte Methoden,
+    Opcode-Coverage und nicht aufgeloeste Aufrufe (Coverage-Loop).
+      smali      = Smali-Text (.class-Datei oder einzelner .method-Block)
+      cls/name/sig = aufzurufende Methode (Default: erste/einzige im Text)
+      args       = Argumentliste (Liste oder JSON-String), Primitive als int."""
+    try:
+        from core.java.dalvik import DalvikVM, DalvikUnknownOpcode, DalvikException
+        from core.java import smali as Sm
+        from core.java.objects import JString, JObject, JArray
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Java-Kern nicht ladbar: {e!r}"}
+    import json
+    if not smali or not str(smali).strip():
+        return {"ok": False, "hinweis": "kein Smali-Text uebergeben"}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else []
+        except Exception:
+            return {"ok": False, "hinweis": "args ist kein gueltiges JSON"}
+    args = list(args or [])
+
+    def _jval(v):
+        if isinstance(v, JString):
+            return {"type": "String", "value": v.text}
+        if isinstance(v, JObject):
+            return {"type": "Object", "cls": v.cls, "fields": {k: _jval(x) for k, x in v.fields.items()}}
+        if isinstance(v, JArray):
+            return {"type": "Array", "eltype": v.eltype, "data": [_jval(x) for x in v.data]}
+        return v
+
+    vm = DalvikVM()
+    try:
+        if ".class" in smali:
+            clsname, mds = Sm.parse_class(smali)
+        else:
+            mds = [Sm.parse_method(smali)]
+        for md in mds:
+            vm.register(md)
+    except Sm.SmaliUnsupported as e:
+        return {"ok": False, "hinweis": f"Smali-Opcode nicht unterstuetzt: {e.op} (Zeile {e.lineno})",
+                "op": e.op, "line": e.line}
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Parse-Fehler: {e!r}"}
+
+    methods = [{"cls": m.cls, "name": m.name, "sig": m.sig, "nregs": m.nregs, "nargs": m.nargs}
+               for m in mds]
+    target = None
+    if name:
+        for m in mds:
+            if m.name == name and (sig is None or m.sig == sig) and (cls is None or m.cls == cls):
+                target = m
+                break
+        if target is None:
+            return {"ok": False, "hinweis": f"Methode {name}{sig or ''} nicht gefunden",
+                    "methods": methods}
+    else:
+        target = mds[0] if mds else None
+    if target is None:
+        return {"ok": False, "hinweis": "keine Methode im Smali", "methods": methods}
+
+    try:
+        ret = vm.invoke(target.cls, target.name, target.sig, args)
+    except DalvikUnknownOpcode as e:
+        return {"ok": False, "hinweis": f"Dalvik-Opcode nicht implementiert: {e.op} @pc={e.pc}",
+                "op": e.op, "methods": methods, "coverage": vm.coverage}
+    except DalvikException as e:
+        return {"ok": False, "hinweis": f"Java-Ausnahme: {e.msg}", "methods": methods}
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Laufzeitfehler: {e!r}", "methods": methods}
+
+    return {"ok": True,
+            "called": {"cls": target.cls, "name": target.name, "sig": target.sig, "args": args},
+            "result": _jval(ret), "methods": methods,
+            "coverage": vm.coverage, "missing": vm.missing}
+
+
+def native_dex_run(ctx, dex_path=None, cls=None, name=None, sig=None, args=None, maxins=1000000):
+    """J3/MS-4: ein DEX laden, die Zielklasse (lazy, inkl. <clinit>) in die DalvikVM registrieren und
+    eine Methode ausfuehren. Framework-Aufrufe (android.*/java.*) laufen ueber die Stub-Registry
+    (Coverage-Loop). Generisch, read-only. Liefert Ergebnis + Coverage + nicht aufgeloeste Aufrufe.
+      dex_path      = Pfad zu classes.dex
+      cls/name/sig  = aufzurufende Methode (Lcls; / name / (args)ret)
+      args          = Argumentliste (Liste oder JSON)."""
+    try:
+        from core.java.dex import DexFile
+        from core.java.runtime import JavaRuntime
+        from services.native_emu_service import NativeEmuService
+        from services.native_ffi_service import NativeFfiService
+        from services.native_jni_env_service import NativeJniEnvService
+        from core.java.objects import JString, JObject, JArray
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Java-Kern nicht ladbar: {e!r}"}
+    import json
+    import os
+    if not dex_path or not os.path.isfile(dex_path):
+        return {"ok": False, "hinweis": f"DEX fehlt: {dex_path}"}
+    if not (cls and name and sig):
+        return {"ok": False, "hinweis": "cls/name/sig noetig (Lcls; / name / (args)ret)"}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else []
+        except Exception:
+            return {"ok": False, "hinweis": "args ist kein gueltiges JSON"}
+    args = list(args or [])
+
+    def _jv(v):
+        if isinstance(v, JString):
+            return {"type": "String", "value": v.text}
+        if isinstance(v, JObject):
+            return {"type": "Object", "cls": v.cls}
+        if isinstance(v, JArray):
+            return {"type": "Array", "eltype": v.eltype, "len": len(v.data)}
+        return v
+
+    dx = DexFile(open(dex_path, "rb").read())
+    svc = NativeEmuService(publish=False); eng = svc.new_engine()
+    ffi = NativeFfiService(publish=False); jni = NativeJniEnvService(publish=False)
+    jni.install(eng, ffi, set_entry_reg=None)
+    rt = JavaRuntime(eng, jni)
+    rt.attach_dex(dx)
+    if not rt.loader.has_class(cls):
+        return {"ok": False, "hinweis": f"Klasse {cls} nicht im DEX"}
+    try:
+        rt.load_dex_class(cls)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Klasse laden fehlgeschlagen: {e!r}"}
+    if (cls, name, sig) not in rt.vm.registry:
+        methods = [{"name": k[1], "sig": k[2]} for k in rt.vm.registry if k[0] == cls]
+        return {"ok": False, "hinweis": f"Methode {name}{sig} nicht gefunden/decodierbar",
+                "methods": methods[:50]}
+    try:
+        ret = rt.vm.invoke(cls, name, sig, args)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Laufzeitfehler: {e!r}", "coverage": rt.vm.coverage,
+                "dalvik_missing": rt.vm.missing[:20], "framework_missing": rt.stubs.missing[:20]}
+    return {"ok": True,
+            "dex": {"version": dx.version, "classes": dx.class_defs_size, "methods": dx.method_ids_size},
+            "called": {"cls": cls, "name": name, "sig": sig, "args": args}, "result": _jv(ret),
+            "coverage": rt.vm.coverage, "dalvik_missing": rt.vm.missing[:20],
+            "framework_missing": rt.stubs.missing[:20]}
+
+
+def native_jdbg_run(ctx, smali=None, cls=None, name=None, sig=None, args=None,
+                    breakpoints=None, set_regs=None, max_steps=200000,
+                    studio_root=None, zone="original"):
+    """X1/MS-6: eine Smali-Methode unter dem Java-Debugger (DalvikVM) ausfuehren — skriptbasiert, da
+    MCP-Calls zustandslos sind. `breakpoints` = Liste von pc-Indizes der Zielmethode; an jedem Treffer
+    werden die Register beobachtet. `set_regs` = {index: wert} wird am ERSTEN Treffer angewandt (Mutation).
+    Liefert Breakpoint-Beobachtungen, Timeline-Laenge und Ergebnis (Mutationseffekt sichtbar)."""
+    try:
+        from core.java.dalvik import DalvikVM, DalvikUnknownOpcode, DalvikException
+        from core.java import smali as Sm
+        from core.java.debug import JavaDebugger
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Java-Kern nicht ladbar: {e!r}"}
+    import json
+    if not smali or not str(smali).strip():
+        return {"ok": False, "hinweis": "kein Smali-Text uebergeben"}
+    for nm, val in (("args", args), ("breakpoints", breakpoints), ("set_regs", set_regs)):
+        if isinstance(val, str) and val.strip():
+            try:
+                v = json.loads(val)
+            except Exception:
+                return {"ok": False, "hinweis": f"{nm} ist kein gueltiges JSON"}
+            if nm == "args":
+                args = v
+            elif nm == "breakpoints":
+                breakpoints = v
+            else:
+                set_regs = v
+    args = list(args or [])
+    bps = [int(b) for b in (breakpoints or [])]
+    set_regs = {int(k): v for k, v in (set_regs or {}).items()}
+
+    vm = DalvikVM()
+    try:
+        mds = Sm.parse_class(smali)[1] if ".class" in smali else [Sm.parse_method(smali)]
+        for md in mds:
+            vm.register(md)
+    except Sm.SmaliUnsupported as e:
+        return {"ok": False, "hinweis": f"Smali-Opcode nicht unterstuetzt: {e.op} (Zeile {e.lineno})"}
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Parse-Fehler: {e!r}"}
+    if studio_root:
+        # Lazy-Callee-Aufloesung: App-interne Aufrufe aus dem Smali-Baum EINER Zone nachladen
+        try:
+            from core.java.class_provider import StudioClassProvider
+            vm.class_provider = StudioClassProvider(studio_root, zone=zone)
+        except Exception as e:
+            return {"ok": False, "hinweis": f"Studio-Provider nicht ladbar: {e!r}"}
+    target = None
+    if name:
+        for m in mds:
+            if m.name == name and (sig is None or m.sig == sig) and (cls is None or m.cls == cls):
+                target = m
+                break
+    else:
+        target = mds[0] if mds else None
+    if target is None:
+        return {"ok": False, "hinweis": "Zielmethode nicht gefunden"}
+
+    dbg = JavaDebugger(vm, max_steps=int(max_steps))
+    for pc in bps:
+        dbg.add_breakpoint(target.cls, target.name, target.sig, pc)
+    observations = []
+    applied = False
+    try:
+        st = dbg.start(target.cls, target.name, target.sig, args, stop_at_entry=False)
+        guard = 0
+        while st.get("mode") == "paused" and guard < 100000:
+            guard += 1
+            observations.append({"step": st.get("step"), "pc": st.get("pc"),
+                                 "registers": dbg.registers()})
+            if not applied and set_regs:
+                for i, v in set_regs.items():
+                    dbg.set_register(i, v)
+                applied = True
+            st = dbg.cont()
+    except (DalvikUnknownOpcode, DalvikException) as e:
+        return {"ok": False, "hinweis": f"Laufzeitfehler: {e!r}", "observations": observations}
+    except Exception as e:
+        try:
+            dbg.stop()
+        except Exception:
+            pass
+        return {"ok": False, "hinweis": f"Debugger-Fehler: {e!r}", "observations": observations}
+
+    return {"ok": True, "called": {"cls": target.cls, "name": target.name, "sig": target.sig, "args": args},
+            "result": st.get("result"), "mode": st.get("mode"), "error": st.get("error"),
+            "breakpoints": bps, "set_regs": set_regs, "observations": observations[:50],
+            "studio_root": studio_root, "zone": zone,
+            "timeline_len": len(dbg.timeline)}
+
+
+def native_app_lifecycle_run(ctx, studio_root=None, zone="original", entry=None, max_steps=400000):
+    """MS-4 (erste Slice): eine ganze App am Lifecycle-Einstieg starten. Laedt die Entry-Klasse
+    (`entry` = Deskriptor `Lcom/foo/MainActivity;`) lazy aus dem Smali-Baum EINER Zone
+    (`studio_root` + `zone` original|patched) und ruft die vorhandenen Lifecycle-Callbacks
+    (<init>, onCreate, onStart, onResume) der Reihe nach auf. App-interne Callees werden lazy
+    nachgeladen. Liefert called/skipped/missing (Coverage-Loop) — zielagnostisch, read-only."""
+    try:
+        from core.java.dalvik import DalvikVM, DalvikUnknownOpcode, DalvikException
+        from core.java.class_provider import StudioClassProvider
+        from core.java.lifecycle import LifecycleRunner
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Java-Kern nicht ladbar: {e!r}"}
+    if not studio_root and ctx is not None:
+        try:
+            _unp = ctx.engine.get_unpacked_dir_name() if getattr(ctx, "engine", None) else "base_unpacked_apktool"
+            _base = ctx.cfg.paths.get("DEST_DIR" if zone in ("destination", "patched") else "APP_SOURCE_DIR", "")
+            if _base:
+                cand = os.path.join(_base, _unp)
+                if os.path.isdir(cand):
+                    studio_root = cand
+        except Exception:
+            pass
+    if not studio_root:
+        return {"ok": False, "hinweis": "studio_root (Zonen-Wurzel der entpackten App) fehlt"}
+    if not entry or not str(entry).strip():
+        return {"ok": False, "hinweis": "entry-Deskriptor fehlt (z. B. Lcom/foo/MainActivity;)"}
+    vm = DalvikVM(max_depth=256)
+    try:
+        prov = StudioClassProvider(studio_root, zone=zone)
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Studio-Provider nicht ladbar: {e!r}"}
+    try:
+        report = LifecycleRunner(vm, prov).run(str(entry).strip())
+    except (DalvikUnknownOpcode, DalvikException) as e:
+        return {"ok": False, "hinweis": f"Laufzeitfehler: {e!r}"}
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Lifecycle-Fehler: {e!r}"}
+    return {"ok": True, "studio_root": studio_root, "zone": zone, "entry": report.get("entry"),
+            "called": report.get("called", []), "skipped": report.get("skipped", []),
+            "errors": report.get("errors", []), "missing": report.get("missing", [])[:50],
+            "statics_keys": sorted(list(vm.statics.keys()))[:50]}
+
+
+# ===== Gläserner App-Lauf (MCP-Parität zum GUI-Gläsern-Lauf) =================
+_GLASS_SESSION_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                     "secrets", "probe", "out", "glass")
+
+# In-memory Zustand der letzten gläsernen UI: erlaubt MCP-Interaktion (render/tap/key) ohne
+# erneuten Lauf. Reine Prozess-Lebensdauer; persistente Momentaufnahme bleibt last_ui.json.
+_LAST_UI = {"surface": None}
+
+
+def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
+                     action_points=None, net_replay=None, max_steps=400000,
+                     seam_profile="self_cache", java_cutoffs=None, jni_cutoffs=None,
+                     net_condition=None, instance_id=None, native_fusion=False):
+    """Gläserner App-Lauf über MCP via GlassAppRunner: Lifecycle durch JavaDebugger + View-/Netz-Recorder
+    + konfigurierbare 2-Ebenen-Seams + NetCondition (online/throttled/offline/timeout) + Instanz/Fork."""
+    import json
+    try:
+        from core.java.dalvik import DalvikException, DalvikUnknownOpcode
+        from core.java.net_recorder import ReplayResponder, NetResponse, NetCondition
+        from core.java.seam_config import SeamConfig
+        from core.java.glass_runner import GlassAppRunner, InstanceState, ProjectSnapshotService
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Java-Kern nicht ladbar: {e!r}"}
+    if not studio_root and ctx is not None:
+        try:
+            _unp = ctx.engine.get_unpacked_dir_name() if getattr(ctx, "engine", None) else "base_unpacked_apktool"
+            _base = ctx.cfg.paths.get("DEST_DIR" if zone in ("destination", "patched") else "APP_SOURCE_DIR", "")
+            if _base:
+                cand = os.path.join(_base, _unp)
+                if os.path.isdir(cand):
+                    studio_root = cand
+        except Exception:
+            pass
+    if not studio_root:
+        return {"ok": False, "hinweis": "studio_root (Zonen-Wurzel der entpackten App) fehlt"}
+
+    def _parse_json_arg(nm, val):
+        if isinstance(val, str) and val.strip():
+            try:
+                return json.loads(val), None
+            except Exception:
+                return None, f"{nm} ist kein gueltiges JSON"
+        return val, None
+
+    for nm, raw in (("action_points", action_points), ("net_replay", net_replay),
+                    ("java_cutoffs", java_cutoffs), ("jni_cutoffs", jni_cutoffs),
+                    ("net_condition", net_condition)):
+        parsed, err = _parse_json_arg(nm, raw)
+        if err:
+            return {"ok": False, "hinweis": err}
+        if nm == "action_points": action_points = parsed
+        elif nm == "net_replay": net_replay = parsed
+        elif nm == "java_cutoffs": java_cutoffs = parsed
+        elif nm == "jni_cutoffs": jni_cutoffs = parsed
+        elif nm == "net_condition": net_condition = parsed
+
+    action_points = list(action_points or [])
+    scfg = SeamConfig.from_profile(seam_profile or "self_cache")
+    if isinstance(java_cutoffs, list):
+        scfg.java_cutoffs = java_cutoffs
+    if isinstance(jni_cutoffs, list):
+        scfg.jni_cutoffs = jni_cutoffs
+
+    svc = ProjectSnapshotService(base_dir=_REPO)
+    inst = svc.load_fork(instance_id) if instance_id else InstanceState(app_root=studio_root, zone=zone, seam_profile=scfg.unpack_mode)
+
+    responder = None
+    if net_replay:
+        mapping = {}
+        for k, v in dict(net_replay).items():
+            if isinstance(v, dict):
+                mapping[str(k)] = NetResponse(v.get("code", 200), v.get("headers") or {}, v.get("body", ""))
+            else:
+                mapping[str(k)] = NetResponse(200, {}, v if isinstance(v, (str, bytes)) else str(v))
+        responder = ReplayResponder(mapping)
+
+    runner = GlassAppRunner(studio_root, zone=zone, seam_config=scfg, instance_state=inst, base_dir=_REPO)
+    try:
+        built = runner.build(native_fusion=bool(native_fusion), net_responder=responder,
+                             rules_path=_api_rules_path(ctx))
+    except Exception as e:
+        return {"ok": False, "hinweis": f"GlassAppRunner.build fehlgeschlagen: {e!r}"}
+
+    stubs = built["stubs"]
+    tree = built["tree"]
+    net_log = built["net_log"]
+    dbg = built["jdb"]
+    dbg.max_steps = int(max_steps)
+
+    nc_obj = None
+    if net_condition is not None and hasattr(stubs, "set_net_condition"):
+        nc_obj = stubs.set_net_condition(net_condition)
+    elif net_condition is not None:
+        nc_obj = NetCondition.from_dict(net_condition)
+
+    ap_errors = []
+    for ap in action_points:
+        try:
+            dbg.add_action_point(ap.get("cls"), ap.get("name"), ap.get("sig"), ap.get("pc"),
+                                 ap.get("assigns") or [], cond=ap.get("cond"),
+                                 when_continue=bool(ap.get("when_continue")),
+                                 one_shot=bool(ap.get("one_shot")), hit=ap.get("hit"))
+        except Exception as e:
+            ap_errors.append(repr(e))
+
+    ent = (str(entry).strip() or None) if entry else None
+    run_fn = (lambda: runner.runner.run_app(studio_root=studio_root, launcher=ent))
+    observations = []
+    try:
+        st = dbg.start_app(run_fn, stop_at_entry=False)
+        guard = 0
+        while st.get("mode") == "paused" and guard < 100000:
+            guard += 1
+            observations.append({"step": st.get("step"), "pc": st.get("pc"),
+                                 "cls": st.get("cls"), "name": st.get("name"),
+                                 "registers": dbg.registers()})
+            st = dbg.cont()
+    except (DalvikUnknownOpcode, DalvikException) as e:
+        return {"ok": False, "hinweis": f"Laufzeitfehler: {e!r}", "net_log": net_log.to_list()}
+    except Exception as e:
+        try:
+            dbg.stop()
+        except Exception:
+            pass
+        return {"ok": False, "hinweis": f"Gläsern-Fehler: {e!r}", "net_log": net_log.to_list()}
+
+    nodes = tree.nodes() if tree else []
+    view_summary = {"views": len(nodes),
+                    "texts": [n.text for n in nodes if getattr(n, "text", "")][:20]}
+    ui_snap = None
+    try:
+        from core.java.surface import SceneGraphSurface, snapshot as _ui_snapshot
+        _live = SceneGraphSurface(tree)
+        ui_snap = _ui_snapshot(_live)
+        _LAST_UI["surface"] = _live
+    except Exception:
+        ui_snap = None
+    try:
+        os.makedirs(_GLASS_SESSION_FOLDER, exist_ok=True)
+        with open(os.path.join(_GLASS_SESSION_FOLDER, "last_net_log.json"), "w", encoding="utf-8") as f:
+            json.dump(net_log.to_list(), f, ensure_ascii=False, indent=1)
+        if ui_snap is not None:
+            with open(os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json"), "w", encoding="utf-8") as f:
+                json.dump(ui_snap, f, ensure_ascii=False, indent=1)
+        with open(os.path.join(_GLASS_SESSION_FOLDER, "live_state.json"), "w", encoding="utf-8") as f:
+            json.dump({"mode": st.get("mode"), "step": st.get("step"), "zone": zone, "entry": ent,
+                       "package": inst.package, "instance_id": inst.instance_id,
+                       "seam_profile": scfg.unpack_mode,
+                       "net_condition": (nc_obj.to_dict() if nc_obj else None),
+                       "net_count": len(net_log), "views": len(nodes)}, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+    return {"ok": True, "studio_root": studio_root, "zone": zone, "entry": ent,
+            "mode": st.get("mode"), "view": view_summary,
+            "seam_profile": scfg.unpack_mode, "instance_id": inst.instance_id,
+            "net_condition": (nc_obj.to_dict() if nc_obj else None),
+            "net_log": net_log.to_list(), "net_count": len(net_log),
+            "action_points": len(action_points), "ap_errors": ap_errors,
+            "observations": observations[:50], "observation_count": len(observations)}
+
+
+def native_glass_state(ctx):
+    """Read-only: liest den geteilten Glass-Debugger-Status (`live_state.json`)."""
+    p = os.path.join(_GLASS_SESSION_FOLDER, "live_state.json")
+    if not os.path.isfile(p):
+        return {"ok": True, "state": None, "hinweis": "noch kein Glass-Zustand geschrieben"}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return {"ok": True, "state": json.load(f)}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+
+
+def native_glass_control(ctx, cmd, params_json=None):
+    """Schreibt ein Steuerkommando fuer die GUI in `data/gui_cmd_queue.json`."""
+    params = {}
+    if params_json:
+        try:
+            params = json.loads(params_json) if isinstance(params_json, str) else dict(params_json)
+        except Exception as e:
+            return {"ok": False, "hinweis": f"params_json ungueltig: {e!r}"}
+    entry = {"cmd": str(cmd), **(params if isinstance(params, dict) else {})}
+    qpath = os.path.join(_REPO, "data", "gui_cmd_queue.json")
+    cur = []
+    if os.path.isfile(qpath):
+        try:
+            with open(qpath, "r", encoding="utf-8") as fh:
+                old = json.load(fh)
+            if isinstance(old, list):
+                cur = old
+        except Exception:
+            cur = []
+    cur.append(entry)
+    os.makedirs(os.path.dirname(qpath), exist_ok=True)
+    with open(qpath, "w", encoding="utf-8") as fh:
+        json.dump(cur, fh, ensure_ascii=False, indent=2)
+    return {"ok": True, "queued": entry, "queue_len": len(cur)}
+
+
+def native_glass_fork(ctx, op="list", package=None, fork_id=None, label="", project_name=None):
+    """Verwaltet parallele Glass-Instanzen (Fork/Merge/Discard) & Projekt-Snapshots."""
+    from core.java.glass_runner import InstanceState, ProjectSnapshotService
+    svc = ProjectSnapshotService(base_dir=_REPO)
+    act = str(op or "list").strip().lower()
+    if act == "list":
+        return {"ok": True, "forks": svc.list_forks(package), "projects": svc.list_projects(package)}
+    if act == "fork":
+        base = InstanceState(package=package or getattr(ctx.cfg, "config", {}).get("APP_PACKAGE", "default.app"))
+        inst = svc.create_fork(base, label=label or "")
+        return {"ok": True, "fork": inst.to_dict()}
+    if act == "merge" and fork_id:
+        return svc.merge_fork(fork_id)
+    if act == "discard" and fork_id:
+        return {"ok": svc.discard_fork(fork_id), "fork_id": fork_id}
+    if act == "save_project" and project_name:
+        base = InstanceState(package=package or getattr(ctx.cfg, "config", {}).get("APP_PACKAGE", "default.app"))
+        p = svc.save_project(project_name, instance=base)
+        return {"ok": True, "path": p}
+    if act == "load_project" and project_name:
+        pkg = package or getattr(ctx.cfg, "config", {}).get("APP_PACKAGE", "default.app")
+        res = svc.load_project(pkg, project_name)
+        return {"ok": True, **{k: v for k, v in res.items() if k != "instance"}, "instance": res["instance"].to_dict()}
+    return {"ok": False, "hinweis": f"Unbekannte/unvollstaendige Operation op={op!r}"}
+
+
+def native_ui_snapshot(ctx):
+    """Read-only (gläsern): UI-Momentaufnahme des letzten native.glass_run — Paint-Liste, Masse,
+    sichtbare Texte, Szenegraph-Knoten (cls/text/bounds/clickable). MCP-Paritaet zur Anzeige."""
+    import json
+    p = os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json")
+    if not os.path.isfile(p):
+        return {"ok": True, "ui": None, "hinweis": "noch kein native.glass_run gelaufen"}
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return {"ok": True, "width": data.get("width"), "height": data.get("height"),
+                "text": data.get("text", []), "nodes": data.get("nodes", []),
+                "paint_count": len(data.get("paint", []))}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+
+
+def _persist_ui_snapshot():
+    """Persistiert die aktuelle In-memory-Surface nach last_ui.json (nach tap/key-Aenderung)."""
+    surf = _LAST_UI.get("surface")
+    if surf is None:
+        return None
+    try:
+        from core.java.surface import snapshot as _ui_snapshot
+        snap = _ui_snapshot(surf)
+        os.makedirs(_GLASS_SESSION_FOLDER, exist_ok=True)
+        with open(os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json"), "w", encoding="utf-8") as f:
+            json.dump(snap, f, ensure_ascii=False, indent=1)
+        return snap
+    except Exception:
+        return None
+
+
+def native_ui_detect(ctx, studio_root=None):
+    """Gläsern/read-only: erkennt das UI-Toolkit einer entpackten App (klassisch/Compose/RN/Flutter)
+    und nennt den passenden Render-Produzenten. Rueckgabe: {ok, runtime, producer, has_producer}."""
+    try:
+        import core.java.canvas_recorder, core.java.rn_producer, core.java.skia_recorder, core.java.rn_js_bridge, core.java.rn_hermes_bridge  # noqa
+        from core.java.runtime_detect import producer_for_app
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Erkennung nicht verfuegbar: {e!r}"}
+    root = studio_root or (ctx.get("studio_root") if isinstance(ctx, dict) else None)
+    try:
+        key, prod = producer_for_app(app_dir=root)
+        return {"ok": True, "runtime": key, "producer": key if prod is not None else None,
+                "has_producer": prod is not None,
+                "hinweis": "klassisch laeuft direkt ueber den ViewTree/Debugger" if prod is None else None}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+
+
+def native_ui_render(ctx, path=None, title=None):
+    """Gläsern: rendert die zuletzt gläserne UI zu PNG (am Ende kommt echte Grafik raus). Nutzt die
+    lebende In-memory-Surface (reflektiert tap/key), sonst die gespeicherte paint-Liste aus
+    last_ui.json. Rueckgabe: {ok, path, bytes, width, height}."""
+    try:
+        from tools.surface_raster import render_surface_to_png, render_paint_to_png
+    except Exception as e:
+        return {"ok": False, "hinweis": f"Rasterizer nicht verfuegbar: {e!r}"}
+    out = path or os.path.join(_GLASS_SESSION_FOLDER, "last_ui.png")
+    os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+    surf = _LAST_UI.get("surface")
+    try:
+        if surf is not None:
+            render_surface_to_png(surf, out, title=title or "glass UI")
+        else:
+            p2 = os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json")
+            if not os.path.isfile(p2):
+                return {"ok": True, "path": None, "hinweis": "noch kein native.glass_run gelaufen"}
+            with open(p2, encoding="utf-8") as f:
+                data = json.load(f)
+            render_paint_to_png(data.get("paint", []), out, title=title or "glass UI")
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+    try:
+        sz = os.path.getsize(out)
+    except Exception:
+        sz = None
+    w = h = None
+    if surf is not None:
+        try:
+            from core.java.surface import snapshot as _ui_snapshot
+            sn = _ui_snapshot(surf); w, h = sn.get("width"), sn.get("height")
+        except Exception:
+            pass
+    return {"ok": True, "path": out, "bytes": sz, "width": w, "height": h}
+
+
+def native_ui_tap(ctx, x, y):
+    """Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen. Persistiert
+    die neue Momentaufnahme. Rueckgabe: {ok, handled}."""
+    surf = _LAST_UI.get("surface")
+    if surf is None:
+        return {"ok": True, "handled": False, "hinweis": "noch kein native.glass_run gelaufen"}
+    try:
+        client = getattr(surf, "_hermes_client", None)
+        if client is not None:
+            # Echter Hermes-Pfad: Tap -> Event an Host -> Re-Commit -> neue Surface
+            res = client.tap(x, y)
+            new_surf = client.surface
+            if new_surf is not None:
+                try: new_surf._hermes_client = client
+                except Exception: pass
+                _LAST_UI["surface"] = new_surf
+            _persist_ui_snapshot()
+            return {"ok": True, "handled": bool(res.get("handled")), "tag": res.get("tag")}
+        from core.java.surface import tap as _tap
+        res = _tap(surf, x, y)
+        _persist_ui_snapshot()
+        return {"ok": True, "handled": bool(res.get("handled"))}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+
+
+def native_ui_key(ctx, text, x=None, y=None):
+    """Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben. Im echten Hermes-Pfad mit
+    (x,y) -> onChangeText am Eingabefeld (sonst erstes Eingabefeld). Rueckgabe: {ok, handled}."""
+    surf = _LAST_UI.get("surface")
+    if surf is None:
+        return {"ok": True, "handled": False, "hinweis": "noch kein native.glass_run gelaufen"}
+    try:
+        client = getattr(surf, "_hermes_client", None)
+        if client is not None:
+            # Zielkoordinate: explizit, sonst Mitte des ersten Eingabefeldes (EditText/TextInput)
+            tx, ty = x, y
+            if tx is None or ty is None:
+                for n in surf.tree.nodes():
+                    cls = (getattr(n, "cls", "") or "").lower()
+                    if "edit" in cls or "input" in cls or getattr(n, "props", {}).get("hint"):
+                        b = n.bounds; tx, ty = b[0] + b[2] / 2, b[1] + b[3] / 2; break
+            if tx is None or ty is None:
+                return {"ok": True, "handled": False, "hinweis": "kein Eingabefeld gefunden"}
+            res = client.key(tx, ty, text)
+            new_surf = client.surface
+            if new_surf is not None:
+                try: new_surf._hermes_client = client
+                except Exception: pass
+                _LAST_UI["surface"] = new_surf
+            _persist_ui_snapshot()
+            return {"ok": True, "handled": bool(res.get("handled")), "tag": res.get("tag")}
+        from core.java.surface import key as _key
+        res = _key(surf, text)
+        _persist_ui_snapshot()
+        return {"ok": True, "handled": bool(res.get("handled"))}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+
+
+def native_net_log(ctx):
+    """Read-only: NetLog (Request/Response-Paare) des letzten native.glass_run lesen."""
+    import json
+    p = os.path.join(_GLASS_SESSION_FOLDER, "last_net_log.json")
+    if not os.path.isfile(p):
+        return {"ok": True, "net_log": [], "hinweis": "noch kein native.glass_run gelaufen"}
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        return {"ok": True, "net_log": data, "count": len(data)}
+    except Exception as e:
+        return {"ok": False, "hinweis": repr(e)}
+
+
+# ============================================================ I-Erweiterung: Statischer Flutter/Dart-API-Extractor
+def _resolve_app_root_for_extract(ctx, app_root=None):
+    if app_root and os.path.isdir(str(app_root)):
+        return str(app_root)
+    if ctx is not None and getattr(ctx, "cfg", None) is not None:
+        _, _, dirs = _unpacked_candidates(ctx)
+        if dirs:
+            return dirs[0]
+        src = ctx.cfg.paths.get("APP_SOURCE_DIR", "")
+        if src and os.path.isdir(src):
+            return src
+    return ""
+
+
+def api_extract_flutter_static(ctx, app_root=None):
+    """Liest rein statisch Cognito-/AppSync-GraphQL-/REST-Vorlagen aus flutter_assets & libapp.so (ohne Boot)."""
+    from services.flutter_api_extractor_service import FlutterApiExtractorService
+    root = _resolve_app_root_for_extract(ctx, app_root)
+    if not root:
+        return {"ok": False, "error": "Kein entpackter App-Root gefunden (app_root angeben oder APK entpacken)."}
+    extra = []
+    if ctx is not None and getattr(ctx, "cfg", None) is not None:
+        pkg = (ctx.cfg.config.get("APP_PACKAGE") or "").strip()
+        if pkg:
+            safe_p = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in pkg).strip("._") or "default.app"
+            sc = os.path.join(_REPO, "data", "vfs_selfcache", safe_p)
+            if os.path.isdir(sc):
+                extra.append(sc)
+    return FlutterApiExtractorService.extract_from_app_root(root, extra_lib_dirs=extra)
+
+
+def api_import_templates(ctx, templates_json, app_root=None):
+    """Uebernimmt ausgewaehlte statische API-Vorlagen in die API-Inspector-SQLite-DB (api_traffic.db)."""
+    from services.flutter_api_extractor_service import FlutterApiExtractorService
+    try:
+        items = json.loads(templates_json) if isinstance(templates_json, str) else templates_json
+    except Exception as e:
+        return {"ok": False, "error": f"Ungueltiges JSON: {e}"}
+    # Erlaubt Liste kompletter Vorlage-Dicts ODER Liste von Vorlage-IDs (z.B. ["tpl_1","tpl_2"])
+    if isinstance(items, list) and items and all(isinstance(x, str) for x in items):
+        scan = api_extract_flutter_static(ctx, app_root=app_root)
+        by_id = {t["id"]: t for t in (scan.get("templates") or ()) if isinstance(t, dict)}
+        resolved = [by_id[tid] for tid in items if tid in by_id]
+    elif isinstance(items, list):
+        resolved = [x for x in items if isinstance(x, dict)]
+    elif isinstance(items, dict):
+        resolved = [items]
+    else:
+        return {"ok": False, "error": "templates_json muss Array von IDs oder Vorlage-Objekten sein"}
+
+    db_path = ""
+    if ctx is not None and getattr(ctx, "cfg", None) is not None:
+        db_path = ctx.cfg.paths.get("API_DB", "")
+    if not db_path:
+        db_path = os.path.join(_REPO, "api_traffic.db")
+    n = FlutterApiExtractorService.import_templates_to_db(db_path, resolved)
+    return {"ok": True, "imported": n, "api_db": db_path}
+
+
+# ============================================================ N: LibCarve (Decompile & Patch Studio)
+def _lc_pkg_safe(ctx) -> str:
+    pkg = (ctx.cfg.config.get("APP_PACKAGE") if (ctx and getattr(ctx, "cfg", None)) else "") or "default.app"
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(pkg).strip()).strip("._") or "default.app"
+
+
+def _lc_discover(ctx) -> list:
+    libs = []
+    seen = set()
+    if ctx is not None and getattr(ctx, "cfg", None) is not None:
+        src_dir = ctx.cfg.paths.get("APP_SOURCE_DIR", "")
+        if src_dir and os.path.isdir(src_dir):
+            for unp in ("base_unpacked_apkeditor", "base_unpacked_apktool"):
+                lroot = os.path.join(src_dir, unp, "lib")
+                if not os.path.isdir(lroot):
+                    continue
+                for abi in sorted(os.listdir(lroot)):
+                    ad = os.path.join(lroot, abi)
+                    if not os.path.isdir(ad):
+                        continue
+                    for fn in sorted(os.listdir(ad)):
+                        if fn.endswith(".so"):
+                            fp = os.path.join(ad, fn)
+                            if fp not in seen:
+                                seen.add(fp)
+                                libs.append({"name": fn, "abi": abi, "source": "apk", "path": fp})
+    sc_dir = os.path.join(_REPO, "data", "vfs_selfcache", _lc_pkg_safe(ctx))
+    if os.path.isdir(sc_dir):
+        for fn in sorted(os.listdir(sc_dir)):
+            if fn.endswith(".so"):
+                fp = os.path.join(sc_dir, fn)
+                if fp not in seen:
+                    seen.add(fp)
+                    libs.append({"name": fn, "abi": "arm64-v8a", "source": "self_cache", "path": fp})
+    return libs
+
+
+def _lc_resolve_so_and_index(ctx, path_or_name: str, need_index: bool = True):
+    from core.native.loader import ElfImage
+    from core.native.nindex import NativeIndex
+
+    p = str(path_or_name or "").strip()
+    if p and os.path.isfile(p):
+        so_path = os.path.abspath(p)
+    else:
+        bn = os.path.basename(p)
+        cands = _lc_discover(ctx)
+        hit = next((c for c in cands if c["name"] == bn or c["path"] == p), None)
+        so_path = hit["path"] if hit else ""
+    if not so_path or not os.path.isfile(so_path):
+        return None, None, None
+    img = ElfImage.from_file(so_path)
+    if not need_index:
+        return so_path, img, None
+    cache_dir = os.path.join(_REPO, "data", "native", "_libcarve")
+    idx = NativeIndex().build(img, cache_dir=cache_dir, fast=True)
+    return so_path, img, idx
+
+
+def _lc_resolve_addr(img, idx, func_or_addr) -> Optional[int]:
+    s = str(func_or_addr or "").strip()
+    if not s:
+        return None
+    if s.startswith("0x") or s.isdigit():
+        try:
+            return int(s, 0)
+        except Exception:
+            pass
+    if s in img.dynsyms:
+        return int(img.dynsyms[s].value)
+    if s.startswith("sub_"):
+        try:
+            return int(s[4:], 16)
+        except Exception:
+            pass
+    if idx is not None:
+        low = s.lower()
+        for a, nm in idx.syms:
+            if nm.lower() == low:
+                return int(a)
+        for a, nm in idx.syms:
+            if low in nm.lower():
+                return int(a)
+    return None
+
+
+def libcarve_libs(ctx):
+    from core.native.loader import ElfImage
+    out = []
+    for item in _lc_discover(ctx):
+        entry = dict(item)
+        try:
+            entry["elf"] = ElfImage.from_file(item["path"]).elf_summary()
+        except Exception as e:
+            entry["elf_error"] = repr(e)
+        out.append(entry)
+    return {"ok": True, "count": len(out), "libs": out}
+
+
+def libcarve_outline(ctx, path, filter="", limit=500):
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    flt = (filter or "").strip().lower()
+    rows = []
+    for a, nm, kind in idx.func_catalog:
+        if flt and flt not in nm.lower() and flt not in f"0x{a:x}":
+            continue
+        rows.append({"kind": kind, "name": nm, "vaddr": f"0x{a:x}"})
+        if len(rows) >= int(limit):
+            break
+    return {
+        "ok": True, "path": so_p, "total_funcs": len(idx.func_catalog),
+        "imports_count": len(idx.imports), "imports_preview": idx.imports[:80],
+        "functions": rows, "elf": img.elf_summary(),
+    }
+
+
+def libcarve_search(ctx, path, term, mode="func", limit=200):
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    m = (mode or "func").strip().lower()
+    t = str(term or "").strip()
+    lim = int(limit)
+    hits = []
+    if m == "addr":
+        a = int(t, 0)
+        hits = [{"vaddr": f"0x{a:x}", "func": idx.func_at(a) or f"0x{a:x}"}]
+    elif m == "func":
+        low = t.lower()
+        for a, nm in idx.syms:
+            if low in nm.lower():
+                hits.append({"vaddr": f"0x{a:x}", "name": nm})
+                if len(hits) >= lim:
+                    break
+    elif m == "str":
+        low = t.lower()
+        for a, s in idx.extract_strings(img):
+            if low in s.lower():
+                hits.append({"vaddr": f"0x{a:x}", "text": s[:200]})
+                if len(hits) >= lim:
+                    break
+    elif m == "asm":
+        for src, mn, tgt in idx.search(t.lower(), limit=lim):
+            hits.append({"vaddr": f"0x{src:x}", "func": idx.func_at(src) or "?", "mnem": mn, "target": f"0x{tgt:x}"})
+    elif m == "aob":
+        for a in idx.search_aob(img, t, exec_only=False, limit=lim):
+            hits.append({"vaddr": f"0x{a:x}", "func": idx.func_at(a) or f"0x{a:x}"})
+    return {"ok": True, "mode": m, "count": len(hits), "hits": hits}
+
+
+def libcarve_inspect_func(ctx, path, func_or_addr, max_insns=200):
+    from core.native.engine_arm64 import Arm64Decoder
+    from services.libcarve_pattern_service import LibCarvePatternService
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    addr = _lc_resolve_addr(img, idx, func_or_addr)
+    if addr is None:
+        return {"ok": False, "error": f"Ziel nicht gefunden: {func_or_addr}"}
+    fs, fe = idx.func_bounds(addr)
+    fn = idx.func_at(addr) or f"sub_{fs:x}"
+    span = min(max(4, fe - fs), int(max_insns) * 4)
+    raw = img.read_vaddr(fs, span)
+    md = Arm64Decoder()._md
+    disasm = [f"0x{a:08x}: {mn} {op}" for a, _sz, mn, op in md.disasm_lite(raw, fs)]
+    sig = LibCarvePatternService.generate_signature(img, idx, fs, byte_len=32)
+
+    sha = sha8(so_p)
+    gh_c_path = os.path.join(_REPO, "data", "native", "_libcarve", "ghidra", sha, f"func_{fs:x}.c")
+    ghidra_c = open(gh_c_path, "r", encoding="utf-8", errors="replace").read() if os.path.isfile(gh_c_path) else None
+    anno_p = os.path.join(_REPO, "data", "libcarve", _lc_pkg_safe(ctx), "annotations.json")
+    anno = NativeAnnotationsService(anno_p).get(sha, f"0x{fs:x}") if os.path.isfile(anno_p) else None
+
+    return {
+        "ok": True,
+        "path": so_p,
+        "func": fn,
+        "vaddr": f"0x{fs:x}",
+        "end": f"0x{fe:x}",
+        "orig_size": max(0, fe - fs),
+        "disasm": disasm,
+        "ghidra_c": ghidra_c,
+        "signature": sig,
+        "annotation": anno,
+    }
+
+
+def libcarve_decompile(ctx, path, func_or_addr, run=False):
+    from services.ghidra_service import GhidraService
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    addr = _lc_resolve_addr(img, idx, func_or_addr)
+    if addr is None:
+        return {"ok": False, "error": f"Funktion nicht gefunden: {func_or_addr}"}
+    fs, _fe = idx.func_bounds(addr)
+    ws_dir = os.path.join(_REPO, "data", "native", "_libcarve")
+    sha = sha8(so_p)
+    out_c = os.path.join(ws_dir, "ghidra", sha, f"func_{fs:x}.c")
+    if os.path.isfile(out_c):
+        return {"ok": True, "cached": True, "vaddr": f"0x{fs:x}", "c": open(out_c, "r", encoding="utf-8", errors="replace").read()}
+    if not run:
+        return {"ok": True, "cached": False, "vaddr": f"0x{fs:x}", "hinweis": "Noch nicht gecacht — mit run=true Ghidra-Lauf im Hintergrund starten."}
+    cfg = ctx.cfg if (ctx and getattr(ctx, "cfg", None)) else None
+    svc = GhidraService(cfg)
+    if not svc.available():
+        return {"ok": False, "why": "no_ghidra"}
+    threading.Thread(target=lambda: svc.decompile(so_p, fs, ws_dir), daemon=True).start()
+    return {"ok": True, "started": True, "vaddr": f"0x{fs:x}", "hinweis": "Ghidra im Hintergrund gestartet — gleich erneut ohne run abfragen."}
+
+
+def libcarve_xrefs(ctx, path, func_or_addr, limit=200):
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    addr = _lc_resolve_addr(img, idx, func_or_addr)
+    if addr is None:
+        return {"ok": False, "error": f"Adresse nicht gefunden: {func_or_addr}"}
+    refs = [{"site": f"0x{s:x}", "mnem": m, "caller": idx.func_at(s) or f"0x{s:x}"} for s, m in idx.xrefs_to(addr, limit=int(limit))]
+    return {"ok": True, "target": f"0x{addr:x}", "count": len(refs), "xrefs": refs}
+
+
+def libcarve_callgraph(ctx, path, func_or_addr, depth=2):
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    addr = _lc_resolve_addr(img, idx, func_or_addr)
+    if addr is None:
+        return {"ok": False, "error": f"Adresse nicht gefunden: {func_or_addr}"}
+    fs, _fe = idx.func_bounds(addr)
+    edges = []
+    seen = set()
+    def _walk(a, d):
+        if d <= 0 or a in seen:
+            return
+        seen.add(a)
+        s0, e0 = idx.func_bounds(a)
+        fn0 = idx.func_at(s0) or f"sub_{s0:x}"
+        for src, mn, tgt, cname in idx.outgoing_from(s0, e0, limit=80):
+            edges.append({"from": fn0, "from_addr": f"0x{s0:x}", "site": f"0x{src:x}", "mnem": mn, "to": cname, "to_addr": f"0x{tgt:x}"})
+            if d > 1:
+                _walk(tgt, d - 1)
+    _walk(fs, max(1, min(4, int(depth))))
+    return {"ok": True, "root": f"0x{fs:x}", "edge_count": len(edges), "edges": edges}
+
+
+def libcarve_datagraph(ctx, path, func_or_addr, limit=200):
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    addr = _lc_resolve_addr(img, idx, func_or_addr)
+    if addr is None:
+        return {"ok": False, "error": f"Adresse nicht gefunden: {func_or_addr}"}
+    fs, fe = idx.func_bounds(addr)
+    refs = idx.datagraph_for(img, fs, fe, limit=int(limit))
+    for r in refs:
+        r["site"] = f"0x{r['site']:x}"
+        r["target"] = f"0x{r['target']:x}"
+    return {"ok": True, "func": idx.func_at(fs) or f"sub_{fs:x}", "count": len(refs), "refs": refs}
+
+
+def libcarve_match_pattern(ctx, path, patch_json):
+    from services.libcarve_pattern_service import LibCarvePatternService
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    patch = json.loads(patch_json) if isinstance(patch_json, str) else dict(patch_json)
+    res = LibCarvePatternService.match_patch(img, idx, patch)
+    if res.get("vaddr") is not None:
+        res["vaddr"] = f"0x{res['vaddr']:x}"
+    for c in res.get("candidates") or ():
+        if isinstance(c.get("vaddr"), int):
+            c["vaddr"] = f"0x{c['vaddr']:x}"
+    return res
+
+
+def libcarve_session_get(ctx):
+    from services.ki_workspace_sync_service import KiWorkspaceSyncService
+    return KiWorkspaceSyncService(_REPO).read_workspace_sync()
+
+
+def libcarve_assemble_preview(ctx, code, mode="asm", vaddr=0, orig_size=0, func_name="carve_entry"):
+    from services.libcarve_compiler_service import LibCarveCompilerService
+    cfg = (ctx.cfg.config if (ctx and getattr(ctx, "cfg", None)) else {}) or {}
+    va = int(vaddr, 0) if isinstance(vaddr, str) and vaddr else int(vaddr or 0)
+    m = str(mode or "asm").lower()
+    if m == "c_cave":
+        res = LibCarveCompilerService.compile_c_cave(code, cave_vaddr=(va or 0x100000), func_name=func_name, cfg=cfg)
+    else:
+        res = LibCarveCompilerService.assemble_arm64(code, vaddr=va, orig_size=int(orig_size or 0), auto_nop=True, cfg=cfg)
+    out = dict(res)
+    out.pop("bytes", None)  # hex ist bereits JSON-freundlich enthalten
+    return out
+
+
+def libcarve_patch_list(ctx):
+    out = []
+    for idx, p in enumerate(SessionState.active_libcarve_patches):
+        item = dict(p)
+        item["index"] = idx
+        out.append(item)
+    return {"ok": True, "count": len(out), "patches": out}
+
+
+def libcarve_patch_add(ctx, file, vaddr_or_func, code, mode="asm", description="", abi="arm64-v8a", orig_size=0, aob=""):
+    from services.libcarve_compiler_service import LibCarveCompilerService
+    from services.libcarve_pattern_service import LibCarvePatternService
+
+    cfg = (ctx.cfg.config if (ctx and getattr(ctx, "cfg", None)) else {}) or {}
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, file, need_index=True)
+    va = None
+    fn = str(vaddr_or_func or "").strip()
+    if img is not None and idx is not None:
+        va = _lc_resolve_addr(img, idx, vaddr_or_func)
+        if va is not None:
+            fs, fe = idx.func_bounds(va)
+            if not int(orig_size or 0):
+                orig_size = max(0, fe - fs)
+            fn = idx.func_at(va) or fn
+            if not aob:
+                sig = LibCarvePatternService.generate_signature(img, idx, va, byte_len=32)
+                aob = sig.get("aob", "")
+    elif fn.startswith("0x") or fn.isdigit():
+        va = int(fn, 0)
+
+    if va is None:
+        return {"ok": False, "error": f"Zieladresse '{vaddr_or_func}' in '{file}' nicht aufloesbar."}
+
+    m = str(mode or "asm").lower()
+    if m == "asm":
+        chk = LibCarveCompilerService.assemble_arm64(code, vaddr=va, orig_size=int(orig_size or 0), auto_nop=True, cfg=cfg)
+        if not chk.get("ok"):
+            return {"ok": False, "error": chk.get("error", "ASM-Compile-Fehler")}
+
+    patch = {
+        "type": "libcarve",
+        "file": os.path.basename(file),
+        "abi": abi or "arm64-v8a",
+        "vaddr": f"0x{va:x}",
+        "func": fn,
+        "orig_size": int(orig_size or 0),
+        "mode": m,
+        "auto_nop": True,
+        "orig": "",
+        "edit": code,
+        "orig_hex": img.read_vaddr(va, 32).hex(" ") if img is not None else "",
+        "aob": aob,
+        "description": description or f"LibCarve {os.path.basename(file)}@{f'0x{va:x}'}",
+    }
+    SessionState.active_libcarve_patches.append(patch)
+    persisted = _persist_active(ctx) if ctx is not None else False
+    return {"ok": True, "index": len(SessionState.active_libcarve_patches) - 1, "patch": patch, "persisted": persisted}
+
+
+def libcarve_patch_update(ctx, index, code="", mode="", description=""):
+    i = int(index)
+    if not (0 <= i < len(SessionState.active_libcarve_patches)):
+        return {"ok": False, "error": f"Ungueltiger LibCarve-Patch-Index: {i}"}
+    p = SessionState.active_libcarve_patches[i]
+    if code:
+        p["edit"] = code
+    if mode:
+        p["mode"] = str(mode).lower()
+    if description:
+        p["description"] = description
+    persisted = _persist_active(ctx) if ctx is not None else False
+    return {"ok": True, "index": i, "patch": p, "persisted": persisted}
+
+
+def libcarve_patch_remove(ctx, index):
+    i = int(index)
+    if not (0 <= i < len(SessionState.active_libcarve_patches)):
+        return {"ok": False, "error": f"Ungueltiger LibCarve-Patch-Index: {i}"}
+    rem = SessionState.active_libcarve_patches.pop(i)
+    persisted = _persist_active(ctx) if ctx is not None else False
+    return {"ok": True, "removed": rem.get("vaddr"), "count": len(SessionState.active_libcarve_patches), "persisted": persisted}
+
+
+def libcarve_cave_save(ctx, name, code, file="", vaddr=""):
+    d = os.path.join(_REPO, "data", "libcarve", _lc_pkg_safe(ctx))
+    os.makedirs(d, exist_ok=True)
+    cf = os.path.join(d, "_caves.json")
+    cur = []
+    if os.path.isfile(cf):
+        try:
+            cur = json.load(open(cf, "r", encoding="utf-8"))
+        except Exception:
+            cur = []
+    entry = {"name": str(name).strip(), "file": str(file), "vaddr": str(vaddr), "code": str(code)}
+    cur.append(entry)
+    with open(cf, "w", encoding="utf-8") as fh:
+        json.dump(cur, fh, indent=2, ensure_ascii=False)
+    return {"ok": True, "count": len(cur), "file": cf}
+
+
+def libcarve_annotate(ctx, path, func_or_addr, name, note=""):
+    so_p, img, idx = _lc_resolve_so_and_index(ctx, path, need_index=True)
+    if not so_p:
+        return {"ok": False, "error": f"Bibliothek nicht gefunden: {path}"}
+    addr = _lc_resolve_addr(img, idx, func_or_addr)
+    if addr is None:
+        return {"ok": False, "error": f"Adresse nicht gefunden: {func_or_addr}"}
+    sha = sha8(so_p)
+    anno_p = os.path.join(_REPO, "data", "libcarve", _lc_pkg_safe(ctx), "annotations.json")
+    NativeAnnotationsService(anno_p).set(sha, f"0x{addr:x}", str(name).strip(), str(note or "").strip())
+    return {"ok": True, "sha": sha, "vaddr": f"0x{addr:x}", "name": name}
+
+
+def libcarve_gui_focus(ctx, lib="", vaddr="", draft_code="", mode="asm"):
+    from services.ki_workspace_sync_service import KiWorkspaceSyncService
+    staged = {
+        "libcarve_draft": {
+            "lib": str(lib or ""),
+            "vaddr": str(vaddr or ""),
+            "code": str(draft_code or ""),
+            "mode": str(mode or "asm"),
+        }
+    }
+    sync_res = KiWorkspaceSyncService(_REPO).stage_from_ki(staged)
+    q = native_glass_control(ctx, "open_libcarve", json.dumps(staged["libcarve_draft"]))
+    return {"ok": True, "staged": sync_res, "gui_cmd": q}
+
+
+def libcarve_session_set(ctx, staged_json, base_seq=None):
+    from services.ki_workspace_sync_service import KiWorkspaceSyncService
+    staged = json.loads(staged_json) if isinstance(staged_json, str) else dict(staged_json or {})
+    return KiWorkspaceSyncService(_REPO).stage_from_ki(staged, base_seq=base_seq)
+
+
+def libcarve_compile(ctx, file, abi="arm64-v8a"):
+    from services.libcarve_compiler_service import LibCarveCompilerService
+    cfg = (ctx.cfg.config if (ctx and getattr(ctx, "cfg", None)) else {}) or {}
+    bn = os.path.basename(str(file or "").strip())
+    plist = [p for p in SessionState.active_libcarve_patches if os.path.basename(p.get("file", "")) == bn]
+    if not plist:
+        return {"ok": False, "error": f"Keine aktiven LibCarve-Patches fuer {bn}"}
+    so_p, img, _idx = _lc_resolve_so_and_index(ctx, bn, need_index=False)
+    if img is None:
+        return {"ok": False, "error": f"Basis-.so '{bn}' nicht gefunden"}
+    pkg = (ctx.cfg.config.get("APP_PACKAGE") if (ctx and getattr(ctx, "cfg", None)) else "") or "default.app"
+    ok, out_path, reports = LibCarveCompilerService.compile_to_workspace_cache(
+        _REPO, pkg, abi or "arm64-v8a", bn, img.data, plist, cfg=cfg
+    )
+    return {"ok": ok, "out_path": out_path, "reports": reports}

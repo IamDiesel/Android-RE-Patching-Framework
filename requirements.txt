@@ -3,3 +3,4 @@ frida-tools
 mcp
 
 capstone>=5.0
+pillow>=10.0.0

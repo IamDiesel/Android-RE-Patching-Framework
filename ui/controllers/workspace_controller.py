@@ -115,6 +115,29 @@ class WorkspaceController:
 
         threading.Thread(target=task, daemon=True).start()
 
+    def run_stage(self):
+        """AP1.2: Schnelles Staging in destination/ OHNE APK-Repack (Sekunden) fuer die Emulation."""
+        if self.app.check_lock(): return
+        self._sync_state()
+        self._disable_build_buttons()
+        self.app.log("\n=== STAGE -> DESTINATION (Emulation) ===")
+
+        def task():
+            try:
+                self.app.is_unpacking = True
+                success = self.app.engine.run_stage_destination()
+                if success:
+                    self.app.after(0, lambda: messagebox.showinfo(
+                        "Stage", "Destination ist emulationsbereit (Zone 'patched')."))
+            except Exception as e:
+                self.app.log(f"[!] Fehler im Stage-Thread: {e}")
+            finally:
+                self.app.is_unpacking = False
+                self.app.after(0, self._enable_build_buttons)
+
+        import threading
+        threading.Thread(target=task, daemon=True).start()
+
     def run_flash(self):
         if self.app.check_lock(): return
         self._disable_build_buttons()
@@ -218,15 +241,47 @@ class WorkspaceController:
 
     def save_current_as_favorite(self):
         name = simpledialog.askstring("Favorit sichern", "Gib einen Namen für diesen Favoriten ein:")
-        if not name: return
+        if not name or not name.strip(): return
+        name = name.strip()
 
-        active_patches = self.view.get_all_patches()
+        active_patches = self.view.get_all_patches(include_libforge=True)
         if not active_patches:
             return messagebox.showwarning("Leer", "Es gibt aktuell keine aktiven Patches zum Sichern.")
 
         fav_service = get_shared_favorites(self.app)
+        existing_idx = next((i for i, f in enumerate(fav_service.favs) if f.get("name") == name), None)
+        if existing_idx is not None:
+            ans = messagebox.askyesnocancel(
+                "Favorit existiert bereits",
+                f"Ein Favorit namens '{name}' existiert bereits.\n\n"
+                "Ja = Aktive Patches an bestehenden Favoriten anhängen\n"
+                "Nein = Bestehenden Favoriten überschreiben\n"
+                "Abbrechen = Vorgang abbrechen",
+            )
+            if ans is None:
+                return
+            if ans:
+                ex_fav = fav_service.favs[existing_idx]
+                ex_patches = ex_fav.setdefault("patches", [])
+                ex_patches.extend(active_patches)
+                ex_fav["date"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                fav_service.save_favs()
+                return messagebox.showinfo("Aktualisiert", f"{len(active_patches)} Patch(es) an Favorit '{name}' angehängt!")
+            fav_service.favs[existing_idx] = {
+                "name": name,
+                "version": str(fav_service.favs[existing_idx].get("version") or "1.0"),
+                "description": f"[v{fav_service.favs[existing_idx].get('version') or '1.0'}] Workspace-Bundle ({len(active_patches)} Patch(es))",
+                "comment": "Aktualisiert am " + datetime.datetime.now().strftime('%Y-%m-%d'),
+                "date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "patches": active_patches,
+            }
+            fav_service.save_favs()
+            return messagebox.showinfo("Überschrieben", f"Favorit '{name}' mit {len(active_patches)} Patches aktualisiert!")
+
         new_fav = {
             "name": name,
+            "version": "1.0",
+            "description": f"[v1.0] Workspace-Bundle ({len(active_patches)} Patch(es))",
             "comment": "Gesichert am " + datetime.datetime.now().strftime('%Y-%m-%d'),
             "date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             "patches": active_patches

@@ -106,7 +106,7 @@ def test_resolver_real_smali():
     cls, path = _find_sample_class(jni)
     if not cls:
         pytest.skip("kein Smali-Baum vorhanden")
-    assert jni._class_file(cls) == path
+    assert os.path.normpath(jni._class_file(cls)) == os.path.normpath(path)
     assert jni._class_file("does/not/Exist___") is None
     # Erste echte Methode der Klasse finden und aufloesen
     import re
@@ -162,3 +162,33 @@ def test_getversion_and_getjavavm_direct():
     eng.cpu.x[1] = 0x73000
     _fire(eng, ffi, tr, "GetJavaVM")
     assert int.from_bytes(eng.cpu.m.rb(0x73000, 8), "little") == J.VM_OBJ
+
+
+# ---------- B3.1: FindClass("") -> NULL + Pending-Exception (ART-treu) ----------
+def test_findclass_empty_name_null_and_exception():
+    svc, eng, ffi, jni, tr = _mk()
+    eng.cpu.m.wb(0x70010, b"\x00")          # leerer Name
+    eng.cpu.x[1] = 0x70010
+    _fire(eng, ffi, tr, "FindClass")
+    assert eng.cpu.x[0] == 0, hex(eng.cpu.x[0])          # NULL
+    assert jni.st.pending_exc is not None
+    assert jni.st.pending_exc["type"] == "NoClassDefFoundError"
+    assert jni.get_calls()[-1].get("null") is True
+    _fire(eng, ffi, tr, "ExceptionCheck")
+    assert eng.cpu.x[0] == 1
+    _fire(eng, ffi, tr, "ExceptionOccurred")
+    assert eng.cpu.x[0] == jni.st.exc_handle and eng.cpu.x[0] != 0
+    _fire(eng, ffi, tr, "ExceptionClear")
+    assert jni.st.pending_exc is None
+    _fire(eng, ffi, tr, "ExceptionCheck")
+    assert eng.cpu.x[0] == 0
+
+
+def test_findclass_nonempty_still_returns_handle():
+    """Regression: nicht-leerer Name (auch Framework-Klasse) gibt weiter ein Handle, keine NULL."""
+    svc, eng, ffi, jni, tr = _mk()
+    eng.cpu.m.wb(0x70020, b"android/os/Build\x00")
+    eng.cpu.x[1] = 0x70020
+    _fire(eng, ffi, tr, "FindClass")
+    assert eng.cpu.x[0] != 0
+    assert jni.st.pending_exc is None

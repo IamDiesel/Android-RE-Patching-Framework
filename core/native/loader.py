@@ -54,6 +54,11 @@ class ElfImage:
     sections: Dict[str, dict] = field(default_factory=dict)   # name -> {offset,size,addr,type}
     dynsyms: Dict[str, Symbol] = field(default_factory=dict)  # name -> Symbol
     relocs: List = field(default_factory=list)                # (site_vaddr, target_vaddr, kind)
+    init: int = 0            # DT_INIT (vaddr des Konstruktors, 0 = keiner)
+    init_array: int = 0      # DT_INIT_ARRAY (vaddr der Zeiger-Tabelle)
+    init_arraysz: int = 0    # DT_INIT_ARRAYSZ (Groesse in Bytes)
+    needed: List[str] = field(default_factory=list)   # DT_NEEDED Abhaengigkeiten
+    soname: str = ""         # DT_SONAME
 
     # ---- Parsing ----------------------------------------------------------
     @classmethod
@@ -132,6 +137,10 @@ class ElfImage:
             _parse_dyn_relocs(img, data)
         except Exception:
             pass
+        try:
+            _parse_init_tags(img, data)
+        except Exception:
+            pass
         return img
 
     @classmethod
@@ -146,6 +155,58 @@ class ElfImage:
 
     def symbol(self, name: str) -> Optional[Symbol]:
         return self.dynsyms.get(name)
+
+    def vaddr_to_offset(self, vaddr: int) -> Optional[int]:
+        """Mappt eine virtuelle Adresse ueber PT_LOAD auf den Datei-Offset (oder None)."""
+        v = int(vaddr)
+        for seg in self.segments:
+            if seg.vaddr <= v < seg.vaddr + seg.filesz:
+                return seg.offset + (v - seg.vaddr)
+        return None
+
+    def offset_to_vaddr(self, offset: int) -> Optional[int]:
+        """Inverse Zuordnung Datei-Offset -> virtuelle Adresse (oder None)."""
+        off = int(offset)
+        for seg in self.segments:
+            if seg.offset <= off < seg.offset + seg.filesz:
+                return seg.vaddr + (off - seg.offset)
+        return None
+
+    def read_vaddr(self, vaddr: int, size: int) -> bytes:
+        """Liest bis zu `size` Dateibytes ab virtueller Adresse `vaddr`."""
+        v = int(vaddr)
+        n = max(0, int(size))
+        for seg in self.segments:
+            if seg.vaddr <= v < seg.vaddr + seg.filesz:
+                off = seg.offset + (v - seg.vaddr)
+                avail = min(n, (seg.offset + seg.filesz) - off)
+                return self.data[off:off + avail]
+        return b""
+
+    def elf_summary(self) -> dict:
+        """Kompakte ELF-Metadaten fuer LibCarve & MCP (inkl. 16-KB-Alignment-Check)."""
+        aligns = [int(s.align) for s in self.segments if getattr(s, "align", 0)]
+        max_align = max(aligns, default=0)
+        has_wx = any((s.flags & (PF_W | PF_X)) == (PF_W | PF_X) for s in self.segments)
+        jni_on = self.dynsyms.get("JNI_OnLoad")
+        jni_exports = [n for n, sym in self.dynsyms.items() if sym.value and n.startswith("Java_")]
+        return {
+            "is_aarch64": bool(self.is_aarch64),
+            "entry": hex(self.entry),
+            "soname": self.soname or "",
+            "needed": list(self.needed),
+            "segment_count": len(self.segments),
+            "section_count": len(self.sections),
+            "dynsym_count": sum(1 for sym in self.dynsyms.values() if sym.value > 0),
+            "import_count": sum(1 for sym in self.dynsyms.values() if sym.value == 0 and sym.shndx == 0),
+            "reloc_count": len(self.relocs),
+            "max_align": max_align,
+            "is_16kb_aligned": max_align >= 16384 or (all((s.vaddr % 16384) == (s.offset % 16384) for s in self.segments) and max_align == 0),
+            "has_wx": has_wx,
+            "jni_onload": hex(jni_on.value) if jni_on else None,
+            "jni_export_count": len(jni_exports),
+            "size_bytes": len(self.data),
+        }
 
 
 # ---- Dynamische Relokationen (PT_DYNAMIC-basiert, auch bei gestrippten Libs) ----
@@ -248,3 +309,65 @@ def _parse_dyn_relocs(img, data):
                                 if in_load(tgt):
                                     img.relocs.append((a + b * 8, tgt, "reloc"))
                     addr += 63 * 8
+
+
+def _parse_init_tags(img, data):
+    """Liest DT_INIT (12), DT_INIT_ARRAY (25), DT_INIT_ARRAYSZ (27) aus PT_DYNAMIC.
+    So kann der Linker-Start die ELF-Konstruktoren (.init + .init_array) VOR JNI_OnLoad
+    ausfuehren -- genau wie der echte Android-Linker (dlopen)."""
+    e_phoff, = struct.unpack_from("<Q", data, 32)
+    e_phentsize, e_phnum = struct.unpack_from("<HH", data, 54)
+    dyn_off = dyn_sz = None
+    for i in range(e_phnum):
+        o = e_phoff + i * e_phentsize
+        if o + 56 > len(data):
+            break
+        p_type, = struct.unpack_from("<I", data, o)
+        if p_type == 2:  # PT_DYNAMIC
+            p_offset, = struct.unpack_from("<Q", data, o + 8)
+            p_filesz, = struct.unpack_from("<Q", data, o + 32)
+            dyn_off, dyn_sz = p_offset, p_filesz
+            break
+    if dyn_off is None:
+        return
+    needed_offs = []
+    soname_off = None
+    strtab_vaddr = None
+    strsz = 0
+    for k in range(dyn_sz // 16):
+        tag, val = struct.unpack_from("<qQ", data, dyn_off + k * 16)
+        if tag == 0:
+            break
+        if tag == 1:          # DT_NEEDED
+            needed_offs.append(int(val))
+        elif tag == 5:        # DT_STRTAB
+            strtab_vaddr = int(val)
+        elif tag == 10:       # DT_STRSZ
+            strsz = int(val)
+        elif tag == 12:       # DT_INIT
+            img.init = int(val)
+        elif tag == 14:       # DT_SONAME
+            soname_off = int(val)
+        elif tag == 25:       # DT_INIT_ARRAY
+            img.init_array = int(val)
+        elif tag == 27:       # DT_INIT_ARRAYSZ
+            img.init_arraysz = int(val)
+    if strtab_vaddr is not None and (needed_offs or soname_off is not None):
+        soff = _v2o(img, strtab_vaddr)
+        if soff is not None and soff < len(data):
+            max_end = min(len(data), soff + strsz) if strsz else len(data)
+            dynstr = data[soff:max_end]
+
+            def _read_dynstr(no: int) -> str:
+                if no < 0 or no >= len(dynstr):
+                    return ""
+                end = dynstr.find(b"\x00", no)
+                raw = dynstr[no:end] if end >= 0 else dynstr[no:]
+                return raw.decode("utf-8", "replace")
+
+            for no in needed_offs:
+                nm = _read_dynstr(no)
+                if nm and nm not in img.needed:
+                    img.needed.append(nm)
+            if soname_off is not None:
+                img.soname = _read_dynstr(soname_off)

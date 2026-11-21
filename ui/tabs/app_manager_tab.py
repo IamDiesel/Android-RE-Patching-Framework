@@ -171,18 +171,26 @@ class AppManagerTab(ttk.Frame):
                 self.listbox.insert(tk.END, pkg)
 
     def import_local_apk(self):
-        folderpath = filedialog.askdirectory(initialdir=self.source_dir, title="Ordner mit lokalen APKs auswählen (muss base.apk enthalten)")
+        folderpath = filedialog.askdirectory(initialdir=self.source_dir, title="App-Ordner mit APKs oder entpacktem Code auswählen")
         if not folderpath: return
 
-        if not os.path.exists(os.path.join(folderpath, "base.apk")):
+        if os.path.basename(folderpath) in ("base_unpacked_apktool", "base_unpacked_apkeditor"):
+            folderpath = os.path.dirname(folderpath)
+
+        has_base_apk = os.path.exists(os.path.join(folderpath, "base.apk"))
+        has_unpacked = any(
+            os.path.isdir(os.path.join(folderpath, d))
+            for d in ("base_unpacked_apktool", "base_unpacked_apkeditor")
+        )
+        if not has_base_apk and not has_unpacked:
             return messagebox.showerror("Fehler",
-                                        "Der ausgewählte Ordner muss zwingend die rohen APK-Dateien inkl. 'base.apk' enthalten (Nicht den entpackten Code-Ordner)!")
+                                        "Der ausgewählte Ordner muss entweder 'base.apk' oder bereits entpackten Code ('base_unpacked_apktool' / 'base_unpacked_apkeditor') enthalten!")
 
         pkg_name = os.path.basename(folderpath).replace(" ", "_")
         target_folder = os.path.join(self.source_dir, pkg_name)
         os.makedirs(target_folder, exist_ok=True)
 
-        self.log(f"[*] Importiere lokale APKs aus Ordner: {pkg_name}...")
+        self.log(f"[*] Importiere lokale App aus Ordner: {pkg_name}...")
         self.lbl_status.config(text=f"Importiere {pkg_name}...", foreground="blue")
         self.update_idletasks()
 
@@ -194,7 +202,14 @@ class AppManagerTab(ttk.Frame):
                     if os.path.abspath(src_file) != os.path.abspath(dst_file):
                         shutil.copy(src_file, dst_file)
 
-            self.log(f"[+] Lokale APKs erfolgreich nach source/{pkg_name}/ geladen.")
+            if not has_base_apk and has_unpacked and os.path.abspath(folderpath) != os.path.abspath(target_folder):
+                for d in ("base_unpacked_apktool", "base_unpacked_apkeditor"):
+                    src_sub = os.path.join(folderpath, d)
+                    dst_sub = os.path.join(target_folder, d)
+                    if os.path.isdir(src_sub):
+                        shutil.copytree(src_sub, dst_sub, dirs_exist_ok=True)
+
+            self.log(f"[+] Lokale App erfolgreich nach source/{pkg_name}/ geladen.")
 
             self.stat_workspace.config(text=f"🟢 Verzeichnis: source/{pkg_name}/")
             self.stat_arch.config(text=f"🟢 Architektur erkannt: LOCAL (Generisch)")

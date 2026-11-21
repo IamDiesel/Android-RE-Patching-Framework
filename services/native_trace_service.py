@@ -159,15 +159,45 @@ class NativeTraceService:
             pc = int(eng.cpu.pc) & _M64
             if pc == _SENT:
                 return {"ok": True, "done": True, "steps": steps, "pc": pc, "pc_hex": f"0x{pc:x}"}
+            _sv = getattr(eng, "_survive", None)
+            if _sv is not None and pc < _sv["min"]:
+                lr = int(eng.cpu.lr) & _M64
+                _sv["log"].append({"dead_pc": f"0x{pc:x}", "ret_to": f"0x{lr:x}", "steps": steps})
+                if len(_sv["log"]) >= _sv["cap"]:
+                    return {"ok": True, "survive_cap": True, "steps": steps,
+                            "pc": pc, "pc_hex": f"0x{pc:x}"}
+                if lr == pc or lr < _sv["min"] or lr == _SENT:
+                    return {"ok": True, "done": True, "survived_end": True, "steps": steps,
+                            "pc": lr, "pc_hex": f"0x{lr:x}"}
+                eng.cpu.pc = lr
+                continue
             if pc in bps and not (first and skip_first_bp):
                 return {"ok": True, "paused": True, "bp": pc, "steps": steps,
                         "pc": pc, "pc_hex": f"0x{pc:x}"}
             r = tick(eng)
             first = False
             if not r.get("ok"):
+                _sv2 = getattr(eng, "_survive", None)
+                if _sv2 is not None and len(_sv2["log"]) < _sv2["cap"]:
+                    _lr = int(eng.cpu.lr) & _M64
+                    _pc = int(eng.cpu.pc) & _M64
+                    _sv2["log"].append({"err": r.get("error"), "at": f"0x{_pc:x}",
+                                        "ret_to": f"0x{_lr:x}", "steps": steps})
+                    if _lr >= _sv2["min"] and _lr != _SENT and _lr != _pc:
+                        eng.cpu.pc = _lr
+                        continue
+                    return {"ok": True, "done": True, "survived_end": True, "steps": steps,
+                            "pc": _lr, "pc_hex": f"0x{_lr:x}"}
                 r["steps"] = steps
                 return r
             steps += 1
+            # G-OS-0: Syscall-Breakpoint -> an der Block-/Insn-Grenze pausieren
+            sb = getattr(eng.cpu, "_svc_break", None)
+            if sb is not None:
+                eng.cpu._svc_break = None
+                pcn = int(eng.cpu.pc) & _M64
+                return {"ok": True, "paused_syscall": True, "syscall": sb, "steps": steps,
+                        "pc": pcn, "pc_hex": f"0x{pcn:x}"}
             if r.get("done"):
                 return {"ok": True, "done": True, "steps": steps,
                         "pc": r["pc"], "pc_hex": r["pc_hex"]}
@@ -208,3 +238,107 @@ class NativeTraceService:
             d = json.load(f)
         tr = d.get("trace") or []
         return {"ok": True, "count": len(tr), "trace": tr}
+
+    # ---- CFF-Dispatch-Tracer (2D-vtable 0x137740) -----------------------
+    # Fassaden-Bereiche: Handles 0x55.., JNIEnv/JavaVM 0x66.., FFI-Stubs 0x7a..
+    _DISP_TAINT = ((0x55000000, 0x56000000), (0x66000000, 0x67000000),
+                   (0x7a000000, 0x7b000000))
+
+    @classmethod
+    def _disp_taint(cls, v):
+        v &= _M64
+        for a, b in cls._DISP_TAINT:
+            if a <= v < b:
+                return True
+        return False
+
+    def dispatch_trace_enable(self, eng, vt_base: int = 0x137740,
+                              lo: int = 0x136000, hi: int = 0x13a000,
+                              cap: int = 200000) -> dict:
+        """Read-Watchpoint auf die CFF-vtable-Region [lo,hi). Jeder 8-Byte-Read dort ist ein
+        Dispatch-Fetch und wird als {pc,slot,idx1,col,val,empty,val_taint,x19,x20,x20_taint}
+        an eng._disp['log'] protokolliert. Additiv, bit-neutral (nur Lesen). disable() stellt
+        die Originale wieder her."""
+        st = {"vt": int(vt_base), "lo": int(lo), "hi": int(hi), "cap": int(cap), "log": []}
+        eng._disp = st
+        eng._disp_orig = {}
+        m = eng.cpu.m
+        log = st["log"]
+        taint = self._disp_taint
+
+        def rec(ai, val):
+            if len(log) >= st["cap"]:
+                return
+            cpu = eng.cpu
+            off = ai - st["vt"]
+            idx1 = off // 0x7f0 if off >= 0 else -((-off) // 0x7f0 + 1)
+            col = (off - idx1 * 0x7f0) // 8
+            v = int(val) & _M64
+            x20 = int(cpu.x[20]) & _M64
+            log.append({"pc": int(getattr(cpu, "pc", 0) or 0) & _M64, "slot": ai, "idx1": idx1, "col": col,
+                        "val": v, "empty": (v == 0), "val_taint": taint(v),
+                        "x19": int(cpu.x[19]) & _M64, "x20": x20, "x20_taint": taint(x20)})
+
+        orig64 = getattr(m, "r64", None)
+        if orig64 is not None:
+            eng._disp_orig["r64"] = orig64
+
+            def w64(a):
+                val = orig64(a)
+                if st["lo"] <= a < st["hi"]:
+                    rec(a, val)
+                return val
+            m.r64 = w64
+
+        origr = getattr(m, "r", None)
+        if origr is not None:
+            eng._disp_orig["r"] = origr
+
+            def wr(a, sz):
+                val = origr(a, sz)
+                if sz == 8 and st["lo"] <= a < st["hi"]:
+                    rec(a, val)
+                return val
+            m.r = wr
+        return {"ok": True, "lo": hex(lo), "hi": hex(hi), "vt": hex(vt_base)}
+
+    def dispatch_trace_get(self, eng) -> list:
+        st = getattr(eng, "_disp", None)
+        return list(st["log"]) if st else []
+
+    def dispatch_trace_disable(self, eng) -> dict:
+        m = eng.cpu.m
+        for meth, orig in (getattr(eng, "_disp_orig", {}) or {}).items():
+            setattr(m, meth, orig)
+        eng._disp_orig = {}
+        return {"ok": True}
+
+    def dispatch_trace_summary(self, eng) -> dict:
+        """Kompakt: Anzahl Dispatches, leere Fetches (Trap-Kandidaten), getaintete, und die
+        ERSTE getaintete bzw. erste leere Stelle (= Divergenz-Kandidat)."""
+        log = self.dispatch_trace_get(eng)
+        empties = [e for e in log if e["empty"]]
+        tainted = [e for e in log if e.get("val_taint") or e.get("x20_taint")]
+        def hexify(e):
+            return None if e is None else {k: (hex(e[k]) if k in ("pc", "slot", "val", "x19", "x20") else e[k]) for k in e}
+        return {"dispatches": len(log), "empty_fetches": len(empties),
+                "tainted": len(tainted),
+                "first_tainted": hexify(tainted[0] if tainted else None),
+                "first_empty": hexify(empties[0] if empties else None)}
+
+    # ---- RASP Survival Mode (tote Anti-Tamper-Dispatches überleben) ------
+    def survive_enable(self, eng, min_pc: int = 0x1000, cap: int = 50000) -> dict:
+        """Sprünge auf tote Ziele (pc < min_pc, z.B. leere Vtable-Lücke -> 0) werden
+        protokolliert und per Rücksprung nach lr übersprungen statt zu crashen. So läuft der
+        Code HINTER der Anti-Tamper-Trap weiter und wird über FFI-/JNI-/Dispatch-Logs sichtbar.
+        Additiv; disable() schaltet zurück."""
+        eng._survive = {"min": int(min_pc), "cap": int(cap), "log": []}
+        return {"ok": True, "min": hex(min_pc), "cap": int(cap)}
+
+    def survive_get(self, eng) -> list:
+        st = getattr(eng, "_survive", None)
+        return list(st["log"]) if st else []
+
+    def survive_disable(self, eng) -> dict:
+        eng._survive = None
+        return {"ok": True}

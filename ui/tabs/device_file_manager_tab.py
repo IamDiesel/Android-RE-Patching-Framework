@@ -59,6 +59,23 @@ class DeviceFileManagerTab(ttk.Frame):
         ttk.Button(bot_frame, text="📁 Ordner hochladen", command=self.controller.upload_dir).pack(side="right", padx=2)
         ttk.Button(bot_frame, text="🗑 Löschen", command=self.on_delete).pack(side="right", padx=2)
 
+    def on_app_changed(self, pkg=None):
+        """Aktualisiert Paketauswahl und Standardpfad beim Wechsel der aktiven App."""
+        if not pkg:
+            return
+        try:
+            vals = list(self.cb_pkg.cget("values") or ())
+            if pkg not in vals:
+                vals.insert(0, pkg)
+                self.cb_pkg["values"] = vals
+            self.cb_pkg.set(pkg)
+            self.ent_path.delete(0, tk.END)
+            self.ent_path.insert(0, f"/data/data/{pkg}/")
+            if hasattr(self.controller, "current_path"):
+                self.controller.current_path = f"/data/data/{pkg}/"
+        except Exception:
+            pass
+
     def update_packages(self, pkgs):
         self.cb_pkg['values'] = pkgs
         current_app = self.app.cfg.config.get("APP_PACKAGE", "")

@@ -11,6 +11,7 @@ class SessionState:
     active_hex_patches: List[Dict[str, Any]] = []
     active_lib_replacements: List[Dict[str, Any]] = []
     active_smali_patches: List[Dict[str, Any]] = []
+    active_libcarve_patches: List[Dict[str, Any]] = []
 
     @classmethod
     def get_all_patches(cls) -> List[Dict[str, Any]]:
@@ -18,6 +19,7 @@ class SessionState:
         all_patches = []
         all_patches.extend(cls.active_hex_patches)
         all_patches.extend(cls.active_lib_replacements)
+        all_patches.extend(cls.active_libcarve_patches)
         all_patches.extend(cls.active_smali_patches)
         return all_patches
 
@@ -26,6 +28,7 @@ class SessionState:
         """Setzt die Session für einen neuen Workspace zurück."""
         cls.active_hex_patches.clear()
         cls.active_lib_replacements.clear()
+        cls.active_libcarve_patches.clear()
         cls.active_smali_patches.clear()
 
     # ---- Persistenz-Bruecke (prozessuebergreifende „Active Session") ----
@@ -38,10 +41,11 @@ class SessionState:
     @classmethod
     def load_patches(cls, patches: List[Dict[str, Any]]) -> None:
         """Setzt die aktiven Listen aus einer flachen Patch-Liste (aus active_session.json).
-        Aufteilung nach 'type': hex -> hex, lib_replace -> lib, sonst (smali/new_file) -> smali.
+        Aufteilung nach 'type': hex -> hex, lib_replace -> lib, libcarve -> libcarve, sonst (smali/new_file) -> smali.
         In-place-Clear erhaelt die Listen-Identitaet (GUI-Property zeigt weiter darauf)."""
         cls.active_hex_patches.clear()
         cls.active_lib_replacements.clear()
+        cls.active_libcarve_patches.clear()
         cls.active_smali_patches.clear()
         for p in (patches or []):
             t = p.get("type", "smali")
@@ -49,5 +53,7 @@ class SessionState:
                 cls.active_hex_patches.append(p)
             elif t == "lib_replace":
                 cls.active_lib_replacements.append(p)
+            elif t == "libcarve":
+                cls.active_libcarve_patches.append(p)
             else:  # smali, new_file
                 cls.active_smali_patches.append(p)

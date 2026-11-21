@@ -216,21 +216,31 @@ class NativeFfiService:
         return addr
 
     # ---- Imports verdrahten ---------------------------------------------
-    def wire_imports(self, eng, image) -> dict:
-        """Jeden Import auf eine Stub-Adresse biegen: GOT-Slot := Stub, Dispatcher setzen.
+    def wire_imports(self, eng, image, load_bias: int = 0,
+                     symbol_resolver: Optional[Callable[[str], int]] = None) -> dict:
+        """Jeden Import auf einen aufgeloesten Cross-Lib-Export oder Stub biegen: GOT-Slot setzen.
 
         Reihenfolge: zuerst ``apply_relocations`` (fuellt die internen Dispatch-Zeiger),
         dann ``wire_imports`` (fuellt die Import-Slots, die der Loader NULL laesst)."""
         st = self._st(eng)
         rels = self.import_relocs(image)
+        bias = int(load_bias) & _M64
         wired: List[dict] = []
         for site, name in rels:
-            addr = self.install_named_stub(eng, name)
+            addr = 0
+            if symbol_resolver is not None:
+                try:
+                    addr = int(symbol_resolver(name) or 0) & _M64
+                except Exception:
+                    addr = 0
+            if not addr:
+                addr = self.install_named_stub(eng, name)
+            eff_site = (int(site) + bias) & _M64
             try:
-                eng.mem.write(int(site), (addr & _M64).to_bytes(8, "little"))
+                eng.mem.write(eff_site, (addr & _M64).to_bytes(8, "little"))
             except Exception:
                 continue
-            wired.append({"site": int(site), "name": name, "stub": addr})
+            wired.append({"site": eff_site, "name": name, "stub": addr})
         return {"ok": True, "count": len(wired), "unique": len(st.by_name),
                 "names": sorted(st.by_name.keys()), "wired": wired}
 
@@ -264,3 +274,44 @@ class NativeFfiService:
         c = Counter(e["name"] for e in st.log)
         return {"imports": len(st.by_name), "calls": len(st.log),
                 "by_name": dict(c)}
+
+    # ---- Syscall-Layer (rohe svc der RASP) ------------------------------
+    def install_syscall_hook(self, eng, returns=None, default_ret=0, max_log=100000):
+        """svc-Handler mit Policy. ``returns`` = {nr: ret | {"ret":int, "zero_arg":idx, "zero_len":n}};
+        ``zero_arg`` fuellt den Puffer in x[idx] mit Nullen (z.B. statbuf bei newfstatat). Nicht
+        gelistete Syscalls -> ``default_ret``. Jeder svc wird nach eng._svc_log protokolliert."""
+        log = []
+        eng._svc_log = log
+        pol = {}
+        for k, v in dict(returns or {}).items():
+            try:
+                pol[int(k)] = v
+            except Exception:
+                pass
+        dflt = int(default_ret)
+
+        def hook(cpu):
+            nr = int(cpu.x[8]) & _M64
+            args = [int(cpu.x[i]) & _M64 for i in range(6)]
+            spec = pol.get(nr)
+            if isinstance(spec, dict):
+                val = int(spec.get("ret", dflt))
+                za = spec.get("zero_arg")
+                if za is not None:
+                    try:
+                        cpu.m.wb(int(cpu.x[int(za)]) & _M64, b"\x00" * int(spec.get("zero_len", 128)))
+                    except Exception:
+                        pass
+            elif spec is not None:
+                val = int(spec)
+            else:
+                val = dflt
+            cpu.x[0] = val & _M64
+            if len(log) < max_log:
+                log.append({"nr": nr, "args": args,
+                            "pc": int(getattr(cpu, "pc", 0) or 0) & _M64, "ret": cpu.x[0]})
+        eng.cpu._svc_hook = hook
+        return {"ok": True, "policy_size": len(pol)}
+
+    def get_syscall_log(self, eng):
+        return list(getattr(eng, "_svc_log", []))

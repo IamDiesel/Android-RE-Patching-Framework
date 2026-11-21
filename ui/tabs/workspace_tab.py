@@ -9,6 +9,7 @@ from core.application.event_bus import EventBus
 from core.domain.exceptions import PatchConflictException
 from ui.controllers.workspace_controller import WorkspaceController
 from ui.tabs.lib_forge_tab import LibForgeTab
+from ui.tabs.lib_carve_tab import LibCarveTab
 
 
 class WorkspaceTab(ttk.Frame):
@@ -74,37 +75,77 @@ class WorkspaceTab(ttk.Frame):
         btn.config(command=lambda: self.toggle_dock(parent, title, widget_to_dock, target_paned, weight, btn))
 
     def toggle_dock(self, container_frame, title, inner_widget, target_paned, weight, btn):
-        if hasattr(container_frame, "_is_undocked") and container_frame._is_undocked:
+        """Fenster als eigenstaendiges OS-Fenster ab-/andocken (wm manage).
+        Wichtig: nach `wm manage` MUESSEN deiconify + update_idletasks + lift folgen, sonst
+        erscheint auf Windows kein sichtbares Fenster und der Paned-Bereich waechst nur.
+        Beim Andocken wird exakt an der alten Position wieder eingefuegt."""
+        if getattr(container_frame, "_is_undocked", False):
+            # --- ANDOCKEN ---
             try:
                 container_frame.tk.call('wm', 'forget', container_frame._w)
-            except:
+            except Exception:
                 pass
-            btn.config(text="⧉ Abdocken")
-            target_paned.add(container_frame, weight=weight)
             container_frame._is_undocked = False
-        else:
-            target_paned.forget(container_frame)
+            btn.config(text="\u29c9 Abdocken")
+            idx = getattr(container_frame, "_dock_index", None)
             try:
-                container_frame.tk.call('wm', 'manage', container_frame._w)
-                container_frame.tk.call('wm', 'title', container_frame._w, title)
-                geom = "1000x700" if "Editor" in title else "600x500"
-                container_frame.tk.call('wm', 'geometry', container_frame._w, geom)
+                if idx is not None and idx != "end":
+                    target_paned.insert(idx, container_frame, weight=weight)
+                else:
+                    target_paned.add(container_frame, weight=weight)
+            except Exception:
+                try:
+                    target_paned.add(container_frame, weight=weight)
+                except Exception:
+                    pass
+            return
+        # --- ABDOCKEN ---
+        try:
+            try:
+                panes = [str(p) for p in target_paned.panes()]
+                container_frame._dock_index = panes.index(str(container_frame))
+            except Exception:
+                container_frame._dock_index = "end"
+            target_paned.forget(container_frame)
+            container_frame.update_idletasks()
+            container_frame.tk.call('wm', 'manage', container_frame._w)
+            container_frame.tk.call('wm', 'title', container_frame._w, title)
+            geom = "1000x700" if "Editor" in title else "760x460"
+            container_frame.tk.call('wm', 'geometry', container_frame._w, geom)
+            # Ohne diese drei Zeilen bleibt das Fenster auf Windows unsichtbar:
+            try:
+                container_frame.tk.call('wm', 'deiconify', container_frame._w)
+            except Exception:
+                pass
+            container_frame.update_idletasks()
+            try:
+                container_frame.lift()
+            except Exception:
+                pass
 
-                def on_close():
-                    self.toggle_dock(container_frame, title, inner_widget, target_paned, weight, btn)
+            def on_close():
+                self.toggle_dock(container_frame, title, inner_widget, target_paned, weight, btn)
 
-                cb_name = container_frame.register(on_close)
-                container_frame.tk.call('wm', 'protocol', container_frame._w, 'WM_DELETE_WINDOW', cb_name)
-
-                container_frame._is_undocked = True
-                btn.config(text="⬎ Andocken")
-            except Exception as e:
-                self.app.log(f"[!] System unterstützt kein natives Abdocken: {e}")
+            cb_name = container_frame.register(on_close)
+            container_frame.tk.call('wm', 'protocol', container_frame._w, 'WM_DELETE_WINDOW', cb_name)
+            container_frame._is_undocked = True
+            btn.config(text="\u2927 Andocken")
+        except Exception as e:
+            # wm manage nicht unterstuetzt: Fenster NICHT verschwinden lassen -> zurueck andocken.
+            try:
+                self.app.log(f"[!] Abdocken nicht moeglich ({e}); Konsole bleibt angedockt.")
+            except Exception:
+                pass
+            try:
                 target_paned.add(container_frame, weight=weight)
-
+            except Exception:
+                pass
+            container_frame._is_undocked = False
+            btn.config(text="\u29c9 Abdocken")
     def build_editor(self, parent):
         patch_book = ttk.Notebook(parent)
         patch_book.pack(side="top", fill="both", expand=True, padx=5, pady=5)
+        self.patch_book = patch_book
 
         tab_hex = ttk.Frame(patch_book)
         tab_libs = ttk.Frame(patch_book)
@@ -114,6 +155,8 @@ class WorkspaceTab(ttk.Frame):
         patch_book.add(tab_libs, text="Native Lib Replacer")
         self.lib_forge = LibForgeTab(patch_book, self.app)
         patch_book.add(self.lib_forge, text="🛠 LibForge")
+        self.lib_carve = LibCarveTab(patch_book, self.app)
+        patch_book.add(self.lib_carve, text="🔪 LibCarve (C / ASM)")
         patch_book.add(self.smali_studio, text="Smali Studio (Java / Kotlin)")
 
         # --- HEX PATCHER UI ---
@@ -226,6 +269,10 @@ class WorkspaceTab(ttk.Frame):
 
     def clear_main_console(self):
         self.console.delete("1.0", tk.END)
+        try:
+            self.app._log_buf.clear()
+        except Exception:
+            pass
         EventBus.publish("CONSOLE_CLEARED", "main")
 
     def build_console(self, parent):
@@ -234,6 +281,7 @@ class WorkspaceTab(ttk.Frame):
 
         f_main_console = ttk.Frame(self.console_notebook)
         self.console_notebook.add(f_main_console, text="🖥️ Main Console")
+        self.f_main_console = f_main_console
 
         self.console = tk.Text(f_main_console, height=12, bg="black", fg="lightgreen")
         self.console.pack(side="bottom", fill="both", expand=True, padx=5, pady=5)
@@ -341,6 +389,10 @@ class WorkspaceTab(ttk.Frame):
         f_single_builds = ttk.Frame(f_actions)
         f_single_builds.pack(fill="x", padx=10, pady=2)
 
+        self.btn_stage = ttk.Button(f_single_builds, text="⚡ Stage → Destination (Emulation)",
+                                    command=self.controller.run_stage)
+        self.btn_stage.pack(side="left", fill="x", expand=True, padx=(0, 2))
+
         self.btn_build = ttk.Button(f_single_builds, text="⚙️ Nur BUILD", command=self.controller.run_build)
         self.btn_build.pack(side="left", fill="x", expand=True, padx=(0, 2))
 
@@ -402,6 +454,8 @@ class WorkspaceTab(ttk.Frame):
         self.btn_build.config(state=state)
         self.btn_flash.config(state=state)
         self.btn_1click.config(state=state)
+        if hasattr(self, "btn_stage"):
+            self.btn_stage.config(state=state)
 
     def is_uninstall_requested(self) -> bool:
         return self.var_uninstall.get()
@@ -419,10 +473,14 @@ class WorkspaceTab(ttk.Frame):
             for p in self.lib_rows if p["target"].get().strip() and p["source"].get().strip()
         ]
 
-    def get_all_patches(self):
+    def get_all_patches(self, include_libforge: bool = False):
         all_patches = []
         all_patches.extend(self.get_hex_patch_data())
         all_patches.extend(self.get_lib_replacement_data())
+        if getattr(self, "lib_carve", None) is not None:
+            all_patches.extend(self.lib_carve.libcarve_patches)
+        if include_libforge and getattr(self, "lib_forge", None) is not None:
+            all_patches.extend(self.lib_forge.get_active_libforge_patches(include_selected_if_none=False))
         if self.smali_studio:
             all_patches.extend(self.smali_studio.smali_patches)
         return all_patches
@@ -432,10 +490,48 @@ class WorkspaceTab(ttk.Frame):
             for p in list(self.patch_rows): self.remove_patch_row(p["frame"])
             for p in list(self.lib_rows): self.remove_lib_row(p["frame"])
             if self.smali_studio: self.smali_studio.smali_patches.clear()
+            if getattr(self, "lib_carve", None) is not None: self.lib_carve.libcarve_patches.clear()
 
         for pt in record.get("patches", record.get("smali_patches", [])):
-            if pt.get("type") == "smali" or "orig" in pt and "edit" in pt and "file" in pt:
-                pt["type"] = "smali"
+            if pt.get("type") == "libcarve":
+                if getattr(self, "lib_carve", None) is not None:
+                    is_dup = any(
+                        ex.get("file") == pt.get("file") and ex.get("vaddr") == pt.get("vaddr")
+                        for ex in self.lib_carve.libcarve_patches
+                    )
+                    if not is_dup:
+                        self.lib_carve.libcarve_patches.append(pt)
+            elif pt.get("type") == "libforge":
+                try:
+                    import os as _os
+                    from services.native_lib_service import get_shared_manager
+                    mgr = get_shared_manager(self.app)
+                    lname = (pt.get("name") or "").strip() or "custom"
+                    lib = next((l for l in mgr.get_all() if l.name == lname), None)
+                    if lib is None:
+                        lib = mgr.create(name=lname, origin=pt.get("origin", "built") or "built")
+                    lib.version = str(pt.get("version") or "1.0")
+                    lib.description = str(pt.get("description") or "")
+                    if lib.origin != "imported":
+                        lib.source_code = str(pt.get("source_code") or lib.source_code or "")
+                    lib.abi = str(pt.get("abi") or "arm64-v8a")
+                    try:
+                        lib.api_level = int(pt.get("api_level") or 30)
+                    except (ValueError, TypeError):
+                        lib.api_level = 30
+                    lib.link_libs = str(pt.get("link_libs") or "log dl")
+                    lib.extra_flags = str(pt.get("extra_flags") or "")
+                    lib.output_kind = str(pt.get("output_kind") or "shared")
+                    if pt.get("so_relpath"):
+                        lib.so_relpath = str(pt.get("so_relpath"))
+                    mgr.update(lib)
+                    if lib.so_relpath and _os.path.exists(mgr.abspath(lib.so_relpath)):
+                        mgr.set_active(lib.id, True)
+                except Exception:
+                    pass
+
+            elif pt.get("type") in ("smali", "new_file") or ("orig" in pt and "edit" in pt and "file" in pt):
+                pt.setdefault("type", "smali")
                 if self.smali_studio:
                     is_dup = any(
                         ex["file"] == pt["file"] and ex["orig"] == pt["orig"] for ex in self.smali_studio.smali_patches)
@@ -459,6 +555,8 @@ class WorkspaceTab(ttk.Frame):
                 last_row["patch"].insert(0, pt.get("patch", ""))
 
         if self.smali_studio: self.smali_studio.refresh_smali_tree()
+        if getattr(self, "lib_carve", None) is not None: self.lib_carve.refresh_patch_tree()
+        if getattr(self, "lib_forge", None) is not None: self.lib_forge.refresh_list()
         if "app_version" in record:
             self.ent_version.delete(0, tk.END)
             self.ent_version.insert(0, record.get("app_version", ""))

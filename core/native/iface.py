@@ -216,6 +216,11 @@ class FakeEnvironment(Environment):
         self._clock += self._clock_step
         return now
 
+    def advance_clock(self, ns: int) -> None:
+        """Virtuelle Uhr um ns vorstellen (OS-7: nanosleep ohne echten Sleep)."""
+        if not self._real_clock:
+            self._clock += max(int(ns), 0)
+
 
 class SyscallHandler(abc.ABC):
     """svc-Dispatch (WS-E3). Rückgabe True = behandelt, sonst Kern-Default/Fehler."""

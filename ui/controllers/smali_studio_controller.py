@@ -402,6 +402,65 @@ class SmaliStudioController:
         self.view.editor.clear_edit()
         self.app.persist_active_session()  # T1
 
+    def build_current_patch_dict(self):
+        """Erzeugt ein Smali-Patch-Dict aus der aktuellen Editor-Auswahl (ohne Liste zu leeren)."""
+        f = self.current_smali_file
+        orig = self.view.editor.get_orig_text()
+        edit = self.view.editor.get_edit_text()
+        if not f or not orig or not edit:
+            return None
+        scope = "file" if hasattr(self.view.editor, "var_view_mode") and self.view.editor.var_view_mode.get() == "file" else "method"
+        return {"type": "smali", "scope": scope, "file": f, "orig": orig, "edit": edit}
+
+    def save_current_as_favorite(self):
+        patch = self.build_current_patch_dict()
+        if patch is None:
+            return messagebox.showwarning("Smali Favoriten", "Bitte zuerst eine Smali-Methode/Datei bearbeiten (Original & Edit nicht leer).")
+        from services.favorite_service import get_shared_favorites
+        name = simpledialog.askstring("Als Favorit speichern", "Name für den Smali-Favoriten:",
+                                      initialvalue=os.path.basename(patch["file"]), parent=self.view)
+        if not name or not name.strip():
+            return
+        fav = {
+            "name": name.strip(),
+            "version": "1.0",
+            "description": f"[v1.0] Smali {patch['file']} ({patch['scope']})",
+            "patches": [patch],
+        }
+        get_shared_favorites(self.app).add_favorite(fav)
+        self.app.log(f"[+] Smali-Favorit '{name.strip()}' gespeichert.")
+
+    def append_current_to_favorite(self):
+        patch = self.build_current_patch_dict()
+        if patch is None:
+            return messagebox.showwarning("Smali Favoriten", "Bitte zuerst eine Smali-Methode/Datei bearbeiten.")
+        from services.favorite_service import get_shared_favorites
+        fav_svc = get_shared_favorites(self.app)
+        if not fav_svc.favs:
+            return self.save_current_as_favorite()
+        from ui.dialogs.favorite_patches_dialog import choose_existing_favorite_dialog
+        idx = choose_existing_favorite_dialog(
+            self.view.winfo_toplevel(), fav_svc, title="Smali-Patch zu Favorit hinzufügen"
+        )
+        if idx is None:
+            return
+        fav_svc.favs[idx].setdefault("patches", []).append(patch)
+        fav_svc.save_favs()
+        self.app.log(f"[+] Smali-Patch an Favorit '{fav_svc.favs[idx].get('name', '')}' angehängt.")
+
+    def save_workspace_bundle_as_favorite(self):
+        ws = getattr(self.app, "workspace_tab", None)
+        ctrl = getattr(ws, "controller", None)
+        if ctrl is not None:
+            ctrl.save_current_as_favorite()
+
+    def open_favorites_manager(self):
+        ws = getattr(self.app, "workspace_tab", None)
+        if ws is None:
+            return
+        from ui.dialogs.favorite_patches_dialog import FavoritePatchesDialog
+        FavoritePatchesDialog(self.view.winfo_toplevel(), ws, initial_filter="Smali")
+
     def remove_smali_patch(self, idx):
         del self.smali_patches[idx]
 
@@ -419,7 +478,7 @@ class SmaliStudioController:
 
     def open_global_search(self):
         if not self.view._ensure_index_loaded(): return
-        if hasattr(self, "search_window") and self.search_window.winfo_exists():
+        if getattr(self, "search_window", None) is not None and self.search_window.winfo_exists():
             self.search_window.lift()
             self.search_window.focus_force()
             return
@@ -576,8 +635,29 @@ class SmaliStudioController:
             app.native_studio.controller.navigate(pick.addr)
             self.app.log(f"[Native-Bruecke] {dalvik_class}->{method} -> {pick.lib}@0x{pick.addr:x} "
                          f"({pick.symbol}, {pick.by}, conf {pick.confidence:.2f})")
+            self.jump_to_libcarve(pick.lib, pick.addr, focus=False)
         except Exception as e:
             messagebox.showerror("Native-Bruecke", f"Sprung fehlgeschlagen: {e}")
+
+    def jump_to_libcarve(self, lib_name: str, vaddr: int, focus: bool = True):
+        """Synchronisiert / springt zu einem Native-Ziel in LibCarve."""
+        app = self.app
+        ws = getattr(app, "workspace_tab", None)
+        lc = getattr(ws, "lib_carve", None) if ws is not None else None
+        if lc is None:
+            return
+        ctrl = lc.controller
+        bn = os.path.basename(str(lib_name or ""))
+        if focus and hasattr(app, "focus_libcarve"):
+            app.focus_libcarve(bn, vaddr)
+        if ctrl.image is None or (bn and os.path.basename(getattr(ctrl, "image_path", "") or "") != bn):
+            cands = ctrl.discover_libraries()
+            hit = next((c for c in cands if c["name"] == bn), None)
+            if hit:
+                ctrl.load_so_path(hit["path"], abi=hit.get("abi", "arm64-v8a"), target_vaddr=vaddr)
+                return
+        if ctrl.image is not None:
+            ctrl.navigate_to(int(vaddr), add_to_history=True)
 
     def _choose_native_hit(self, hits):
         """Kleiner modaler Auswahldialog bei mehrdeutigen Treffern."""

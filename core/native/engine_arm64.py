@@ -124,16 +124,21 @@ class Arm64Engine:
         self.mem.write(addr, data)
         self.mem.map(addr, len(data), perms)
 
-    def load_image(self, image: ElfImage):
+    def load_image(self, image: ElfImage, load_bias: int = 0):
+        m64 = (1 << 64) - 1
+        bias = int(load_bias) & m64
         for seg in image.segments:
             perms = 0
             if seg.flags & _PF_R: perms |= iface.PERM_R
             if seg.flags & _PF_W: perms |= iface.PERM_W
             if seg.flags & _PF_X: perms |= iface.PERM_X
+            va = (seg.vaddr + bias) & m64
+            if hasattr(self.cpu, "invalidate_code"):
+                self.cpu.invalidate_code(va, max(seg.memsz, seg.filesz, 1))
             if seg.filesz:
-                self.mem.write(seg.vaddr, image.data[seg.offset:seg.offset + seg.filesz])
-            self.mem.map(seg.vaddr, max(seg.memsz, 1), perms or iface.PERM_R)
-        self.listener(EV_PROGRESS, {"stage": "loaded", "segments": len(image.segments)})
+                self.mem.write(va, image.data[seg.offset:seg.offset + seg.filesz])
+            self.mem.map(va, max(seg.memsz, 1), perms or iface.PERM_R)
+        self.listener(EV_PROGRESS, {"stage": "loaded", "segments": len(image.segments), "load_bias": bias})
 
     # ---- Plugins / Beobachtung -------------------------------------------
     def attach_plugin(self, plugin: TargetPlugin):
@@ -147,16 +152,18 @@ class Arm64Engine:
         """Nicht-invasiver Beobachtungs-Hook (läuft vor der Instruktion an pc)."""
         self.cpu.probes[pc] = fn
 
-    def apply_relocations(self, image) -> int:
+    def apply_relocations(self, image, load_bias: int = 0) -> int:
         """Wendet die vom Loader geparsten Relocations an: schreibt je (site, target) den
         8-Byte-Zeiger `target` nach `site`. Fuellt die in der Datei NULL-Dispatch-/Call-Zeiger
         obfuskierter Libs (z. B. OLLVM-Flattening). Additiv; wird nur auf Wunsch aufgerufen
         (load_image ruft sie NICHT automatisch -> Kontrakt bleibt bit-exakt)."""
         m64 = (1 << 64) - 1
+        bias = int(load_bias) & m64
         n = 0
         for row in (getattr(image, "relocs", None) or []):
             try:
-                site = int(row[0]); tgt = int(row[1]) & m64
+                site = (int(row[0]) + bias) & m64
+                tgt = (int(row[1]) + bias) & m64
                 self.mem.write(site, tgt.to_bytes(8, "little"))
                 n += 1
             except Exception:
@@ -170,8 +177,12 @@ class Arm64Engine:
         return self._dec.decode(int.from_bytes(raw, "little"), pc)
 
     # ---- Ausführung -------------------------------------------------------
-    def run_function(self, entry: int, args=(), maxins: int = 2_000_000_000) -> int:
-        ret = self.cpu.run(entry, tuple(args), maxins)
+    def run_function(self, entry: int, args=(), maxins: int = 2_000_000_000,
+                     max_wall_s: Optional[float] = None) -> int:
+        if max_wall_s is not None:
+            ret = self.cpu.run(entry, tuple(args), maxins, max_wall_s=max_wall_s)
+        else:
+            ret = self.cpu.run(entry, tuple(args), maxins)
         self.listener(EV_PROGRESS, {"stage": "ran", "entry": entry, "ret": ret})
         return ret
 

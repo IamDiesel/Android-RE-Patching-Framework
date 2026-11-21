@@ -1,7 +1,7 @@
 {
     "BASE_DIR": "C:\\Users\\Lenovo\\Documents\\GitHub\\Android RE Patching Framework",
-    "SPLIT_NAME": "org.nativescript.LibreLinkUp",
-    "APP_PACKAGE": "org.nativescript.LibreLinkUp",
+    "SPLIT_NAME": "com.alpicoolneutral.fridge.controller",
+    "APP_PACKAGE": "com.alpicoolneutral.fridge.controller",
     "SIGNER_JAR": "tools\\uber-apk-signer.jar",
     "APKEDITOR_JAR": "tools\\APKEditor.jar",
     "LSPATCH_JAR": "tools\\lspatch.jar",
@@ -37,6 +37,11 @@
             {
                 "name": "Apply Hex Patches",
                 "type": "anchor_patch"
+            },
+            {
+                "name": "Apply LibCarve Patches",
+                "type": "libcarve_patch",
+                "target": "extract"
             },
             {
                 "name": "Repack APK (jar)",
@@ -87,6 +92,10 @@
             {
                 "name": "Inject Custom Libs",
                 "type": "inject_custom_libs"
+            },
+            {
+                "name": "Apply LibCarve Patches",
+                "type": "libcarve_patch"
             },
             {
                 "name": "Inject Added Libs",
@@ -182,6 +191,7 @@
         "tools": {
             "lib.build": true,
             "lib.delete": true,
+            "favorites.delete": true,
             "pipeline.run": true,
             "pipeline.flash": true,
             "device.ls": true,
@@ -196,7 +206,11 @@
             "net.route": true,
             "frida.scripts_delete": true,
             "frida.collections_delete": true,
-            "frida.push_collection": true
+            "frida.push_collection": true,
+            "native.dbg_step": true,
+            "native.dbg_resume": true,
+            "native.os_config_set": true,
+            "native.session_set": true
         },
         "caps": {
             "build": true,
@@ -204,7 +218,10 @@
             "app_start": true,
             "exec_run": true,
             "file_manager": true,
-            "delete_ops": true
+            "delete_ops": true,
+            "dbg_write": true,
+            "session_write": true,
+            "os_write": true
         },
         "console": {
             "max_bytes": 20971520,

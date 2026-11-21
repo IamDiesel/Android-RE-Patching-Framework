@@ -126,6 +126,14 @@ The default configuration ships with production-ready pipelines. To understand h
         "type": "inject_custom_libs"
     },
     {
+        "name": "Apply LibCarve Patches", 
+        "type": "libcarve_patch"
+    },
+    {
+        "name": "Inject Added Libs", 
+        "type": "inject_added_libs"
+    },
+    {
         "name": "Inject Frida Gadget", 
         "type": "inject_frida"
     },
@@ -167,23 +175,31 @@ Evaluates your UI-defined Smali modifications and applies them to the mirrored c
 Overwrites native `.so` libraries (e.g., patched Unity or Flutter engines) within the designated architecture folders based on the UI table.
 
 
-4. **`inject_frida`:**
+4. **`libcarve_patch`:**
+Compiles all active **LibCarve** modifications (`ARM64 ASM` in-place/cave, `C-Cave` via NDK `clang`, or `Hex`) directly into the target `.so` binaries using 16-KB-aligned ELF64 segment injection when needed. *(Note: To test patches in the glass debugger/simulator via `Stand: Live-Patches` / `Zone: live`, no pipeline build is required.)*
+
+
+5. **`inject_added_libs`:**
+Copies active libraries compiled or imported via **LibForge** into the target `lib/<abi>/` directories (guarded against overwriting existing APK libraries).
+
+
+6. **`inject_frida`:**
 Evaluates the UI checkbox. If enabled, it obfuscates and injects the Frida Gadget (v17+) and its JSON config. If disabled, it performs an active cleanup of residual Frida artifacts.
 
 
-5. **`manifest_and_build`:**
+7. **`manifest_and_build`:**
 Injects the Network Security Config (for MITM proxying), alters the `android:debuggable` flag, and recompiles the APK using the selected compiler (`apktool`, `apkeditor`, or `aapt2`).
 
 
-6. **`apply_lspatch`:**
+8. **`apply_lspatch`:**
 Dynamically repacks the newly built APK with Non-Root Xposed modules (like TrustMeAlready) via `lspatch.jar` if toggled in the UI.
 
 
-7. **`cmd` (Clean):**
+9. **`cmd` (Clean):**
 Executes a shell command to delete legacy signed APKs to prevent signature collisions.
 
 
-8. **`cmd` (Sign):**
+10. **`cmd` (Sign):**
 Invokes `uber-apk-signer.jar` to cryptographically sign and align the repackaged binary.
 
 
@@ -469,6 +485,45 @@ Replaces native crash reporting libraries (like Crashlytics) with your own hooki
 {
     "name": "Replace Crashlytics Lib", 
     "type": "inject_custom_libs"
+}
+
+```
+
+#### `type: "libcarve_patch"`
+
+Reads `SessionState.active_libcarve_patches` populated by **LibCarve** (`ARM64 ASM`, `C-Cave`, or `Hex` patches) and compiles them directly into the target `.so` files in `lib/<abi>/` (supporting 16-KB-aligned ELF64 cave segment injection).
+
+✨ **Example 1: Standard `BUILD_NATIVE` Usage**
+Patches `.so` binaries inside the mirrored destination workspace before manifest repackaging and signing.
+
+```json
+{
+    "name": "Apply LibCarve Patches",
+    "type": "libcarve_patch"
+}
+
+```
+
+✨ **Example 2: Flutter / Split-Extract Usage (`BUILD_FLUTTER`)**
+Targets `{EXTRACT_DIR}/lib` directly when patching unpacked Flutter/engine bundles prior to `jar` repacking and `zipalign`.
+
+```json
+{
+    "name": "Apply LibCarve Patches",
+    "type": "libcarve_patch",
+    "target": "extract"
+}
+
+```
+
+#### `type: "inject_added_libs"`
+
+Injects active custom `.so` binaries compiled or imported via **LibForge** (`data/native_libs.json`) into `lib/<abi>/`, refusing to overwrite existing original app libraries.
+
+```json
+{
+    "name": "Inject Added Libs",
+    "type": "inject_added_libs"
 }
 
 ```

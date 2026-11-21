@@ -8,12 +8,95 @@ from services.favorite_service import FavoriteService, get_shared_favorites
 from ui.controllers.favorite_patches_controller import FavoritePatchesController
 
 
+TOOL_LABELS = {
+    "smali": "Smali",
+    "new_file": "Smali",
+    "libcarve": "LibCarve",
+    "libforge": "LibForge",
+    "hex": "Hex",
+    "lib_replace": "Lib-Replace",
+}
+
+FILTER_OPTIONS = [
+    "Alle",
+    "Smali",
+    "LibCarve",
+    "LibForge",
+    "Hex",
+    "Lib-Replace",
+    "Kombi (Multi-Tool)",
+]
+
+
+def format_fav_tools(fav: dict):
+    """Liefert (Badge-Text, Tool-Label-Set, Sub-Patch-Anzahl) fuer einen Favoriten."""
+    patches = fav.get("patches") if isinstance(fav, dict) and isinstance(fav.get("patches"), list) else [fav]
+    ordered = []
+    seen = set()
+    for p in patches:
+        if not isinstance(p, dict):
+            continue
+        pt = str(p.get("type", "smali") or "smali")
+        lbl = TOOL_LABELS.get(pt, pt)
+        if lbl not in seen:
+            seen.add(lbl)
+            ordered.append(lbl)
+    return (" + ".join(ordered) if ordered else "Smali"), seen, len(patches)
+
+
+def choose_existing_favorite_dialog(parent, fav_service, title: str = "Zu bestehendem Favoriten hinzufügen"):
+    """Modaler Auswahl-Dialog fuer einen bestehenden Favoriten. Gibt den Listen-Index oder None zurueck."""
+    favs = getattr(fav_service, "favs", []) or []
+    if not favs:
+        return None
+    dlg = tk.Toplevel(parent)
+    dlg.title(title)
+    dlg.geometry("520x360")
+    dlg.transient(parent)
+    dlg.grab_set()
+    result = {"idx": None}
+
+    ttk.Label(dlg, text="Ziel-Favorit auswählen:", font=("Segoe UI", 9, "bold")).pack(anchor="w", padx=10, pady=(10, 4))
+    f_lb = ttk.Frame(dlg)
+    f_lb.pack(fill="both", expand=True, padx=10, pady=4)
+    lb = tk.Listbox(f_lb, exportselection=False, font=("Segoe UI", 9))
+    sb = ttk.Scrollbar(f_lb, orient="vertical", command=lb.yview)
+    lb.configure(yscrollcommand=sb.set)
+    lb.pack(side="left", fill="both", expand=True)
+    sb.pack(side="right", fill="y")
+
+    idx_map = []
+    for idx, f in reversed(list(enumerate(favs))):
+        badge, _s, cnt = format_fav_tools(f)
+        lb.insert(tk.END, f"[{idx}] {f.get('name', 'Unbenannt')}  —  {badge} ({cnt} Patch(es))")
+        idx_map.append(idx)
+    if idx_map:
+        lb.selection_set(0)
+
+    def _ok(_evt=None):
+        sel = lb.curselection()
+        if sel:
+            result["idx"] = idx_map[int(sel[0])]
+        dlg.destroy()
+
+    def _cancel():
+        dlg.destroy()
+
+    lb.bind("<Double-1>", _ok)
+    f_b = ttk.Frame(dlg)
+    f_b.pack(fill="x", padx=10, pady=8)
+    ttk.Button(f_b, text="Abbrechen", command=_cancel).pack(side="right", padx=4)
+    ttk.Button(f_b, text="➕ Hinzufügen", command=_ok).pack(side="right", padx=4)
+    dlg.wait_window()
+    return result["idx"]
+
+
 class FavoritePatchesDialog(tk.Toplevel):
-    def __init__(self, parent, ws):
+    def __init__(self, parent, ws, initial_filter: str = "Alle"):
         super().__init__(parent)
         self.ws = ws
         self.title("⭐ Patch Favoriten Manager")
-        self.geometry("1100x650")
+        self.geometry("1180x680")
         self.attributes("-topmost", True)
         self.transient(ws.winfo_toplevel())
 
@@ -22,15 +105,34 @@ class FavoritePatchesDialog(tk.Toplevel):
 
         self.current_sub_patch_idx = 0
         self._debounce_timer = None
+        self._initial_filter = initial_filter if initial_filter in FILTER_OPTIONS else "Alle"
         self.create_widgets()
 
     def create_widgets(self):
         f_btn = ttk.Frame(self)
         f_btn.pack(side="bottom", fill="x", padx=10, pady=10)
 
-        ttk.Button(f_btn, text="💾 Speichern", command=self.controller.save_current).pack(side="left", padx=5)
-        ttk.Button(f_btn, text="🗑 Löschen", command=self.controller.delete_current).pack(side="left", padx=5)
-        ttk.Button(f_btn, text="🔄 Aktualisieren", command=self.reload_favs).pack(side="left", padx=5)
+        ttk.Button(f_btn, text="💾 Speichern", command=self.controller.save_current).pack(side="left", padx=4)
+        ttk.Button(f_btn, text="🗑 Löschen", command=self.controller.delete_current).pack(side="left", padx=4)
+        ttk.Button(f_btn, text="🔄 Aktualisieren", command=self.reload_favs).pack(side="left", padx=4)
+
+        mb_add = ttk.Menubutton(f_btn, text="➕ Hinzufügen ▾")
+        m_add = tk.Menu(mb_add, tearoff=0)
+        m_add.add_command(label="Aktuellen Smali-Editor anhängen",
+                          command=lambda: self.controller.append_from_tool("smali"))
+        m_add.add_command(label="Aktuellen LibCarve-Patch anhängen",
+                          command=lambda: self.controller.append_from_tool("libcarve"))
+        m_add.add_command(label="Ausgewählte LibForge-Lib anhängen",
+                          command=lambda: self.controller.append_from_tool("libforge"))
+        m_add.add_separator()
+        m_add.add_command(label="Alle aktiven Workspace-Patches anhängen",
+                          command=lambda: self.controller.append_from_tool("workspace"))
+        mb_add.config(menu=m_add)
+        mb_add.pack(side="left", padx=4)
+
+        ttk.Button(f_btn, text="🔗 Auswahl kombinieren",
+                   command=self.controller.combine_selected_favorites).pack(side="left", padx=4)
+
         ttk.Button(f_btn, text="▶ Alle anwenden (Batch)", command=self.controller.start_batch_fav).pack(side="right",
                                                                                                         padx=5)
         ttk.Button(f_btn, text="▶ Nur aktuellen anwenden", command=self.controller.start_single_fav).pack(side="right",
@@ -40,14 +142,35 @@ class FavoritePatchesDialog(tk.Toplevel):
         main_paned.pack(side="top", fill="both", expand=True, padx=10, pady=10)
 
         f_left = ttk.Frame(main_paned)
-        main_paned.add(f_left, weight=1)
+        main_paned.add(f_left, weight=2)
 
-        self.tree_favs = ttk.Treeview(f_left, columns=("Bezeichnung",), show="headings")
+        f_flt = ttk.Frame(f_left)
+        f_flt.pack(side="top", fill="x", pady=(0, 5))
+        ttk.Label(f_flt, text="Tool:").pack(side="left", padx=(0, 3))
+        self.cmb_filter = ttk.Combobox(f_flt, values=FILTER_OPTIONS, width=18, state="readonly")
+        self.cmb_filter.set(self._initial_filter)
+        self.cmb_filter.pack(side="left", padx=(0, 6))
+        self.cmb_filter.bind("<<ComboboxSelected>>", lambda _e: self.populate_list())
+        ttk.Label(f_flt, text="Suche:").pack(side="left", padx=(0, 3))
+        self.ent_search = ttk.Entry(f_flt, width=16)
+        self.ent_search.pack(side="left", fill="x", expand=True)
+        self.ent_search.bind("<KeyRelease>", lambda _e: self.populate_list())
+
+        f_tree = ttk.Frame(f_left)
+        f_tree.pack(side="top", fill="both", expand=True)
+        self.tree_favs = ttk.Treeview(
+            f_tree, columns=("Bezeichnung", "Tools", "Anzahl"), show="headings", selectmode="extended"
+        )
         self.tree_favs.heading("Bezeichnung", text="Bezeichnung")
+        self.tree_favs.heading("Tools", text="Tools")
+        self.tree_favs.heading("Anzahl", text="#")
+        self.tree_favs.column("Bezeichnung", width=165, stretch=True)
+        self.tree_favs.column("Tools", width=120, stretch=True)
+        self.tree_favs.column("Anzahl", width=36, anchor="center", stretch=False)
         self.tree_favs.pack(side="left", fill="both", expand=True)
         self.tree_favs.bind("<<TreeviewSelect>>", self.on_select)
 
-        scrollbar = ttk.Scrollbar(f_left, orient="vertical", command=self.tree_favs.yview)
+        scrollbar = ttk.Scrollbar(f_tree, orient="vertical", command=self.tree_favs.yview)
         self.tree_favs.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
 
@@ -57,9 +180,10 @@ class FavoritePatchesDialog(tk.Toplevel):
         f_nav = ttk.Frame(f_right)
         f_nav.pack(fill="x", padx=5, pady=5)
         ttk.Label(f_nav, text="Favorit Name:").pack(side="left", padx=(0, 5))
-        self.ent_name = ttk.Entry(f_nav, width=30)
+        self.ent_name = ttk.Entry(f_nav, width=28)
         self.ent_name.pack(side="left", padx=5)
 
+        ttk.Button(f_nav, text="➖ Sub-Patch", command=self.controller.remove_current_sub_patch).pack(side="right", padx=4)
         self.btn_next = ttk.Button(f_nav, text="▶", width=3, command=self.next_sub_patch)
         self.btn_next.pack(side="right", padx=5)
         self.lbl_sub_patch = ttk.Label(f_nav, text="Sub-Patch 1 / 1", font=("Segoe UI", 9, "bold"))
@@ -170,12 +294,24 @@ class FavoritePatchesDialog(tk.Toplevel):
             pass
 
     def populate_list(self):
-        for i in self.tree_favs.get_children(): self.tree_favs.delete(i)
+        for i in self.tree_favs.get_children():
+            self.tree_favs.delete(i)
 
-        # Durch reversed(list(enumerate(...))) iterieren wir rückwärts durch die Liste,
-        # behalten aber den originalen Index (idx) für die 'iid' bei.
+        flt = self.cmb_filter.get() if hasattr(self, "cmb_filter") else "Alle"
+        query = self.ent_search.get().strip().lower() if hasattr(self, "ent_search") else ""
+
+        # Rückwärts iterieren, originalen Index (idx) als iid beibehalten
         for idx, f in reversed(list(enumerate(self.controller.fav_service.favs))):
-            self.tree_favs.insert("", "end", iid=str(idx), values=(f.get("name", "Unnamed"),))
+            badge, tool_set, cnt = format_fav_tools(f)
+            if flt == "Kombi (Multi-Tool)":
+                if len(tool_set) < 2:
+                    continue
+            elif flt != "Alle" and flt not in tool_set:
+                continue
+            fname = f.get("name", "Unnamed")
+            if query and query not in fname.lower() and query not in badge.lower() and query not in str(f.get("description", "")).lower():
+                continue
+            self.tree_favs.insert("", "end", iid=str(idx), values=(fname, badge, str(cnt)))
 
     def on_select(self, event):
         self.current_sub_patch_idx = 0
@@ -220,6 +356,27 @@ class FavoritePatchesDialog(tk.Toplevel):
             self.txt_orig.insert("1.0",
                                  f"HEX PATCH\n\nDatei: {p.get('file', 'libflutter.so')}\nRAM: {p.get('ram', '')}\nBase: {p.get('base', '')}\nOrig: {p.get('orig', '')}")
             self.txt_edit.insert("1.0", p.get("patch", ""))
+        elif ptype == "libcarve":
+            self.ent_file.insert(0, p.get("file", ""))
+            orig_info = (
+                f"// LIBCARVE PATCH ({p.get('mode', 'asm')})\n"
+                f"// Funktion: {p.get('func', '?')} @ {p.get('vaddr', '?')} [{p.get('abi', 'arm64-v8a')}]\n"
+                f"// AOB-Signatur: {p.get('aob', '(keine)')}\n\n"
+                f"{p.get('orig', '')}"
+            )
+            self.txt_orig.insert("1.0", orig_info)
+            self.txt_edit.insert("1.0", p.get("edit", ""))
+        elif ptype == "libforge":
+            self.ent_file.insert(0, p.get("name", ""))
+            orig_info = (
+                f"// LIBFORGE BIBLIOTHEK\n"
+                f"// Name: lib{p.get('name', '')}.so (v{p.get('version', '1.0')})\n"
+                f"// ABI: {p.get('abi', 'arm64-v8a')} | API: {p.get('api_level', 30)} | Typ: {p.get('output_kind', 'shared')}\n"
+                f"// Link-Libs: {p.get('link_libs', '')} | Flags: {p.get('extra_flags', '')}\n"
+                f"// Beschreibung: {p.get('description', '')}\n"
+            )
+            self.txt_orig.insert("1.0", orig_info)
+            self.txt_edit.insert("1.0", p.get("source_code", ""))
         else:
             self.ent_file.insert(0, p.get("file", ""))
             self.txt_orig.insert("1.0", p.get("orig", ""))

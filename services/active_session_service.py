@@ -24,6 +24,8 @@ def _patch_key(p) -> str:
     t = p.get("type", "smali")
     if t == "lib_replace":
         return f"lib|{p.get('target','')}|{p.get('source','')}"
+    if t == "libcarve":
+        return f"libcarve|{p.get('file','')}|{p.get('abi','arm64-v8a')}|{p.get('vaddr','')}|{p.get('func','')}"
     if t == "hex":
         return f"hex|{p.get('file','')}|{p.get('ram','')}|{p.get('patch','')}"
     # smali / new_file: Datei + Scope + Anfang des orig-Blocks reichen zur Unterscheidung

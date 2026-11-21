@@ -93,6 +93,79 @@ class AnchorPatchStep(PipelineStep):
             return False
 
 
+class ApplyLibCarvePatchesStep(PipelineStep):
+    """Kompiliert & schreibt aktive LibCarve-Patches (ASM / C-Cave / Hex) in BUILD_NATIVE & BUILD_FLUTTER."""
+
+    def execute(self, step_config: Dict[str, Any], engine_context: Any) -> bool:
+        patches = list(getattr(SessionState, "active_libcarve_patches", None) or ())
+        if not patches:
+            engine_context.log("[*] Keine LibCarve-Patches definiert, überspringe.")
+            return True
+
+        target_mode = str(step_config.get("target") or "").lower()
+        paths = getattr(engine_context.cfg, "paths", {}) or {}
+        if target_mode == "extract" and paths.get("EXTRACT_DIR"):
+            apk_lib_dir = os.path.join(paths["EXTRACT_DIR"], "lib")
+        else:
+            folder_name = engine_context.get_unpacked_dir_name()
+            dest_base = paths.get("DEST_DIR", "")
+            cand_dest = os.path.join(dest_base, folder_name, "lib") if dest_base else ""
+            if cand_dest and os.path.isdir(cand_dest):
+                apk_lib_dir = cand_dest
+            elif paths.get("EXTRACT_DIR") and os.path.isdir(os.path.join(paths["EXTRACT_DIR"], "lib")):
+                apk_lib_dir = os.path.join(paths["EXTRACT_DIR"], "lib")
+            else:
+                apk_lib_dir = cand_dest
+
+        if not apk_lib_dir or not os.path.isdir(apk_lib_dir):
+            engine_context.log("[*] Kein entpackter 'lib'-Ordner fuer LibCarve vorhanden. Überspringe.")
+            return True
+
+        from services.libcarve_compiler_service import LibCarveCompilerService
+        by_target = {}
+        for p in patches:
+            fname = os.path.basename(str(p.get("file") or "").strip())
+            abi = str(p.get("abi") or "arm64-v8a").strip()
+            if fname:
+                by_target.setdefault((abi, fname), []).append(p)
+
+        cfg_dict = getattr(engine_context.cfg, "config", {}) or {}
+        applied_files = 0
+        for (abi, fname), plist in by_target.items():
+            cand_path = os.path.join(apk_lib_dir, abi, fname)
+            if not os.path.isfile(cand_path):
+                # Fallback: nach Dateiname in allen ABIs suchen
+                hits = [
+                    os.path.join(apk_lib_dir, d, fname)
+                    for d in sorted(os.listdir(apk_lib_dir))
+                    if os.path.isfile(os.path.join(apk_lib_dir, d, fname))
+                ]
+                cand_path = hits[0] if hits else ""
+            if not cand_path or not os.path.isfile(cand_path):
+                engine_context.log(f"[!] LibCarve Ziel-Lib '{fname}' ({abi}) im Build-Verzeichnis nicht gefunden.")
+                return False
+            try:
+                with open(cand_path, "rb") as fh:
+                    orig_bytes = fh.read()
+                out_bytes, reports = LibCarveCompilerService.apply_patches_to_elf(orig_bytes, plist, cfg=cfg_dict)
+                fails = [r for r in reports if not r.get("ok")]
+                if fails:
+                    err_msg = "; ".join(str(r.get("error")) for r in fails)
+                    engine_context.log(f"[!] LibCarve Build-Fehler in {fname}: {err_msg}")
+                    return False
+                with open(cand_path, "wb") as fh:
+                    fh.write(out_bytes)
+                os.utime(cand_path, None)
+                applied_files += 1
+                engine_context.log(f"[+] LibCarve: {len(reports)} Patch(es) erfolgreich in {cand_path} angewendet.")
+            except Exception as e:
+                engine_context.log(f"[!] LibCarve Fehler bei '{fname}': {e}")
+                return False
+
+        engine_context.log(f"[+] LibCarve Build-Step abgeschlossen ({applied_files} Bibliothek(en) aktualisiert).")
+        return True
+
+
 class SmartPatchStep(PipelineStep):
     @staticmethod
     def _is_super_stub(edit_block: str) -> bool:

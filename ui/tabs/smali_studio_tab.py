@@ -33,7 +33,13 @@ class SmaliStudioTab(ttk.Frame):
 
     def get_unpacked_dir_name(self):
         strategy = self.app.cfg.config.get("MANIFEST_STRATEGY", "smali_only")
-        return "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
+        preferred = "base_unpacked_apkeditor" if strategy == "apkeditor" else "base_unpacked_apktool"
+        app_src = self.app.cfg.paths.get("APP_SOURCE_DIR", "")
+        if app_src and not os.path.isdir(os.path.join(app_src, preferred)):
+            alt = "base_unpacked_apktool" if preferred == "base_unpacked_apkeditor" else "base_unpacked_apkeditor"
+            if os.path.isdir(os.path.join(app_src, alt)):
+                return alt
+        return preferred
 
     def get_smali_dir(self):
         return os.path.join(self.app.cfg.paths.get("APP_SOURCE_DIR", ""), self.get_unpacked_dir_name())
@@ -44,15 +50,25 @@ class SmaliStudioTab(ttk.Frame):
     def _ensure_index_loaded(self, parent_widget=None):
         parent_dlg = parent_widget if parent_widget else self.winfo_toplevel()
 
-        if self.search_engine.is_indexed: return True
+        source_smali = self.get_smali_dir()
+        norm_src = os.path.abspath(source_smali) if source_smali else ""
+        pkg = self.app.cfg.config.get("APP_PACKAGE", "app")
+
+        if (self.search_engine.is_indexed
+                and self.search_engine.indexed_dir == norm_src
+                and self.search_engine.indexed_pkg == pkg):
+            return True
+
+        if self.search_engine.is_indexed:
+            self.search_engine.reset()
+
         if self.search_engine.is_indexing:
             messagebox.showinfo("Warte", "RAM Index wird gerade aufgebaut.", parent=parent_dlg)
             return False
 
-        source_smali = self.get_smali_dir()
         if os.path.exists(source_smali):
             dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), self.get_unpacked_dir_name())
-            self.search_engine.build_ram_index(source_smali, dest_cache, self.app.cfg.config.get("APP_PACKAGE", "app"),
+            self.search_engine.build_ram_index(source_smali, dest_cache, pkg,
                                                lambda c: self.update_status(f"Bereit ({c} Dateien)"))
             messagebox.showinfo("Lade Index...", "Cache wird geladen. Versuche es gleich noch einmal.",
                                 parent=parent_dlg)
@@ -61,6 +77,70 @@ class SmaliStudioTab(ttk.Frame):
         messagebox.showwarning("Fehler", "Kein entpackter Code gefunden! Bitte zuerst 'APK Entpacken' klicken.",
                                parent=parent_dlg)
         return False
+
+    def on_app_changed(self, pkg=None):
+        """Setzt Studio-Zustand & RAM-Index beim App-Wechsel zurueck und indexiert ggf. neu."""
+        self.search_engine.reset()
+        ctrl = getattr(self, "controller", None)
+        if ctrl is not None:
+            win = getattr(ctrl, "search_window", None)
+            if win is not None:
+                try:
+                    if win.winfo_exists():
+                        win.destroy()
+                except Exception:
+                    pass
+                ctrl.search_window = None
+            ctrl._ram_dict = {}
+            ctrl.current_smali_file = ""
+            ctrl.current_method_name = ""
+            ctrl.editing_patch_idx = None
+            ctrl.history_nodes.clear()
+            ctrl.history_root_id = None
+            ctrl.current_history_id = None
+            ctrl.history_counter = 0
+
+        if hasattr(self.app, "cg"):
+            try:
+                self.app.cg.clear()
+            except Exception:
+                pass
+
+        for tr_name in ("tree_outline", "tree_file", "tree_incoming", "tree_outgoing",
+                        "tree_datagraph", "tree_history", "tree_callstack", "tree_custom_structs"):
+            tr = getattr(self, tr_name, None)
+            if tr is not None:
+                try:
+                    for item in tr.get_children():
+                        tr.delete(item)
+                except Exception:
+                    pass
+
+        try:
+            self.editor.load_code("")
+            self.editor.clear_edit()
+        except Exception:
+            pass
+        try:
+            self.lbl_smali_file.config(text="Keine Datei geladen")
+        except Exception:
+            pass
+
+        smali_dir = self.get_smali_dir()
+        if getattr(self, "struct_manager", None) is not None:
+            self.struct_manager.smali_dir = smali_dir
+            self.struct_manager.custom_files.clear()
+
+        if os.path.isdir(smali_dir):
+            dest_cache = os.path.join(self.app.cfg.paths.get("DEST_DIR", ""), self.get_unpacked_dir_name())
+            pkg_name = pkg or self.app.cfg.config.get("APP_PACKAGE", "app")
+            self.update_status("Indexiere neue App...")
+            self.search_engine.build_ram_index(
+                smali_dir, dest_cache, pkg_name,
+                lambda c: self.update_status(f"Bereit ({c} Dateien)")
+            )
+        else:
+            self.update_status("Noch nicht entpackt")
 
     def open_loadlibrary_helper(self):
         """F15: fuegt System.loadLibrary(<aktive LibForge-Lib>) als Smali am Cursor ein."""
@@ -130,8 +210,27 @@ class SmaliStudioTab(ttk.Frame):
             side="left", padx=2)
         ttk.Button(nav_frame, text="▶", width=3, command=lambda: self.controller.navigate_forward()).pack(
             side="left", padx=2)
+        ttk.Button(top_bar, text="🐞 Im Debugger öffnen", command=self.open_in_debugger).pack(
+            side="left", padx=3)
+        ttk.Button(top_bar, text="🔴 Breakpoint setzen", command=self.set_breakpoint_in_debugger).pack(
+            side="left", padx=3)
+        ttk.Button(top_bar, text="▶️ Live testen", command=self.run_live_in_simulator).pack(
+            side="left", padx=3)
         ttk.Button(top_bar, text="💾 Zur Patch-Liste", command=lambda: self.controller.add_smali_patch()).pack(
             side="right", padx=5)
+        mb_fav = ttk.Menubutton(top_bar, text="⭐ Favoriten ▾")
+        fav_menu = tk.Menu(mb_fav, tearoff=0)
+        fav_menu.add_command(label="⭐ Aktuellen Patch als neuen Favoriten speichern",
+                             command=lambda: self.controller.save_current_as_favorite())
+        fav_menu.add_command(label="➕ Aktuellen Patch zu bestehendem Favoriten hinzufügen...",
+                             command=lambda: self.controller.append_current_to_favorite())
+        fav_menu.add_command(label="📦 Aktive Workspace-Patches als Kombi-Favorit sichern",
+                             command=lambda: self.controller.save_workspace_bundle_as_favorite())
+        fav_menu.add_separator()
+        fav_menu.add_command(label="🗂 Favoriten-Manager öffnen (Filter: Smali)",
+                             command=lambda: self.controller.open_favorites_manager())
+        mb_fav.config(menu=fav_menu)
+        mb_fav.pack(side="right", padx=3)
 
         # Label für den vollen Pfad auf der rechten Seite (links neben dem Speichern-Button)
         self.lbl_smali_file = ttk.Label(top_bar, text="Keine Datei geladen", font=("Segoe UI", 9, "bold"), anchor="e")
@@ -490,3 +589,46 @@ class SmaliStudioTab(ttk.Frame):
                 self.controller.load_history_node(node_id)
 
             self.controller._ignore_mode_change = False
+
+    def open_in_debugger(self):
+        """Laedt aktuelle Smali-Datei/Methode im Debugger und wechselt dorthin (Paket 6A)."""
+        dbg_ctrl = getattr(getattr(self.app, "debugger_tab", None), "ctrl", None)
+        if dbg_ctrl is None:
+            return
+        rel = getattr(self.controller, "current_smali_file", "") or ""
+        if not rel:
+            messagebox.showinfo("Debugger", "Bitte zuerst eine Smali-Datei im Studio laden.")
+            return
+        smali_dir = self.get_smali_dir()
+        try:
+            content = self.editor.txt_edit.get("1.0", "end-1c")
+        except Exception:
+            content = ""
+        if not content.strip():
+            return
+        dbg_ctrl.load_method_block(content, rel, 1, smali_dir=smali_dir)
+        if hasattr(self.app, "notebook") and hasattr(self.app, "debugger_tab"):
+            self.app.notebook.select(self.app.debugger_tab)
+
+    def set_breakpoint_in_debugger(self):
+        """Setzt fuer die aktuell im Smali Studio geoeffnete Methode direkt einen App-Breakpoint."""
+        dbg_ctrl = getattr(getattr(self.app, "debugger_tab", None), "ctrl", None)
+        if dbg_ctrl is None:
+            return
+        rel = (getattr(self.controller, "current_smali_file", "") or "").replace("\\", "/")
+        msig = getattr(self.controller, "current_method_name", "") or ""
+        from core.java.class_provider import StudioClassProvider
+        desc = StudioClassProvider._desc_from_rel(rel)
+        if not desc or not msig or msig.startswith("<Klassen"):
+            messagebox.showinfo("Debugger", "Bitte zuerst eine konkrete Methode im Smali Studio oeffnen.")
+            return
+        name = msig.split("(", 1)[0]
+        sig = ("(" + msig.split("(", 1)[1]) if "(" in msig else ""
+        dbg_ctrl.add_app_bp(desc, name, sig, pc=0)
+        self.app.log(f"[*] Breakpoint im Debugger gesetzt: {desc}->{name}{sig} @pc=0")
+
+    def run_live_in_simulator(self):
+        """Startet die App im Debugger sofort mit allen aktiven Workspace-Patches ('live', ohne Build)."""
+        dbg_ctrl = getattr(getattr(self.app, "debugger_tab", None), "ctrl", None)
+        if dbg_ctrl is not None and hasattr(dbg_ctrl, "run_live_with_patches"):
+            dbg_ctrl.run_live_with_patches()

@@ -23,7 +23,7 @@ class PipelineEngine:
         from .steps.basic_steps import CmdStep, MirrorWorkspaceStep
         from .steps.trace_steps import TraceStartStep, TraceStopStep
         from .steps.apk_steps import DecompileStep, MergeSplitsStep, ManifestBuildStep
-        from .steps.patch_steps import SmartPatchStep, AnchorPatchStep, InjectCustomLibsStep
+        from .steps.patch_steps import SmartPatchStep, AnchorPatchStep, InjectCustomLibsStep, ApplyLibCarvePatchesStep
         from .steps.lib_steps import InjectAddedLibsStep
         from .steps.hook_steps import FridaInjectStep, LSPatchInjectStep
 
@@ -39,6 +39,7 @@ class PipelineEngine:
             "anchor_patch": AnchorPatchStep(),
             "inject_custom_libs": InjectCustomLibsStep(),
             "inject_added_libs": InjectAddedLibsStep(),
+            "libcarve_patch": ApplyLibCarvePatchesStep(),
             "inject_frida": FridaInjectStep(),
             "apply_lspatch": LSPatchInjectStep()
         }
@@ -56,6 +57,30 @@ class PipelineEngine:
         for k, v in vars_dict.items():
             text = text.replace(f"{{{k}}}", str(v))
         return text
+
+    def run_stage_destination(self) -> bool:
+        """AP1.2: SCHNELLES Staging in destination/ OHNE APK-Repack/Signing (Sekunden statt Minuten).
+        Nur mirror_workspace -> smart_patch -> inject_custom_libs -> inject_added_libs."""
+        self.log("=== STAGE -> DESTINATION (Emulation, kein APK-Build) ===")
+        seq = [("Workspace spiegeln", "mirror_workspace"),
+               ("Smali-Patches anwenden", "smart_patch"),
+               ("Custom-Libs injizieren", "inject_custom_libs"),
+               ("Hinzugefuegte Libs injizieren", "inject_added_libs")]
+        if "libcarve_patch" in self._steps:
+            seq.append(("LibCarve-Patches anwenden", "libcarve_patch"))
+        for label, stype in seq:
+            self.log("--- %s ---" % label)
+            step = self._steps.get(stype)
+            if step is None:
+                self.log("[!] Schritt fehlt: %s" % stype); return False
+            try:
+                ok = step.execute({"name": label, "type": stype}, self)
+            except Exception as e:
+                self.log("[!] Fehler in '%s': %r" % (label, e)); return False
+            if not ok:
+                self.log("[!] STAGE abgebrochen bei '%s'" % label); return False
+        self.log("=== STAGE -> DESTINATION fertig (destination/ ist emulationsbereit) ===")
+        return True
 
     def run_pipeline(self, pipeline_name: str) -> bool:
         pipeline = self.cfg.config.get("PIPELINES", {}).get(pipeline_name, [])
