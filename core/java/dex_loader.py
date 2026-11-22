@@ -10,9 +10,12 @@
 from __future__ import annotations
 
 import math as _math
+import re as _re
 import struct as _struct
 
 from core.java.dex_code import decode_code
+from core.java.dalvik import DalvikException, DalvikUnknownOpcode, VmBudgetExceeded
+from core.java.deviation_journal import DebugStop
 from core.java.objects import JString, JObject, JArray
 from core.java.device_profile import DeviceProfile
 
@@ -27,6 +30,37 @@ _TIME_UNITS = (
     ("HOURS", "toHours", 3_600_000_000_000),
     ("DAYS", "toDays", 86_400_000_000_000),
 )
+
+
+def _unpack_ieee_float(val, is_f32: bool) -> float:
+    """Decode Dalvik IEEE-754 int bit-patterns (or boxed/float values) into Python float."""
+    if isinstance(val, JObject):
+        return _unpack_ieee_float(val.fields.get("value", 0.0), is_f32)
+    if isinstance(val, float):
+        return val
+    if isinstance(val, int) and not isinstance(val, bool):
+        fmt, mask, out_fmt = ("<I", 0xFFFFFFFF, "<f") if is_f32 else ("<Q", 0xFFFFFFFFFFFFFFFF, "<d")
+        return _struct.unpack(out_fmt, _struct.pack(fmt, val & mask))[0]
+    try:
+        return float(val or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _as_py_f32(val) -> float:
+    return _unpack_ieee_float(val, True)
+
+
+def _as_py_f64(val) -> float:
+    return _unpack_ieee_float(val, False)
+
+
+def _fmt_java_float(fv: float) -> str:
+    if _math.isnan(fv):
+        return "NaN"
+    if _math.isinf(fv):
+        return "-Infinity" if fv < 0 else "Infinity"
+    return str(fv)
 
 
 def is_framework(cls: str) -> bool:
@@ -165,7 +199,10 @@ class AndroidStubs:
 
     def __init__(self, vfs=None, vm=None, profile=None):
         self.missing = []
+        self._missing_idx = {}
         self._stubs = {}
+        self._overridden_stubs = []
+        self._q_seq = 0
         self.activity_callbacks = []   # registrierte Application$ActivityLifecycleCallbacks
         self.pending_runnables = []    # geplante Handler/View/UI-Runnables
         self._prefs_store = {}         # In-Memory SharedPreferences
@@ -175,12 +212,19 @@ class AndroidStubs:
         self._window_singleton = None
         self._activity_finished = False
         self._activity_stack = []
+        import time as _t_init
         self._pending_nav_intent = None
-        self._clock_ms = 1700000000000
+        self._clock_ms = int(_t_init.time() * 1000)
+        self._clock_tz = None
+        self._clock_frozen = False
+        self._clock_step_ms = 100
+        self._clock_offset_ms = 0
+        self._clock_custom = False
         self._nano_seq = 0
         self.vm = vm                 # VM-Referenz fuer reflektiven Dispatch (generisch)
         self.profile = profile or DeviceProfile()   # konfigurierbare android.*-Konstanten
         self._by_name = {}           # (name,sig) -> fn: vererbungs-tolerante Framework-Methoden
+        self._tostr_guard = set()
         self.vfs = vfs if vfs is not None else VirtualFS()
         self._install_builtins()
         self._install_reflection()
@@ -204,12 +248,16 @@ class AndroidStubs:
             ("core.java.net_protocols_g7", "install_g7_java_stubs"),
             ("core.java.nav_rx_paging_g8", "install_g8_stubs"),
             ("core.java.hardware_media_g9", "install_g9_stubs"),
+            ("core.java.virtual_clock", "install_virtual_clock_stubs"),
+            ("core.java.sdk_breadth_g15", "install_g15_stubs"),
+            ("core.java.view_breadth_g16", "install_g16_stubs"),
         ):
             try:
                 _m = __import__(_mod_name, fromlist=[_fn_name])
                 getattr(_m, _fn_name)(self)
             except Exception:
                 pass
+        self._apply_profile_clock()
         if vm is not None:
             vm._stubs_ref = self
             self._seed_primitive_types(vm)
@@ -226,19 +274,46 @@ class AndroidStubs:
                     pass
 
     def register(self, cls, name, sig, fn):
-        self._stubs[(cls, name, sig)] = fn
+        key = (cls, name, sig)
+        if key in self._stubs:
+            self._overridden_stubs.append(key)
+        self._stubs[key] = fn
 
     def register_by_name(self, name, sig, fn):
         """Framework-Methode vererbungs-tolerant (unabhaengig von der deklarierenden Klasse)."""
         self._by_name[(name, sig)] = fn
 
-    def resolve(self, cls, name, sig, args, static):
+    def _record_missing(self, cls, name, sig):
+        if len(self.missing) == 0 and self._missing_idx:
+            self._missing_idx.clear()
+        key = (cls, name, sig)
+        idx = self._missing_idx.get(key)
+        if idx is not None and (
+            idx >= len(self.missing)
+            or (self.missing[idx].get("cls"), self.missing[idx].get("name"), self.missing[idx].get("sig")) != key
+        ):
+            self._missing_idx = {
+                (m.get("cls"), m.get("name"), m.get("sig")): i
+                for i, m in enumerate(self.missing)
+                if isinstance(m, dict)
+            }
+            idx = self._missing_idx.get(key)
+        if idx is not None:
+            self.missing[idx]["count"] = int(self.missing[idx].get("count", 1)) + 1
+        elif len(self.missing) < 5000:
+            self._missing_idx[key] = len(self.missing)
+            self.missing.append({"cls": cls, "name": name, "sig": sig, "count": 1})
+        vm = getattr(self, "vm", None)
+        if vm is not None and hasattr(vm, "deviations"):
+            vm.deviations.record("missing_stub", f"{cls}->{name}{sig}", step=getattr(vm, "steps", 0))
+
+    def resolve(self, cls, name, sig, args, static, allow_default: bool = True, allow_by_name: bool = True):
         fn = None
         if not static and cls == "Ljava/lang/Object;" and name != "<init>" and args and isinstance(args[0], JObject):
             fn = self._stubs.get((args[0].cls, name, sig))
         if fn is None:
             fn = self._stubs.get((cls, name, sig))
-        if fn is None:
+        if fn is None and allow_by_name:
             fn = self._by_name.get((name, sig))   # geerbte Framework-Methode (Context, Object, ...)
         if fn is not None:
             return True, fn(args)
@@ -246,14 +321,58 @@ class AndroidStubs:
             return True, self._intent_put_extra(args, sig)
         if not static and cls == "Landroid/content/Intent;" and name == "putExtras" and args:
             return True, self._intent_put_extras(args)
-        if is_framework(cls):
+        if allow_default and is_framework(cls):
             # bedarfsgetrieben: protokollieren + sauberer Default (0/null)
-            self.missing.append({"cls": cls, "name": name, "sig": sig})
+            self._record_missing(cls, name, sig)
             # Konstruktoren liefern den Empfaenger zurueck (args[0]) statt 0
             if name == "<init>" and args:
                 return True, args[0]
             return True, 0
         return False, 0
+
+    def resolve_phased(self, wants, rcls, cls, name, sig, args, static):
+        """Mehrphasige Stub-Aufloesung: erst explizite Stubs ueber wants, dann _by_name, dann Default."""
+        for want in wants:
+            handled, ret = self.resolve(want, name, sig, args, static, allow_default=False, allow_by_name=False)
+            if handled:
+                return True, ret
+        fn_bn = self._by_name.get((name, sig))
+        if fn_bn is not None:
+            return True, fn_bn(args)
+        if not static and (cls == "Landroid/content/Intent;" or rcls == "Landroid/content/Intent;") and args:
+            if name == "putExtra":
+                return True, self._intent_put_extra(args, sig)
+            if name == "putExtras":
+                return True, self._intent_put_extras(args)
+        target = cls if is_framework(cls) else (rcls if is_framework(rcls) else None)
+        if target is not None:
+            self._record_missing(target, name, sig)
+            if name == "<init>" and args:
+                return True, args[0]
+            return True, 0
+        return False, 0
+
+    @staticmethod
+    def _bundle_map(obj):
+        if not isinstance(obj, JObject):
+            return {}
+        m_a = obj.fields.get("map")
+        m_b = obj.fields.get("$map")
+        if isinstance(m_a, dict) and isinstance(m_b, dict):
+            if m_a is not m_b:
+                m_a.update(m_b)
+                obj.fields["$map"] = m_a
+            return m_a
+        if isinstance(m_a, dict):
+            obj.fields["$map"] = m_a
+            return m_a
+        if isinstance(m_b, dict):
+            obj.fields["map"] = m_b
+            return m_b
+        m = {}
+        obj.fields["map"] = m
+        obj.fields["$map"] = m
+        return m
 
     @staticmethod
     def _intent_extras_map(intent_obj):
@@ -264,10 +383,11 @@ class AndroidStubs:
                 intent_obj.fields["_extras"] = ex
             bd = intent_obj.fields.get("extras")
             if isinstance(bd, JObject):
-                bmap = bd.fields.get("map")
-                if isinstance(bmap, dict) and bmap is not ex:
+                bmap = AndroidStubs._bundle_map(bd)
+                if bmap is not ex:
                     ex.update(bmap)
                 bd.fields["map"] = ex
+                bd.fields["$map"] = ex
             return ex
         return {}
 
@@ -276,10 +396,12 @@ class AndroidStubs:
             ex = self._intent_extras_map(a[0])
             bd = a[0].fields.get("extras")
             if not isinstance(bd, JObject):
-                bd = JObject("Landroid/os/Bundle;", {"map": ex})
+                bd = JObject("Landroid/os/Bundle;", {"map": ex, "$map": ex})
                 a[0].fields["extras"] = bd
             else:
+                self._bundle_map(bd)
                 bd.fields["map"] = ex
+                bd.fields["$map"] = ex
             return bd
         return self.make_bundle()
 
@@ -304,9 +426,46 @@ class AndroidStubs:
                 ex.update(src.fields["map"])
         return a[0] if a else None
 
+    def _apply_profile_clock(self):
+        prof = getattr(self, "profile", None)
+        if prof is None or not hasattr(prof, "get"):
+            return
+        tz = prof.get("clock_tz")
+        ep = prof.get("clock_epoch_ms")
+        iso = prof.get("clock_iso")
+        frz = bool(prof.get("clock_frozen", False))
+        if tz is not None or ep is not None or iso is not None or frz:
+            try:
+                from core.java.virtual_clock import set_virtual_clock
+                set_virtual_clock(self, epoch_ms=ep, iso_str=iso, tz_name=tz, frozen=frz)
+            except Exception:
+                pass
+
+    def current_time_ms(self, advance=False, step_ms=100):
+        cur = int(getattr(self, "_clock_ms", 1700000000000))
+        if advance and not getattr(self, "_clock_frozen", False):
+            st = int(getattr(self, "_clock_step_ms", step_ms) if step_ms == 100 else step_ms)
+            cur += st
+            self._clock_ms = cur
+        return cur
+
+    def current_datetime(self, tz_name=None):
+        import datetime as _dt
+        ms = int(self.current_time_ms(advance=False))
+        eff = tz_name or getattr(self, "_clock_tz", None)
+        if eff:
+            from core.java.virtual_clock import resolve_tzinfo
+            return _dt.datetime.fromtimestamp(ms / 1000.0, tz=resolve_tzinfo(eff))
+        return _dt.datetime.fromtimestamp(ms / 1000.0)
+
+    def format_status_clock(self):
+        dt = self.current_datetime()
+        if getattr(self, "_clock_custom", False):
+            return f"{dt:%d.%m.%Y %H:%M}" + (" ❄️" if getattr(self, "_clock_frozen", False) else "")
+        return f"{dt:%H:%M}"
+
     def _tick_ms(self, step=100):
-        self._clock_ms = getattr(self, "_clock_ms", 1700000000000) + int(step)
-        return self._clock_ms
+        return self.current_time_ms(advance=True, step_ms=step)
 
     # ---- eingebaute Stubs --------------------------------------------------
     def _install_builtins(self):
@@ -317,17 +476,64 @@ class AndroidStubs:
         self.register("Ljava/lang/Object;", "<init>", "()V", lambda a: None)
         self.register("Ljava/lang/Object;", "clone", "()Ljava/lang/Object;", self._obj_clone)
         # --- Enum (ordinal/name fuer Kotlin when-Switch) ---
+        def _enum_name(a):
+            return JString(str(a[0].fields.get("__ename", "")) if a and isinstance(a[0], JObject) else "")
+
+        def _enum_ord(a):
+            return a[0].fields.get("__ordinal", 0) if a and isinstance(a[0], JObject) else 0
+
+        def _enum_hash(a):
+            if a and isinstance(a[0], JObject):
+                return self._java_strhash(
+                    f"{a[0].cls}:{a[0].fields.get('__ename', '')}:{a[0].fields.get('__ordinal', 0)}"
+                )
+            return 0
+
+        def _enum_decl_cls(a):
+            if not a or not isinstance(a[0], JObject):
+                return None
+            c = a[0].cls
+            if self.vm is not None:
+                cur = c
+                for _ in range(8):
+                    sup = self.vm._superclass(cur)
+                    if sup in (None, "Ljava/lang/Enum;", "Ljava/lang/Object;"):
+                        break
+                    cur = sup
+                c = cur
+                if hasattr(self.vm, "intern_class"):
+                    return self.vm.intern_class(c)
+            dotted = c[1:-1].replace("/", ".") if c.startswith("L") and c.endswith(";") else c
+            return JObject("Ljava/lang/Class;", {"name": dotted})
+
+        def _enum_value_of(a):
+            cls_obj = a[0] if a else None
+            ename = self._txt(a[1]) if len(a) > 1 else ""
+            edesc = self._desc_from_class_obj(cls_obj) if cls_obj is not None else None
+            if edesc and self.vm is not None:
+                cur = self.vm.statics.get(edesc, {}).get(ename)
+                if isinstance(cur, JObject):
+                    return cur
+            return JObject(edesc or "Ljava/lang/Enum;", {"__ename": ename or "", "__ordinal": 0})
+
+        def _enum_clone(a):
+            raise DalvikException("java.lang.CloneNotSupportedException")
+
         self.register("Ljava/lang/Enum;", "<init>", "(Ljava/lang/String;I)V", self._enum_init)
-        self.register_by_name("ordinal", "()I",
-                              lambda a: (a[0].fields.get("__ordinal", 0)
-                                         if a and isinstance(a[0], JObject) else 0))
-        self.register_by_name("name", "()Ljava/lang/String;",
-                              lambda a: JString(a[0].fields.get("__ename", "")
-                                                if a and isinstance(a[0], JObject) else ""))
+        self.register("Ljava/lang/Enum;", "toString", "()Ljava/lang/String;", _enum_name)
+        self.register("Ljava/lang/Enum;", "name", "()Ljava/lang/String;", _enum_name)
+        self.register("Ljava/lang/Enum;", "ordinal", "()I", _enum_ord)
+        self.register("Ljava/lang/Enum;", "hashCode", "()I", _enum_hash)
+        self.register("Ljava/lang/Enum;", "getDeclaringClass", "()Ljava/lang/Class;", _enum_decl_cls)
+        self.register("Ljava/lang/Enum;", "valueOf", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;",
+                      _enum_value_of)
+        self.register("Ljava/lang/Enum;", "clone", "()Ljava/lang/Object;", _enum_clone)
+        self.register_by_name("ordinal", "()I", _enum_ord)
+        self.register_by_name("name", "()Ljava/lang/String;", _enum_name)
         self.register("Ljava/lang/Integer;", "valueOf", "(I)Ljava/lang/Integer;",
                       lambda a: JObject("Ljava/lang/Integer;", {"value": int(a[0]) if a and isinstance(a[0], (int, bool)) else 0}))
         self.register("Ljava/lang/Integer;", "valueOf", "(Ljava/lang/String;)Ljava/lang/Integer;",
-                      lambda a: JObject("Ljava/lang/Integer;", {"value": self._parse_int(a)}))
+                      lambda a: JObject("Ljava/lang/Integer;", {"value": self._parse_java_int(a[0] if a else None, 10, 32)}))
         self.register("Ljava/lang/Integer;", "intValue", "()I", self._unbox)
         self.register("Ljava/lang/Boolean;", "valueOf", "(Z)Ljava/lang/Boolean;",
                       lambda a: JObject("Ljava/lang/Boolean;", {"value": 1 if (a and a[0]) else 0}))
@@ -344,10 +550,10 @@ class AndroidStubs:
                       lambda a: JObject("Ljava/lang/Short;", {"value": int(a[0]) if a else 0}))
         self.register("Ljava/lang/Short;", "shortValue", "()S", self._unbox)
         self.register("Ljava/lang/Float;", "valueOf", "(F)Ljava/lang/Float;",
-                      lambda a: JObject("Ljava/lang/Float;", {"value": a[0] if a else 0.0}))
+                      lambda a: JObject("Ljava/lang/Float;", {"value": _as_py_f32(a[0]) if a else 0.0}))
         self.register("Ljava/lang/Float;", "floatValue", "()F", self._unbox)
         self.register("Ljava/lang/Double;", "valueOf", "(D)Ljava/lang/Double;",
-                      lambda a: JObject("Ljava/lang/Double;", {"value": a[0] if a else 0.0}))
+                      lambda a: JObject("Ljava/lang/Double;", {"value": _as_py_f64(a[0]) if a else 0.0}))
         self.register("Ljava/lang/Double;", "doubleValue", "()D", self._unbox)
 
         def _f32_bits(val, norm_nan=False):
@@ -381,20 +587,6 @@ class AndroidStubs:
                 if norm_nan and ((raw & 0x7FF0000000000000) == 0x7FF0000000000000) and (raw & 0x000FFFFFFFFFFFFF):
                     raw = 0x7FF8000000000000
             return raw - 0x10000000000000000 if raw >= 0x8000000000000000 else raw
-
-        def _as_py_f32(val):
-            if isinstance(val, JObject):
-                val = val.fields.get("value", 0.0)
-            if isinstance(val, float):
-                return val
-            return _struct.unpack("<f", _struct.pack("<I", int(val or 0) & 0xFFFFFFFF))[0]
-
-        def _as_py_f64(val):
-            if isinstance(val, JObject):
-                val = val.fields.get("value", 0.0)
-            if isinstance(val, float):
-                return val
-            return _struct.unpack("<d", _struct.pack("<Q", int(val or 0) & 0xFFFFFFFFFFFFFFFF))[0]
 
         self.register("Ljava/lang/Float;", "intBitsToFloat", "(I)F",
                       lambda a: _struct.unpack("<f", _struct.pack("<I", int(a[0] or 0) & 0xFFFFFFFF))[0] if a else 0.0)
@@ -488,7 +680,12 @@ class AndroidStubs:
         self.register_by_name("get", "(Lkotlin/coroutines/CoroutineContext$Key;)Lkotlin/coroutines/CoroutineContext$Element;",
                               lambda a: None)
         self.register("Lkotlin/ResultKt;", "throwOnFailure", "(Ljava/lang/Object;)V", lambda a: None)
-        self.register("Ljava/lang/Integer;", "parseInt", "(Ljava/lang/String;)I", self._parse_int)
+        self.register("Ljava/lang/Integer;", "parseInt", "(Ljava/lang/String;)I",
+                      lambda a: self._parse_java_int(a[0] if a else None, 10, 32))
+        self.register("Ljava/lang/Long;", "parseLong", "(Ljava/lang/String;)J",
+                      lambda a: self._parse_java_int(a[0] if a else None, 10, 64))
+        self.register("Ljava/lang/Long;", "valueOf", "(Ljava/lang/String;)Ljava/lang/Long;",
+                      lambda a: JObject("Ljava/lang/Long;", {"value": self._parse_java_int(a[0] if a else None, 10, 64)}))
         self.register("Ljava/lang/String;", "length", "()I",
                       lambda a: len(self._txt(a[0]) or ""))
         self.register("Ljava/lang/String;", "valueOf", "(I)Ljava/lang/String;",
@@ -524,9 +721,17 @@ class AndroidStubs:
                       lambda a: JString(self._chars_to_text(a[0] if a else None,
                                         int(a[1]) if len(a) > 1 else 0, int(a[2]) if len(a) > 2 else None)))
         self.register("Ljava/lang/String;", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;",
-                      lambda a: JString(self._txt(a[0]) if a and self._txt(a[0]) is not None else ""))
+                      lambda a: JString(self._obj_to_str(a[0] if a else None)))
         self.register("Ljava/lang/String;", "valueOf", "(Z)Ljava/lang/String;",
                       lambda a: JString("true" if a and a[0] else "false"))
+        self.register("Ljava/lang/String;", "valueOf", "(J)Ljava/lang/String;",
+                      lambda a: JString(str(int(a[0]) if a and a[0] is not None else 0)))
+        self.register("Ljava/lang/String;", "valueOf", "(F)Ljava/lang/String;",
+                      lambda a: JString(_fmt_java_float(_as_py_f32(a[0]) if a and a[0] is not None else 0.0)))
+        self.register("Ljava/lang/String;", "valueOf", "(D)Ljava/lang/String;",
+                      lambda a: JString(_fmt_java_float(_as_py_f64(a[0]) if a and a[0] is not None else 0.0)))
+        self.register("Ljava/lang/String;", "valueOf", "(C)Ljava/lang/String;",
+                      lambda a: JString(chr(int(a[0]) & 0xFFFF) if a and isinstance(a[0], int) else str(a[0] if a else "")))
         self.register("Ljava/lang/String;", "toCharArray", "()[C",
                       lambda a: JArray("[C", [ord(c) for c in (self._txt(a[0]) or "")]))
         self.register("Ljava/lang/String;", "equalsIgnoreCase", "(Ljava/lang/String;)Z",
@@ -552,8 +757,14 @@ class AndroidStubs:
         # --- ClassLoader & Array & Exception-Konstruktoren ---
         self.register("Ljava/lang/ClassLoader;", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", self._cl_find_library)
         self.register("Ldalvik/system/BaseDexClassLoader;", "findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", self._cl_find_library)
-        self.register_by_name("getParent", "()Ljava/lang/ClassLoader;",
-                              lambda a: a[0] if a and isinstance(a[0], JObject) else self._get_classloader(()))
+        def _cl_get_parent(a):
+            if a and isinstance(a[0], JObject):
+                p = a[0].fields.get("_parent")
+                if isinstance(p, JObject) and p is not a[0]:
+                    return p
+            return None
+        self.register("Ljava/lang/ClassLoader;", "getParent", "()Ljava/lang/ClassLoader;", _cl_get_parent)
+        self.register_by_name("getParent", "()Ljava/lang/ClassLoader;", _cl_get_parent)
         self.register("Ljava/lang/ClassLoader;", "getResource", "(Ljava/lang/String;)Ljava/net/URL;", lambda a: None)
         self.register("Ljava/lang/ClassLoader;", "getResourceAsStream", "(Ljava/lang/String;)Ljava/io/InputStream;", lambda a: None)
         self.register("Ljava/lang/reflect/Array;", "newInstance",
@@ -588,7 +799,7 @@ class AndroidStubs:
         # StringBuilder (minimal)
         self.register("Ljava/lang/StringBuilder;", "<init>", "()V", self._sb_init)
         self.register("Ljava/lang/StringBuilder;", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
-                      self._sb_append)
+                      self._sb_append_str)
         self.register("Ljava/lang/StringBuilder;", "append", "(I)Ljava/lang/StringBuilder;", self._sb_append)
         self.register("Ljava/lang/StringBuilder;", "toString", "()Ljava/lang/String;", self._sb_tostr)
         # --- String (erweitert) ---
@@ -604,6 +815,85 @@ class AndroidStubs:
         self.register_by_name("subSequence", "(II)Ljava/lang/CharSequence;", _subseq_fn)
         self.register("Ljava/lang/String;", "indexOf", "(Ljava/lang/String;)I", self._str_indexof)
         self.register("Ljava/lang/String;", "startsWith", "(Ljava/lang/String;)Z", self._str_startswith)
+        self.register("Ljava/lang/String;", "startsWith", "(Ljava/lang/String;I)Z",
+                      lambda a: (lambda s, p, o: 1 if (0 <= o <= len(s) and s[o:].startswith(p)) else 0)(
+                          (self._txt(a[0]) or "") if a else "",
+                          (self._txt(a[1]) or "") if len(a) > 1 else "",
+                          int(a[2] or 0) if len(a) > 2 else -1,
+                      ))
+        self.register("Ljava/lang/String;", "contains", "(Ljava/lang/CharSequence;)Z",
+                      lambda a: 1 if (len(a) > 1 and a[1] is not None and (self._txt(a[1]) or "") in (self._txt(a[0]) or "")) else 0)
+        _str_ce = lambda a: 1 if (len(a) > 1 and a[1] is not None and (self._txt(a[0]) or "") == self._txt(a[1])) else 0
+        self.register("Ljava/lang/String;", "contentEquals", "(Ljava/lang/CharSequence;)Z", _str_ce)
+        self.register("Ljava/lang/String;", "contentEquals", "(Ljava/lang/StringBuffer;)Z", _str_ce)
+        def _str_matches(a):
+            s = (self._txt(a[0]) or "") if a else ""
+            pat = (self._txt(a[1]) or "") if len(a) > 1 and a[1] is not None else None
+            if pat is None:
+                return 0
+            try:
+                return 1 if _re.fullmatch(pat, s) is not None else 0
+            except Exception:
+                return 1 if s == pat else 0
+        self.register("Ljava/lang/String;", "matches", "(Ljava/lang/String;)Z", _str_matches)
+        def _str_region_matches(a, has_ic=False):
+            if len(a) < (6 if has_ic else 5):
+                return 0
+            ic = bool(a[1]) if has_ic else False
+            oi = 2 if has_ic else 1
+            s = self._txt(a[0]) or ""
+            toff = int(a[oi] or 0)
+            other = self._txt(a[oi + 1])
+            ooff = int(a[oi + 2] or 0)
+            ln = int(a[oi + 3] or 0)
+            if other is None or toff < 0 or ooff < 0 or toff + ln > len(s) or ooff + ln > len(other):
+                return 0
+            if ln <= 0:
+                return 1
+            sub1 = s[toff : toff + ln]
+            sub2 = other[ooff : ooff + ln]
+            return 1 if ((sub1.lower() == sub2.lower()) if ic else (sub1 == sub2)) else 0
+        self.register("Ljava/lang/String;", "regionMatches", "(ILjava/lang/String;II)Z",
+                      lambda a: _str_region_matches(a, False))
+        self.register("Ljava/lang/String;", "regionMatches", "(ZILjava/lang/String;II)Z",
+                      lambda a: _str_region_matches(a, True))
+        self.register("Ljava/lang/String;", "replace", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;",
+                      lambda a: JString((self._txt(a[0]) or "").replace(
+                          (self._txt(a[1]) or "") if len(a) > 1 else "",
+                          (self._txt(a[2]) or "") if len(a) > 2 else "",
+                      )))
+        def _str_re_replace(a, count=0):
+            s = (self._txt(a[0]) or "") if a else ""
+            pat = (self._txt(a[1]) or "") if len(a) > 1 else ""
+            repl = (self._txt(a[2]) or "") if len(a) > 2 else ""
+            py_repl = _re.sub(r"\$(\d+)", r"\\\1", repl)
+            try:
+                return JString(_re.sub(pat, py_repl, s, count=count))
+            except Exception:
+                return JString(s.replace(pat, repl, 1) if count == 1 else s.replace(pat, repl))
+        self.register("Ljava/lang/String;", "replaceAll", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                      lambda a: _str_re_replace(a, 0))
+        self.register("Ljava/lang/String;", "replaceFirst", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                      lambda a: _str_re_replace(a, 1))
+        def _str_cmp(a, ic=False):
+            s1 = (self._txt(a[0]) or "") if a else ""
+            s2 = (self._txt(a[1]) or "") if len(a) > 1 else ""
+            if ic:
+                s1, s2 = s1.lower(), s2.lower()
+            return -1 if s1 < s2 else (1 if s1 > s2 else 0)
+        self.register("Ljava/lang/String;", "compareTo", "(Ljava/lang/String;)I", lambda a: _str_cmp(a, False))
+        self.register("Ljava/lang/String;", "compareTo", "(Ljava/lang/Object;)I", lambda a: _str_cmp(a, False))
+        self.register("Ljava/lang/String;", "compareToIgnoreCase", "(Ljava/lang/String;)I", lambda a: _str_cmp(a, True))
+        self.register("Ljava/lang/String;", "toLowerCase", "()Ljava/lang/String;",
+                      lambda a: JString((self._txt(a[0]) or "").lower()))
+        self.register("Ljava/lang/String;", "toLowerCase", "(Ljava/util/Locale;)Ljava/lang/String;",
+                      lambda a: JString((self._txt(a[0]) or "").lower()))
+        self.register("Ljava/lang/String;", "toUpperCase", "()Ljava/lang/String;",
+                      lambda a: JString((self._txt(a[0]) or "").upper()))
+        self.register("Ljava/lang/String;", "toUpperCase", "(Ljava/util/Locale;)Ljava/lang/String;",
+                      lambda a: JString((self._txt(a[0]) or "").upper()))
+        self.register("Ljava/lang/String;", "isBlank", "()Z",
+                      lambda a: 1 if not (self._txt(a[0]) or "").strip() else 0)
         self.register("Ljava/lang/String;", "concat", "(Ljava/lang/String;)Ljava/lang/String;",
                       lambda a: JString((self._txt(a[0]) or "") + ((self._txt(a[1]) or "") if len(a) > 1 else "")))
         self.register("Ljava/lang/String;", "toString", "()Ljava/lang/String;",
@@ -618,39 +908,110 @@ class AndroidStubs:
         self.register("Ljava/util/HashMap;", "size", "()I",
                       lambda a: len(a[0].fields.get("map", {})) if a and isinstance(a[0], JObject) else 0)
         # --- SharedPreferences + Editor (In-Memory-Persistenz pro Lauf) ---
+        def _sp_s32(v):
+            if isinstance(v, (int, bool)):
+                x = int(v) & 0xFFFFFFFF
+                return x - 0x100000000 if (x & 0x80000000) else x
+            return 0
+
+        def _sp_s64(v):
+            if isinstance(v, (int, bool)):
+                x = int(v) & 0xFFFFFFFFFFFFFFFF
+                return x - (1 << 64) if (x & (1 << 63)) else x
+            return 0
+
         def _sp_store(sp_obj):
             if isinstance(sp_obj, JObject):
                 nm = sp_obj.fields.get("__prefs_name") or "default"
                 return self._prefs_store.setdefault(nm, {})
             return self._prefs_store.setdefault("default", {})
 
-        def _sp_get(a, fallback=0):
+        def _sp_get(a, fallback=0, norm=None):
             key = self._txt(a[1]) if len(a) > 1 else None
             default_v = a[2] if len(a) > 2 else fallback
             store = _sp_store(a[0] if a else None)
-            return store[key] if (key is not None and key in store) else default_v
+            val = store[key] if (key is not None and key in store) else default_v
+            return norm(val) if callable(norm) else val
 
         def _sp_editor(a):
             sp_obj = a[0] if a else None
             nm = sp_obj.fields.get("__prefs_name", "default") if isinstance(sp_obj, JObject) else "default"
             return JObject("Landroid/content/SharedPreferences$Editor;", {"__prefs_name": nm})
 
-        def _sp_put(a, is_bool=False):
+        def _sp_put(a, is_bool=False, norm=None):
             ed = a[0] if a else None
             key = self._txt(a[1]) if len(a) > 1 else None
-            val = (1 if a[2] else 0) if (is_bool and len(a) > 2) else (a[2] if len(a) > 2 else None)
+            raw_v = a[2] if len(a) > 2 else None
+            if is_bool:
+                val = (1 if raw_v else 0) if len(a) > 2 else 0
+            elif callable(norm):
+                val = norm(raw_v) if len(a) > 2 else 0
+            else:
+                val = raw_v
             if key is not None:
                 _sp_store(ed)[key] = val
             return ed
+
+        def _sp_get_stringset(a):
+            key = self._txt(a[1]) if len(a) > 1 else None
+            default_v = a[2] if len(a) > 2 else None
+            store = _sp_store(a[0] if a else None)
+            if key is not None and key in store:
+                raw = store[key]
+                if isinstance(raw, JObject) and ("__items" in (raw.fields or {}) or "$items" in (raw.fields or {})):
+                    items = list(raw.fields.get("__items") or raw.fields.get("$items") or ())
+                    jitems = [x if isinstance(x, JString) else JString(self._txt(x) or "") for x in items]
+                    return JObject("Ljava/util/LinkedHashSet;", {"__items": list(jitems), "$items": list(jitems)})
+                if isinstance(raw, (list, tuple, set)):
+                    jitems = [x if isinstance(x, JString) else JString(self._txt(x) or "") for x in raw]
+                    return JObject("Ljava/util/LinkedHashSet;", {"__items": list(jitems), "$items": list(jitems)})
+            return default_v
+
+        def _sp_put_stringset(a):
+            ed = a[0] if a else None
+            key = self._txt(a[1]) if len(a) > 1 else None
+            raw_v = a[2] if len(a) > 2 else None
+            if key is not None:
+                if raw_v is None or raw_v == 0:
+                    _sp_store(ed).pop(key, None)
+                else:
+                    ext = self._extract_coll_items(raw_v)
+                    jitems = [x if isinstance(x, JString) else JString(self._txt(x) or "") for x in ext]
+                    _sp_store(ed)[key] = JObject("Ljava/util/LinkedHashSet;", {"__items": list(jitems), "$items": list(jitems)})
+            return ed
+
+        def _sp_get_all_base(a):
+            raw = dict(_sp_store(a[0] if a else None))
+            m = {str(k): (JString(v) if isinstance(v, str) else v) for k, v in raw.items()}
+            rk = {str(k): JString(str(k)) for k in raw.keys()}
+            return JObject("Ljava/util/HashMap;", {"map": m, "__raw_keys": rk})
+
+        def _sp_get_float(a):
+            key = self._txt(a[1]) if len(a) > 1 else None
+            store = _sp_store(a[0] if a else None)
+            if key is not None and key in store:
+                val = store[key]
+                if isinstance(val, float):
+                    return val
+                if isinstance(val, int) and not isinstance(val, bool) and (val & 0x7FFFFFFF) >= 0x00800000:
+                    return _as_py_f32(val)
+                try:
+                    return float(val or 0.0)
+                except Exception:
+                    return 0.0
+            return _as_py_f32(a[2]) if len(a) > 2 else 0.0
 
         for _sp_cls in ("Landroid/content/SharedPreferences;",):
             self.register(_sp_cls, "getString",
                           "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
                           lambda a: _sp_get(a, JString("")))
-            self.register(_sp_cls, "getInt", "(Ljava/lang/String;I)I", lambda a: _sp_get(a, 0))
-            self.register(_sp_cls, "getLong", "(Ljava/lang/String;J)J", lambda a: _sp_get(a, 0))
-            self.register(_sp_cls, "getFloat", "(Ljava/lang/String;F)F", lambda a: _sp_get(a, 0.0))
+            self.register(_sp_cls, "getInt", "(Ljava/lang/String;I)I", lambda a: _sp_get(a, 0, norm=_sp_s32))
+            self.register(_sp_cls, "getLong", "(Ljava/lang/String;J)J", lambda a: _sp_get(a, 0, norm=_sp_s64))
+            self.register(_sp_cls, "getFloat", "(Ljava/lang/String;F)F", _sp_get_float)
             self.register(_sp_cls, "getBoolean", "(Ljava/lang/String;Z)Z", lambda a: _sp_get(a, 0))
+            self.register(_sp_cls, "getStringSet",
+                          "(Ljava/lang/String;Ljava/util/Set;)Ljava/util/Set;", _sp_get_stringset)
+            self.register(_sp_cls, "getAll", "()Ljava/util/Map;", _sp_get_all_base)
             self.register(_sp_cls, "contains", "(Ljava/lang/String;)Z",
                           lambda a: 1 if (len(a) > 1 and (self._txt(a[1]) or "") in _sp_store(a[0])) else 0)
             self.register(_sp_cls, "edit", "()Landroid/content/SharedPreferences$Editor;", _sp_editor)
@@ -661,16 +1022,19 @@ class AndroidStubs:
                       lambda a: _sp_put(a))
         self.register(_ED, "putInt",
                       "(Ljava/lang/String;I)Landroid/content/SharedPreferences$Editor;",
-                      lambda a: _sp_put(a))
+                      lambda a: _sp_put(a, norm=_sp_s32))
         self.register(_ED, "putLong",
                       "(Ljava/lang/String;J)Landroid/content/SharedPreferences$Editor;",
-                      lambda a: _sp_put(a))
+                      lambda a: _sp_put(a, norm=_sp_s64))
         self.register(_ED, "putFloat",
                       "(Ljava/lang/String;F)Landroid/content/SharedPreferences$Editor;",
-                      lambda a: _sp_put(a))
+                      lambda a: _sp_put(a, norm=_as_py_f32))
         self.register(_ED, "putBoolean",
                       "(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;",
                       lambda a: _sp_put(a, is_bool=True))
+        self.register(_ED, "putStringSet",
+                      "(Ljava/lang/String;Ljava/util/Set;)Landroid/content/SharedPreferences$Editor;",
+                      _sp_put_stringset)
         self.register(_ED, "remove",
                       "(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;",
                       lambda a: (_sp_store(a[0]).pop(self._txt(a[1]) or "", None), a[0])[1] if a else None)
@@ -990,7 +1354,8 @@ class AndroidStubs:
         return JObject("Landroid/content/Context;", {"__pkg__": self.profile.package or "com.example.app"})
 
     def make_bundle(self):
-        return JObject("Landroid/os/Bundle;", {"map": {}})
+        m = {}
+        return JObject("Landroid/os/Bundle;", {"map": m, "$map": m})
 
     def _make_file(self, path):
         return JObject("Ljava/io/File;", {"path": path})
@@ -1050,27 +1415,124 @@ class AndroidStubs:
            lambda a: JString(self.profile.package or "com.example.app"))
         # Object-Basis (vererbungs-tolerant)
         bn("toString", "()Ljava/lang/String;",
-           lambda a: JString(a[0].cls if a and isinstance(a[0], JObject) else ""))
+           lambda a: JString(str(a[0].fields["__ename"]))
+           if a and isinstance(a[0], JObject) and "__ename" in a[0].fields
+           else (JString(a[0].cls) if a and isinstance(a[0], JObject) else JString("")))
         bn("hashCode", "()I", lambda a: (id(a[0]) & 0x7fffffff) if a else 0)
         bn("equals", "(Ljava/lang/Object;)Z", lambda a: 1 if len(a) > 1 and a[0] is a[1] else 0)
         bn("getClass", "()Ljava/lang/Class;", lambda a: self._obj_class_obj(a[0] if a else None))
         self.register("Ljava/lang/Object;", "getClass", "()Ljava/lang/Class;",
                       lambda a: self._obj_class_obj(a[0] if a else None))
         # Bundle (exakt)
-        self.register("Landroid/os/Bundle;", "<init>", "()V", lambda a: self._coll_init(a, "map", {}))
+        def _bundle_get_def(a, default=None):
+            if a and isinstance(a[0], JObject):
+                m = self._bundle_map(a[0])
+                k = self._bundle_key(a)
+                if k in m:
+                    return m[k]
+            return default
+
+        self.register("Landroid/os/Bundle;", "<init>", "()V",
+                      lambda a: (AndroidStubs._bundle_map(a[0]), None)[1] if a and isinstance(a[0], JObject) else None)
         self.register("Landroid/os/Bundle;", "putString",
                       "(Ljava/lang/String;Ljava/lang/String;)V", self._bundle_put)
         self.register("Landroid/os/Bundle;", "putInt", "(Ljava/lang/String;I)V", self._bundle_put)
         self.register("Landroid/os/Bundle;", "putBoolean", "(Ljava/lang/String;Z)V", self._bundle_put)
         self.register("Landroid/os/Bundle;", "putLong", "(Ljava/lang/String;J)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putFloat", "(Ljava/lang/String;F)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putDouble", "(Ljava/lang/String;D)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putLongArray", "(Ljava/lang/String;[J)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putIntArray", "(Ljava/lang/String;[I)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putByteArray", "(Ljava/lang/String;[B)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putStringArray", "(Ljava/lang/String;[Ljava/lang/String;)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putStringArrayList", "(Ljava/lang/String;Ljava/util/ArrayList;)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putParcelableArrayList", "(Ljava/lang/String;Ljava/util/ArrayList;)V", self._bundle_put)
+        def _b_as_jstr(v):
+            if v is None:
+                return JString("")
+            return v if isinstance(v, JString) else JString(str(v))
+
+        def _b_unbox(v):
+            if isinstance(v, JObject) and v.cls in (
+                "Ljava/lang/Boolean;", "Ljava/lang/Byte;", "Ljava/lang/Short;",
+                "Ljava/lang/Character;", "Ljava/lang/Integer;", "Ljava/lang/Long;",
+                "Ljava/lang/Float;", "Ljava/lang/Double;",
+            ) and "value" in v.fields:
+                return v.fields["value"]
+            return v
+
+        def _b_s32(v):
+            v = _b_unbox(v)
+            if isinstance(v, (int, bool)):
+                x = int(v) & 0xFFFFFFFF
+                return x - (1 << 32) if (x & (1 << 31)) else x
+            try:
+                x = int(v) & 0xFFFFFFFF
+                return x - (1 << 32) if (x & (1 << 31)) else x
+            except Exception:
+                return 0
+
+        def _b_s64(v):
+            v = _b_unbox(v)
+            if isinstance(v, (int, bool)):
+                x = int(v) & 0xFFFFFFFFFFFFFFFF
+                return x - (1 << 64) if (x & (1 << 63)) else x
+            try:
+                x = int(v) & 0xFFFFFFFFFFFFFFFF
+                return x - (1 << 64) if (x & (1 << 63)) else x
+            except Exception:
+                return 0
+
+        def _b_f(v, default=0.0):
+            v = _b_unbox(v)
+            try:
+                return float(v) if v is not None else float(default)
+            except Exception:
+                return float(default)
+
         self.register("Landroid/os/Bundle;", "getString",
-                      "(Ljava/lang/String;)Ljava/lang/String;", lambda a: self._bundle_get(a) or JString(""))
-        self.register("Landroid/os/Bundle;", "getInt", "(Ljava/lang/String;)I", lambda a: self._bundle_get(a) or 0)
+                      "(Ljava/lang/String;)Ljava/lang/String;", lambda a: _b_as_jstr(self._bundle_get(a)))
+        self.register("Landroid/os/Bundle;", "getString",
+                      "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                      lambda a: (lambda v: (v if isinstance(v, JString) else JString(str(v))) if v is not None else (a[2] if len(a) > 2 else JString("")))(_bundle_get_def(a, None)))
+        self.register("Landroid/os/Bundle;", "getInt", "(Ljava/lang/String;)I", lambda a: _b_s32(self._bundle_get(a) or 0))
+        self.register("Landroid/os/Bundle;", "getInt", "(Ljava/lang/String;I)I",
+                      lambda a: _b_s32(_bundle_get_def(a, a[2] if len(a) > 2 else 0)))
+        self.register("Landroid/os/Bundle;", "getLong", "(Ljava/lang/String;)J",
+                      lambda a: _b_s64(self._bundle_get(a) or 0))
+        self.register("Landroid/os/Bundle;", "getLong", "(Ljava/lang/String;J)J",
+                      lambda a: _b_s64(_bundle_get_def(a, a[2] if len(a) > 2 else 0)))
+        self.register("Landroid/os/Bundle;", "getFloat", "(Ljava/lang/String;)F",
+                      lambda a: _b_f(self._bundle_get(a), 0.0))
+        self.register("Landroid/os/Bundle;", "getFloat", "(Ljava/lang/String;F)F",
+                      lambda a: _b_f(_bundle_get_def(a, a[2] if len(a) > 2 else 0.0), a[2] if len(a) > 2 else 0.0))
+        self.register("Landroid/os/Bundle;", "getDouble", "(Ljava/lang/String;)D",
+                      lambda a: _b_f(self._bundle_get(a), 0.0))
+        self.register("Landroid/os/Bundle;", "getDouble", "(Ljava/lang/String;D)D",
+                      lambda a: _b_f(_bundle_get_def(a, a[2] if len(a) > 2 else 0.0), a[2] if len(a) > 2 else 0.0))
+        self.register("Landroid/os/Bundle;", "getLongArray", "(Ljava/lang/String;)[J", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getIntArray", "(Ljava/lang/String;)[I", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getByteArray", "(Ljava/lang/String;)[B", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getStringArray", "(Ljava/lang/String;)[Ljava/lang/String;", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getStringArrayList", "(Ljava/lang/String;)Ljava/util/ArrayList;", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getParcelableArrayList", "(Ljava/lang/String;)Ljava/util/ArrayList;", self._bundle_get)
         self.register("Landroid/os/Bundle;", "getBoolean", "(Ljava/lang/String;)Z",
-                      lambda a: 1 if self._bundle_get(a) else 0)
+                      lambda a: 1 if _b_unbox(self._bundle_get(a)) else 0)
         self.register("Landroid/os/Bundle;", "getBoolean", "(Ljava/lang/String;Z)Z",
-                      lambda a: (1 if self._bundle_get(a) else 0) if (a and isinstance(a[0], JObject) and self._bundle_key(a) in a[0].fields.get("map", {})) else (1 if len(a) > 2 and a[2] else 0))
+                      lambda a: (1 if _b_unbox(self._bundle_get(a)) else 0) if (a and isinstance(a[0], JObject) and self._bundle_key(a) in self._bundle_map(a[0])) else (1 if len(a) > 2 and _b_unbox(a[2]) else 0))
         self.register("Landroid/os/Bundle;", "containsKey", "(Ljava/lang/String;)Z", self._bundle_has)
+        self.register("Landroid/os/Bundle;", "putParcelable",
+                      "(Ljava/lang/String;Landroid/os/Parcelable;)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "putSerializable",
+                      "(Ljava/lang/String;Ljava/io/Serializable;)V", self._bundle_put)
+        self.register("Landroid/os/Bundle;", "getParcelable",
+                      "(Ljava/lang/String;)Landroid/os/Parcelable;", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getParcelable",
+                      "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getSerializable",
+                      "(Ljava/lang/String;)Ljava/io/Serializable;", self._bundle_get)
+        self.register("Landroid/os/Bundle;", "getSerializable",
+                      "(Ljava/lang/String;Ljava/lang/Class;)Ljava/io/Serializable;", self._bundle_get)
 
         # Intent (Extras & Flags vollstaendig)
         def _intent_get_extra(a, fallback=None, kind="raw"):
@@ -1080,32 +1542,34 @@ class AndroidStubs:
                 if k in ex:
                     v = ex[k]
                     if kind == "bool":
-                        return 1 if v else 0
+                        return 1 if _b_unbox(v) else 0
                     if kind == "int":
+                        u = _b_unbox(v)
                         try:
-                            return int(v) if v is not None else (int(fallback) if fallback is not None else 0)
+                            return int(u) if u is not None else (int(_b_unbox(fallback)) if fallback is not None else 0)
                         except Exception:
-                            return int(fallback) if fallback is not None else 0
+                            return int(_b_unbox(fallback)) if fallback is not None else 0
                     if kind == "float":
+                        u = _b_unbox(v)
                         try:
-                            return float(v) if v is not None else float(fallback or 0.0)
+                            return float(u) if u is not None else float(_b_unbox(fallback) or 0.0)
                         except Exception:
-                            return float(fallback or 0.0)
+                            return float(_b_unbox(fallback) or 0.0)
                     if kind == "str":
                         if isinstance(v, JString):
                             return v
                         return JString(str(v)) if v not in (None, 0) else None
                     return v if v not in (0,) else None
             if kind == "bool":
-                return 1 if fallback else 0
+                return 1 if _b_unbox(fallback) else 0
             if kind == "int":
                 try:
-                    return int(fallback) if fallback is not None else 0
+                    return int(_b_unbox(fallback)) if fallback is not None else 0
                 except Exception:
                     return 0
             if kind == "float":
                 try:
-                    return float(fallback or 0.0)
+                    return float(_b_unbox(fallback) or 0.0)
                 except Exception:
                     return 0.0
             return fallback
@@ -1168,19 +1632,19 @@ class AndroidStubs:
     @staticmethod
     def _bundle_put(a):
         if a and isinstance(a[0], JObject):
-            a[0].fields.setdefault("map", {})[AndroidStubs._bundle_key(a)] = a[2] if len(a) > 2 else None
+            AndroidStubs._bundle_map(a[0])[AndroidStubs._bundle_key(a)] = a[2] if len(a) > 2 else None
         return None
 
     @staticmethod
     def _bundle_get(a):
         if a and isinstance(a[0], JObject):
-            return a[0].fields.get("map", {}).get(AndroidStubs._bundle_key(a))
+            return AndroidStubs._bundle_map(a[0]).get(AndroidStubs._bundle_key(a))
         return None
 
     @staticmethod
     def _bundle_has(a):
         if a and isinstance(a[0], JObject):
-            return 1 if AndroidStubs._bundle_key(a) in a[0].fields.get("map", {}) else 0
+            return 1 if AndroidStubs._bundle_key(a) in AndroidStubs._bundle_map(a[0]) else 0
         return 0
 
     # ---- Reflection (generisch: Class.forName/getMethod, Method.invoke) -----
@@ -1302,14 +1766,54 @@ class AndroidStubs:
         except Exception:
             return 0
 
+    def _sync_backing_map_remove(self, coll_obj, removed_item):
+        """Synchronisiert Mutationen auf Map-Views (values/keySet/entrySet) zurueck auf die backing Map."""
+        if not isinstance(coll_obj, JObject):
+            return False
+        bm = coll_obj.fields.get("$backing_map")
+        kind = coll_obj.fields.get("$backing_kind")
+        if not isinstance(bm, JObject) or not kind:
+            return False
+        mp = bm.fields.get("map")
+        raw = bm.fields.get("__raw_keys")
+        if not isinstance(mp, dict):
+            return False
+        if kind == "values":
+            for k, val in list(mp.items()):
+                if self._eq_el(val, removed_item):
+                    del mp[k]
+                    if isinstance(raw, dict):
+                        raw.pop(k, None)
+                    return True
+            return False
+        if kind == "keys":
+            mk = self._mkey(removed_item)
+            if mk in mp:
+                del mp[mk]
+                if isinstance(raw, dict):
+                    raw.pop(mk, None)
+                return True
+            return False
+        if kind == "entries" and isinstance(removed_item, JObject):
+            mk = self._mkey(removed_item.fields.get("key"))
+            if mk in mp and self._eq_el(mp[mk], removed_item.fields.get("value")):
+                del mp[mk]
+                if isinstance(raw, dict):
+                    raw.pop(mk, None)
+                return True
+        return False
+
     def _coll_remove(self, a):
         obj = a[0] if a else None
         e = a[1] if len(a) > 1 else None
         items = self._coll_items(obj)
         for i, x in enumerate(items):
             if self._eq_el(x, e):
+                self._sync_backing_map_remove(obj, x)
                 del items[i]
                 return 1
+        if self._sync_backing_map_remove(obj, e):
+            return 1
         return 0
 
     def _coll_contains(self, a):
@@ -1324,14 +1828,27 @@ class AndroidStubs:
         return 1 if not self._coll_items(a[0] if a else None) else 0
 
     def _coll_clear(self, a):
-        self._coll_items(a[0] if a else None).clear()
+        obj = a[0] if a else None
+        self._coll_items(obj).clear()
+        if isinstance(obj, JObject):
+            bm = obj.fields.get("$backing_map")
+            if isinstance(bm, JObject):
+                if isinstance(bm.fields.get("map"), dict):
+                    bm.fields["map"].clear()
+                if isinstance(bm.fields.get("__raw_keys"), dict):
+                    bm.fields["__raw_keys"].clear()
         return None
 
     def _coll_iterator(self, a):
         return JObject("Ljava/util/Iterator;", {"__src": a[0] if a else None, "__idx": 0})
 
     def _coll_toarray(self, a):
-        return JArray("[Ljava/lang/Object;", list(self._coll_items(a[0] if a else None)))
+        el = (
+            (getattr(a[1], "eltype", None) or "[Ljava/lang/Object;")
+            if len(a) > 1 and isinstance(a[1], JArray)
+            else "[Ljava/lang/Object;"
+        )
+        return JArray(el, list(self._coll_items(a[0] if a else None)))
 
     def _coll_get(self, a):
         obj = a[0] if a else None
@@ -1384,33 +1901,65 @@ class AndroidStubs:
                 return i
         return -1
 
+    def _coll_tostr(self, a):
+        obj = a[0] if a else None
+        if not isinstance(obj, JObject):
+            return JString("[]")
+        items = self._coll_items(obj)
+        parts = []
+        for x in items:
+            if x is obj:
+                parts.append("(this Collection)")
+            else:
+                parts.append(self._obj_to_str(x))
+        return JString("[" + ", ".join(parts) + "]")
+
+    def _iter_state(self, it):
+        src = it.fields.get("__src")
+        if src is None and "__items" in it.fields:
+            items = it.fields.get("__items")
+            if not isinstance(items, list):
+                items = list(items) if items is not None else []
+                it.fields["__items"] = items
+        else:
+            items = self._coll_items(src)
+        pos_key = "__pos" if "__pos" in it.fields and "__idx" not in it.fields else "__idx"
+        idx = int(it.fields.get(pos_key, it.fields.get("__pos", 0)) or 0)
+        return src, items, pos_key, idx
+
+    def _iter_set_pos(self, it, pos_key, val):
+        it.fields[pos_key] = val
+        if "__pos" in it.fields and pos_key != "__pos":
+            it.fields["__pos"] = val
+
     def _iter_hasnext(self, a):
         it = a[0] if a else None
         if not isinstance(it, JObject):
             return 0
-        items = self._coll_items(it.fields.get("__src"))
-        return 1 if it.fields.get("__idx", 0) < len(items) else 0
+        _, items, _, idx = self._iter_state(it)
+        return 1 if idx < len(items) else 0
 
     def _iter_next(self, a):
         it = a[0] if a else None
         if not isinstance(it, JObject):
             return 0
-        items = self._coll_items(it.fields.get("__src"))
-        i = it.fields.get("__idx", 0)
+        _, items, pos_key, i = self._iter_state(it)
         if i >= len(items):
             return 0
-        it.fields["__idx"] = i + 1
+        self._iter_set_pos(it, pos_key, i + 1)
         return items[i]
 
     def _iter_remove(self, a):
         it = a[0] if a else None
         if not isinstance(it, JObject):
             return None
-        items = self._coll_items(it.fields.get("__src"))
-        i = it.fields.get("__idx", 0) - 1
+        src, items, pos_key, idx = self._iter_state(it)
+        i = idx - 1
         if 0 <= i < len(items):
+            if src is not None:
+                self._sync_backing_map_remove(src, items[i])
             del items[i]
-            it.fields["__idx"] = i
+            self._iter_set_pos(it, pos_key, i)
         return None
 
     def _atomic_init(self, a):
@@ -1479,6 +2028,22 @@ class AndroidStubs:
             R(cls, "<init>", "()V", self._jcoll_init)
             R(cls, "<init>", "(I)V", self._jcoll_init)
             R(cls, "<init>", "(Ljava/util/Collection;)V", self._jcoll_init)
+        for _ccls in (
+            "Ljava/util/AbstractCollection;", "Ljava/util/AbstractList;",
+            "Ljava/util/AbstractSequentialList;", "Ljava/util/AbstractSet;",
+            "Ljava/util/Collection;", "Ljava/util/List;", "Ljava/util/Set;",
+            "Ljava/util/ArrayList;", "Ljava/util/LinkedList;", "Ljava/util/Vector;",
+            "Ljava/util/Stack;", "Ljava/util/ArrayDeque;",
+            "Ljava/util/concurrent/CopyOnWriteArrayList;", "Ljava/util/concurrent/CopyOnWriteArraySet;",
+            "Ljava/util/HashSet;", "Ljava/util/LinkedHashSet;", "Ljava/util/TreeSet;",
+            "Ljava/util/Arrays$ArrayList;",
+            "Ljava/util/Collections$EmptyList;", "Ljava/util/Collections$SingletonList;",
+            "Ljava/util/Collections$UnmodifiableList;", "Ljava/util/Collections$UnmodifiableCollection;",
+            "Ljava/util/Collections$EmptySet;", "Ljava/util/Collections$SingletonSet;",
+            "Lkotlin/collections/EmptyList;", "Lkotlin/collections/EmptySet;",
+            "Lkotlin/collections/ArrayDeque;",
+        ):
+            R(_ccls, "toString", "()Ljava/lang/String;", self._coll_tostr)
         RB("add", "(Ljava/lang/Object;)Z", self._coll_add)
         RB("add", "(ILjava/lang/Object;)V", self._coll_add_idx)
         RB("addAll", "(Ljava/util/Collection;)Z", self._coll_add_all)
@@ -1563,6 +2128,11 @@ class AndroidStubs:
         if a and isinstance(a[0], JObject):
             obj = a[0]
             obj.fields["_finishing"] = 1
+            if callable(getattr(self, "_cancel_owner_coroutines", None)):
+                try:
+                    self._cancel_owner_coroutines(obj)
+                except Exception:
+                    pass
             cur = getattr(self, "_current_activity", None)
             if cur is None:
                 if self._is_curr_act(obj):
@@ -1589,16 +2159,33 @@ class AndroidStubs:
             try:
                 return self.vm.invoke_virtual(task, name, sig, cargs)
             except Exception as e:
-                emsg = str(e)
-                if type(e).__name__ in ("DebugStop", "DalvikUnknownOpcode") or any(
-                    k in emsg for k in ("StepBudget", "WallBudget", "StackOverflow", "max_depth")
-                ):
+                from core.java.dalvik import DalvikUnknownOpcode, VmBudgetExceeded
+                if isinstance(e, (DebugStop, VmBudgetExceeded, DalvikUnknownOpcode)):
                     raise
+                if hasattr(self.vm, "deviations"):
+                    self.vm.deviations.record(
+                        "asynctask_error",
+                        f"{getattr(task, 'cls', '?')}->{name}{sig}",
+                        repr(e),
+                        step=getattr(self.vm, "steps", 0),
+                    )
                 return None
 
-        _call("onPreExecute", "()V", (task,))
-        res = _call("doInBackground", "([Ljava/lang/Object;)Ljava/lang/Object;", (task, params))
-        _call("onPostExecute", "(Ljava/lang/Object;)V", (task, res))
+        if not task.fields.get("_cancelled"):
+            _call("onPreExecute", "()V", (task,))
+        res = None
+        if not task.fields.get("_cancelled"):
+            res = _call("doInBackground", "([Ljava/lang/Object;)Ljava/lang/Object;", (task, params))
+        if task.fields.get("_cancelled"):
+            if (hasattr(self.vm, "_resolve_method")
+                    and self.vm._resolve_method(task.cls, task.cls, "onCancelled", "(Ljava/lang/Object;)V") is None
+                    and self.vm._resolve_method(task.cls, task.cls, "onCancelled", "()V") is not None):
+                _call("onCancelled", "()V", (task,))
+            else:
+                _call("onCancelled", "(Ljava/lang/Object;)V", (task, res))
+        else:
+            _call("onPostExecute", "(Ljava/lang/Object;)V", (task, res))
+        task.fields["_finished"] = True
         return task
 
     def _get_application(self, a=None):
@@ -1611,8 +2198,36 @@ class AndroidStubs:
             d = int(delay_ms or 0)
         except Exception:
             d = 0
-        if isinstance(runnable, JObject) and 0 <= d <= 3000 and len(self.pending_runnables) < 128:
-            self.pending_runnables.append(runnable)
+        if not isinstance(runnable, JObject):
+            return 1
+        vm = getattr(self, "vm", None)
+        if d < 0 or d > 60_000:
+            if vm is not None and hasattr(vm, "deviations"):
+                vm.deviations.record(
+                    "dropped_runnable",
+                    getattr(runnable, "cls", "?"),
+                    f"delay_ms={d}",
+                    step=getattr(vm, "steps", 0),
+                )
+            return 0
+        if len(self.pending_runnables) >= 256:
+            if vm is not None and hasattr(vm, "deviations"):
+                vm.deviations.record(
+                    "dropped_runnable",
+                    getattr(runnable, "cls", "?"),
+                    "queue_full",
+                    step=getattr(vm, "steps", 0),
+                )
+            return 0
+        self._q_seq += 1
+        clock_ms = int(getattr(self, "_clock_ms", 0) or 0)
+        runnable.fields["_due_ms"] = clock_ms + max(0, d)
+        runnable.fields["_q_seq"] = self._q_seq
+        self.pending_runnables.append(runnable)
+        self.pending_runnables.sort(key=lambda r: (
+            int(r.fields.get("_due_ms", 0)) if isinstance(r, JObject) else 0,
+            int(r.fields.get("_q_seq", 0)) if isinstance(r, JObject) else 0,
+        ))
         return 1
 
     def _install_activity_ctx(self):
@@ -1636,26 +2251,44 @@ class AndroidStubs:
                       else self._mk_window().fields.get("callback")))
         RB("setCallback", "(Landroid/view/Window$Callback;)V",
            lambda a: a[0].fields.__setitem__("callback", a[1]) if len(a) > 1 and isinstance(a[0], JObject) else None)
-        RB("isTaskRoot", "()Z", lambda a: 1)
+        RB("isTaskRoot", "()Z",
+           lambda a: 0 if bool(getattr(getattr(self, "_active_runner", None), "activity_stack", None)) else 1)
         RB("isFinishing", "()Z", lambda a: int(bool(a[0].fields.get("_finishing"))) if a and isinstance(a[0], JObject) else 0)
         RB("isDestroyed", "()Z", lambda a: int(bool(a[0].fields.get("_destroyed"))) if a and isinstance(a[0], JObject) else 0)
+        def _act_on_back(a):
+            disp = getattr(self, "_dispatch_back_press", None)
+            if callable(disp):
+                return disp(a[0] if a else None)
+            return self._finish_act(a)
+
         R("Landroid/app/Activity;", "finish", "()V", self._finish_act)
         R("Landroid/app/Activity;", "finishAfterTransition", "()V", self._finish_act)
         R("Landroid/app/Activity;", "finishAffinity", "()V", self._finish_act)
         R("Landroid/app/Activity;", "finishAndRemoveTask", "()V", self._finish_act)
-        R("Landroid/app/Activity;", "onBackPressed", "()V", self._finish_act)
+        R("Landroid/app/Activity;", "onBackPressed", "()V", _act_on_back)
         RB("finish", "()V", self._finish_act)
         RB("finishAfterTransition", "()V", self._finish_act)
         RB("finishAffinity", "()V", self._finish_act)
-        RB("onBackPressed", "()V", self._finish_act)
+        RB("onBackPressed", "()V", _act_on_back)
         R("Landroid/os/AsyncTask;", "<init>", "()V", lambda a: None)
         R("Landroid/os/AsyncTask;", "execute", "(Ljava/lang/Runnable;)V",
           lambda a: (self._queue_runnable(a[0] if a else None, 0), None)[1])
         R("Landroid/os/AsyncTask;", "execute", "([Ljava/lang/Object;)Landroid/os/AsyncTask;", self._asynctask_exec)
         R("Landroid/os/AsyncTask;", "executeOnExecutor",
           "(Ljava/util/concurrent/Executor;[Ljava/lang/Object;)Landroid/os/AsyncTask;", self._asynctask_exec)
-        R("Landroid/os/AsyncTask;", "cancel", "(Z)Z", lambda a: 1)
-        R("Landroid/os/AsyncTask;", "isCancelled", "()Z", lambda a: 0)
+        def _at_cancel(a):
+            task = a[0] if a and isinstance(a[0], JObject) else None
+            if task is None or task.fields.get("_finished") or task.fields.get("_cancelled"):
+                return 0
+            task.fields["_cancelled"] = True
+            return 1
+
+        def _at_is_cancelled(a):
+            task = a[0] if a and isinstance(a[0], JObject) else None
+            return 1 if (task is not None and task.fields.get("_cancelled")) else 0
+
+        R("Landroid/os/AsyncTask;", "cancel", "(Z)Z", _at_cancel)
+        R("Landroid/os/AsyncTask;", "isCancelled", "()Z", _at_is_cancelled)
         R("Landroid/os/AsyncTask;", "publishProgress", "([Ljava/lang/Object;)V",
           lambda a: (self.vm.invoke_virtual(a[0], "onProgressUpdate", "([Ljava/lang/Object;)V",
                                             (a[0], a[1] if len(a) > 1 else None))
@@ -1717,7 +2350,7 @@ class AndroidStubs:
         R(SB, "append", "([C)Ljava/lang/StringBuilder;",
           lambda a: self._sb_push(a[0], self._chars_to_text(a[1] if len(a) > 1 else None)))
         R(SB, "append", "(Ljava/lang/Object;)Ljava/lang/StringBuilder;",
-          lambda a: self._sb_push(a[0], self._txt(a[1]) if (len(a) > 1 and self._txt(a[1]) is not None) else "null"))
+          lambda a: self._sb_push(a[0], self._obj_to_str(a[1] if len(a) > 1 else None)))
         R(SB, "append", "(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;",
           lambda a: self._sb_push(a[0], (self._txt(a[1]) or "") if len(a) > 1 else ""))
         R(SB, "append", "(F)Ljava/lang/StringBuilder;", lambda a: self._sb_push(a[0], repr(float(a[1]))))
@@ -1773,11 +2406,44 @@ class AndroidStubs:
           lambda a: 1 if (self._txt(a[0]) or "").endswith(self._txt(a[1]) or "") else 0)
 
         # --- System / Class / Throwable / Reference ---
+        _SYS_PROPS = {
+            "java.io.tmpdir": "/data/local/tmp",
+            "file.separator": "/",
+            "path.separator": ":",
+            "line.separator": "\n",
+            "user.dir": "/",
+            "user.home": "/data/local/tmp",
+            "os.name": "Linux",
+            "http.agent": "Dalvik/2.1.0 (Linux; U; Android 13)",
+        }
+
+        def _sys_get_prop(a):
+            key = self._txt(a[0]) if a else None
+            if key in _SYS_PROPS:
+                return JString(_SYS_PROPS[key])
+            return a[1] if len(a) > 1 else None
+
         R("Ljava/lang/System;", "identityHashCode", "(Ljava/lang/Object;)I",
           lambda a: (id(a[0]) & 0x7fffffff) if a and a[0] is not None else 0)
         R("Ljava/lang/System;", "getProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-          lambda a: a[2] if len(a) > 2 else JString(""))
-        R("Ljava/lang/System;", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;", lambda a: None)
+          _sys_get_prop)
+        R("Ljava/lang/System;", "getProperty", "(Ljava/lang/String;)Ljava/lang/String;",
+          _sys_get_prop)
+        _JLOG = "Ljava/util/logging/Logger;"
+        R(_JLOG, "getLogger", "(Ljava/lang/String;)Ljava/util/logging/Logger;",
+          lambda a: JObject(_JLOG, {"name": (self._txt(a[0]) if a else None) or ""}))
+        for _lm, _lsig in (
+            ("log", "(Ljava/util/logging/Level;Ljava/lang/String;)V"),
+            ("log", "(Ljava/util/logging/Level;Ljava/lang/String;Ljava/lang/Throwable;)V"),
+            ("log", "(Ljava/util/logging/Level;Ljava/lang/String;[Ljava/lang/Object;)V"),
+            ("info", "(Ljava/lang/String;)V"),
+            ("warning", "(Ljava/lang/String;)V"),
+            ("fine", "(Ljava/lang/String;)V"),
+            ("setLevel", "(Ljava/util/logging/Level;)V"),
+            ("addHandler", "(Ljava/util/logging/Handler;)V"),
+        ):
+            R(_JLOG, _lm, _lsig, lambda a: None)
+        R(_JLOG, "isLoggable", "(Ljava/util/logging/Level;)Z", lambda a: 0)
         R("Ljava/lang/System;", "nanoTime", "()J", self._sys_nanotime)
         self.register_by_name("getCause", "()Ljava/lang/Throwable;",
                               lambda a: a[0].fields.get("cause") if a and isinstance(a[0], JObject) else None)
@@ -1786,12 +2452,13 @@ class AndroidStubs:
         self.register_by_name("getLocalizedMessage", "()Ljava/lang/String;",
                               lambda a: JString(a[0].fields.get("message", "") or "") if a and isinstance(a[0], JObject) else JString(""))
         R("Ljava/lang/Class;", "getCanonicalName", "()Ljava/lang/String;", self._cls_getname)
-        R("Ljava/lang/ref/WeakReference;", "<init>", "(Ljava/lang/Object;)V",
-          lambda a: a[0].fields.__setitem__("ref", a[1] if len(a) > 1 else None) if a and isinstance(a[0], JObject) else None)
-        R("Ljava/lang/ref/WeakReference;", "get", "()Ljava/lang/Object;",
-          lambda a: a[0].fields.get("ref") if a and isinstance(a[0], JObject) else None)
-        R("Ljava/lang/ref/WeakReference;", "clear", "()V",
-          lambda a: a[0].fields.__setitem__("ref", None) if a and isinstance(a[0], JObject) else None)
+        for _ref_cls in ("Ljava/lang/ref/Reference;", "Ljava/lang/ref/WeakReference;", "Ljava/lang/ref/SoftReference;"):
+            R(_ref_cls, "<init>", "(Ljava/lang/Object;)V",
+              lambda a: a[0].fields.__setitem__("ref", a[1] if len(a) > 1 else None) if a and isinstance(a[0], JObject) else None)
+            R(_ref_cls, "get", "()Ljava/lang/Object;",
+              lambda a: a[0].fields.get("ref") if a and isinstance(a[0], JObject) else None)
+            R(_ref_cls, "clear", "()V",
+              lambda a: a[0].fields.__setitem__("ref", None) if a and isinstance(a[0], JObject) else None)
         # Throwable/Exception <init>(String) -> message (vererbungstolerant)
         self.register_by_name("<init>", "(Ljava/lang/String;)V", self._throwable_init_msg)
         self.register_by_name("<init>", "(Ljava/lang/String;Ljava/lang/Throwable;)V", self._throwable_init_msg_cause)
@@ -1839,15 +2506,24 @@ class AndroidStubs:
         R("Ljava/util/Collections;", "addAll",
           "(Ljava/util/Collection;[Ljava/lang/Object;)Z", _collections_add_all)
         for MAP in ("Ljava/util/HashMap;", "Ljava/util/LinkedHashMap;", "Ljava/util/concurrent/ConcurrentHashMap;",
-                    "Ljava/util/TreeMap;", "Ljava/util/Map;", "Ljava/util/SortedMap;"):
-            if MAP not in ("Ljava/util/Map;", "Ljava/util/SortedMap;"):
+                    "Ljava/util/TreeMap;", "Ljava/util/EnumMap;", "Ljava/util/Map;", "Ljava/util/SortedMap;"):
+            if MAP not in ("Ljava/util/Map;", "Ljava/util/SortedMap;", "Ljava/util/EnumMap;"):
                 R(MAP, "<init>", "()V", lambda a: self._coll_init(a, "map", {}))
+                R(MAP, "<init>", "(I)V", lambda a: self._coll_init(a, "map", {}))
+                R(MAP, "<init>", "(IF)V", lambda a: self._coll_init(a, "map", {}))
+                R(MAP, "<init>", "(IFI)V", lambda a: self._coll_init(a, "map", {}))
                 R(MAP, "<init>", "(Ljava/util/Map;)V",
                   lambda a, _sort=(MAP == "Ljava/util/TreeMap;"): self._map_copy_init(
                       a[0] if a else None, a[1] if len(a) > 1 else None, sort_keys=_sort))
                 if MAP == "Ljava/util/TreeMap;":
                     R(MAP, "<init>", "(Ljava/util/SortedMap;)V",
                       lambda a: self._map_copy_init(a[0] if a else None, a[1] if len(a) > 1 else None, sort_keys=True))
+            elif MAP == "Ljava/util/EnumMap;":
+                R(MAP, "<init>", "(Ljava/lang/Class;)V", lambda a: self._coll_init(a, "map", {}))
+                R(MAP, "<init>", "(Ljava/util/EnumMap;)V",
+                  lambda a: self._map_copy_init(a[0] if a else None, a[1] if len(a) > 1 else None))
+                R(MAP, "<init>", "(Ljava/util/Map;)V",
+                  lambda a: self._map_copy_init(a[0] if a else None, a[1] if len(a) > 1 else None))
             R(MAP, "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", self._map_put)
             R(MAP, "putIfAbsent", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", self._map_put_if_absent)
             R(MAP, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", self._map_get)
@@ -1856,7 +2532,11 @@ class AndroidStubs:
             R(MAP, "size", "()I", lambda a: len(a[0].fields.get("map", {})) if a and isinstance(a[0], JObject) else 0)
             R(MAP, "isEmpty", "()Z", lambda a: 1 if not (a and isinstance(a[0], JObject) and a[0].fields.get("map", {})) else 0)
             R(MAP, "values", "()Ljava/util/Collection;",
-              lambda a: JObject("Ljava/util/ArrayList;", {"__items": list((a[0].fields.get("map", {}) if a and isinstance(a[0], JObject) else {}).values())}))
+              lambda a: JObject("Ljava/util/ArrayList;", {
+                  "__items": list((a[0].fields.get("map", {}) if a and isinstance(a[0], JObject) else {}).values()),
+                  "$backing_map": a[0] if a and isinstance(a[0], JObject) else None,
+                  "$backing_kind": "values",
+              }))
             R(MAP, "keySet", "()Ljava/util/Set;", self._map_keyset)
             R(MAP, "entrySet", "()Ljava/util/Set;", self._map_entryset)
             R(MAP, "remove", "(Ljava/lang/Object;)Ljava/lang/Object;",
@@ -1884,8 +2564,7 @@ class AndroidStubs:
         R("Landroid/view/View;", "combineMeasuredStates", "(II)I",
           lambda a: (int(a[0]) | int(a[1])) & 0xFFFFFFFF if len(a) > 1 else 0)
         R("Landroid/widget/ExpandableListView;", "getPackedPositionType", "(J)I", self._elv_packedtype)
-        R("Landroid/widget/ExpandableListView;", "getPackedPositionGroup", "(J)I",
-          lambda a: int(a[0]) & 0xFFFFFFFF if a else -1)
+        R("Landroid/widget/ExpandableListView;", "getPackedPositionGroup", "(J)I", self._packed_group)
         R("Landroid/view/ViewConfiguration;", "getGlobalActionKeyTimeout", "()J", lambda a: 500)
         R("Landroid/graphics/PointF;", "length", "(FF)F", self._pointf_length)
         R("Landroid/graphics/ImageFormat;", "getBitsPerPixel", "(I)I", self._imgfmt_bpp)
@@ -1900,9 +2579,12 @@ class AndroidStubs:
         R("Ljava/lang/String;", "getBytes", "(Ljava/nio/charset/Charset;)[B", self._str_getbytes)
         R("Ljava/lang/StringBuilder;", "append", "(Ljava/lang/CharSequence;II)Ljava/lang/StringBuilder;",
           lambda a: self._sb_push(a[0], (self._txt(a[1]) or "")[int(a[2]) if len(a) > 2 else 0:int(a[3]) if len(a) > 3 else None]))
-        R("Ljava/lang/Enum;", "compareTo", "(Ljava/lang/Enum;)I",
-          lambda a: (int(a[0].fields.get("__ordinal", 0)) - int(a[1].fields.get("__ordinal", 0)))
-                    if len(a) > 1 and isinstance(a[0], JObject) and isinstance(a[1], JObject) else 0)
+        def _enum_cmp(a):
+            return (int(a[0].fields.get("__ordinal", 0)) - int(a[1].fields.get("__ordinal", 0))) \
+                if len(a) > 1 and isinstance(a[0], JObject) and isinstance(a[1], JObject) else 0
+
+        R("Ljava/lang/Enum;", "compareTo", "(Ljava/lang/Enum;)I", _enum_cmp)
+        R("Ljava/lang/Enum;", "compareTo", "(Ljava/lang/Object;)I", _enum_cmp)
         R("Ljava/lang/Enum;", "equals", "(Ljava/lang/Object;)Z", lambda a: 1 if len(a) > 1 and a[0] is a[1] else 0)
         R("Ljava/lang/System;", "mapLibraryName", "(Ljava/lang/String;)Ljava/lang/String;",
           lambda a: JString("lib" + (self._txt(a[0]) or "") + ".so"))
@@ -1989,17 +2671,104 @@ class AndroidStubs:
             except Exception:
                 return JString(str(v) if v is not None else "0")
 
+        def _flt_to_str(a, is_f32=False):
+            v = a[0] if a else 0.0
+            if isinstance(v, JString):
+                return v
+            if isinstance(v, JObject):
+                is_f32 = (v.cls == "Ljava/lang/Float;")
+                v = v.fields.get("value", 0.0)
+            if isinstance(v, JString):
+                return v
+            try:
+                fv = _as_py_f32(v) if is_f32 else _as_py_f64(v)
+                return JString(_fmt_java_float(fv))
+            except Exception:
+                return JString(str(v) if v is not None else "0.0")
+
         def _bool_to_str(a):
             v = a[0] if a else 0
             if isinstance(v, JObject):
                 v = v.fields.get("value", 0)
             return JString("true" if v else "false")
 
-        for _num_cls, _psig in (("Ljava/lang/Integer;", "I"), ("Ljava/lang/Long;", "J")):
+        for _num_cls, _psig in (
+            ("Ljava/lang/Integer;", "I"),
+            ("Ljava/lang/Long;", "J"),
+            ("Ljava/lang/Short;", "S"),
+            ("Ljava/lang/Byte;", "B"),
+        ):
             R(_num_cls, "toString", "()Ljava/lang/String;", _num_to_str)
             R(_num_cls, "toString", f"({_psig})Ljava/lang/String;", _num_to_str)
+        R("Ljava/lang/Float;", "toString", "()Ljava/lang/String;", lambda a: _flt_to_str(a, is_f32=True))
+        R("Ljava/lang/Float;", "toString", "(F)Ljava/lang/String;", lambda a: _flt_to_str(a, is_f32=True))
+        R("Ljava/lang/Double;", "toString", "()Ljava/lang/String;", lambda a: _flt_to_str(a, is_f32=False))
+        R("Ljava/lang/Double;", "toString", "(D)Ljava/lang/String;", lambda a: _flt_to_str(a, is_f32=False))
         R("Ljava/lang/Boolean;", "toString", "()Ljava/lang/String;", _bool_to_str)
         R("Ljava/lang/Boolean;", "toString", "(Z)Ljava/lang/String;", _bool_to_str)
+
+        # ---- StringBuilder/StringBuffer + Appendable, Radix Parse, Runtime, TextUtils ----
+        def _sb_coerce(val, sig_hint=""):
+            if sig_hint == "Z":
+                return "true" if val else "false"
+            if sig_hint == "C":
+                return chr(int(val) & 0xFFFF) if isinstance(val, int) else (str(val or "")[:1])
+            if sig_hint in ("I", "J", "F", "D"):
+                return str(val if val is not None else 0)
+            if isinstance(val, JArray):
+                return "".join(chr(int(c) & 0xFFFF) if isinstance(c, int) else str(c) for c in val.data)
+            if self._is_dalvik_null(val) or isinstance(val, (JObject, JString, str)):
+                return self._obj_to_str(val)
+            t = self._txt(val)
+            if t is not None:
+                return t
+            return str(val)
+
+        for _sbcls in ("Ljava/lang/StringBuilder;", "Ljava/lang/StringBuffer;"):
+            R(_sbcls, "<init>", "()V", self._sb_init)
+            R(_sbcls, "<init>", "(I)V", self._sb_init)
+            R(_sbcls, "<init>", "(Ljava/lang/String;)V", self._sb_init_str)
+            R(_sbcls, "<init>", "(Ljava/lang/CharSequence;)V", self._sb_init_str)
+            R(_sbcls, "toString", "()Ljava/lang/String;", self._sb_tostr)
+            R(_sbcls, "length", "()I", lambda a: len(a[0].fields.get("buf", "") or "") if a and isinstance(a[0], JObject) else 0)
+            R(_sbcls, "setLength", "(I)V", self._sb_setlen)
+            R(_sbcls, "deleteCharAt", f"(I){_sbcls}", self._sb_delat)
+            R(_sbcls, "insert", f"(ILjava/lang/String;){_sbcls}", self._sb_insert)
+            R(_sbcls, "reverse", f"(){_sbcls}", lambda a: self._sb_set(a[0], (a[0].fields.get("buf", "") or "")[::-1]) if a and isinstance(a[0], JObject) else None)
+            for _ret in (_sbcls, "Ljava/lang/Appendable;"):
+                R(_sbcls, "append", f"(Ljava/lang/CharSequence;){_ret}",
+                  lambda a: self._sb_push(a[0], "null" if (len(a) < 2 or self._is_dalvik_null(a[1])) else (self._txt(a[1]) if self._txt(a[1]) is not None else self._obj_to_str(a[1]))))
+                R(_sbcls, "append", f"(Ljava/lang/CharSequence;II){_ret}",
+                  lambda a: self._sb_push(a[0], (self._txt(a[1]) or "null")[int(a[2]):int(a[3])] if len(a) > 3 else ""))
+                R(_sbcls, "append", f"(C){_ret}",
+                  lambda a: self._sb_push(a[0], chr(int(a[1]) & 0xFFFF) if len(a) > 1 else ""))
+            if _sbcls == "Ljava/lang/StringBuffer;":
+                for _ps in ("Ljava/lang/String;", "Ljava/lang/Object;", "I", "J", "F", "D", "Z", "[C"):
+                    R(_sbcls, "append", f"({_ps}){_sbcls}",
+                      lambda a, _h=_ps: self._sb_push(a[0], _sb_coerce(a[1] if len(a) > 1 else None, _h)))
+
+        R("Ljava/lang/Integer;", "parseInt", "(Ljava/lang/String;I)I",
+          lambda a: self._parse_java_int(a[0] if a else None, int(a[1]) if len(a) > 1 else 10, 32))
+        R("Ljava/lang/Integer;", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Integer;",
+          lambda a: JObject("Ljava/lang/Integer;", {"value": self._parse_java_int(a[0] if a else None, int(a[1]) if len(a) > 1 else 10, 32)}))
+        R("Ljava/lang/Long;", "parseLong", "(Ljava/lang/String;I)J",
+          lambda a: self._parse_java_int(a[0] if a else None, int(a[1]) if len(a) > 1 else 10, 64))
+        R("Ljava/lang/Long;", "valueOf", "(Ljava/lang/String;I)Ljava/lang/Long;",
+          lambda a: JObject("Ljava/lang/Long;", {"value": self._parse_java_int(a[0] if a else None, int(a[1]) if len(a) > 1 else 10, 64)}))
+
+        R("Ljava/lang/Runtime;", "availableProcessors", "()I", lambda a: 4)
+        R("Ljava/lang/Runtime;", "maxMemory", "()J", lambda a: 268435456)
+        R("Ljava/lang/Runtime;", "totalMemory", "()J", lambda a: 67108864)
+        R("Ljava/lang/Runtime;", "freeMemory", "()J", lambda a: 33554432)
+
+        R("Landroid/text/TextUtils;", "equals", "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Z",
+          lambda a: 1 if ((None if not a or a[0] is None else self._txt(a[0])) == (None if len(a) < 2 or a[1] is None else self._txt(a[1]))) else 0)
+
+        _WRAP_CLS = {
+            "Ljava/lang/Boolean;", "Ljava/lang/Byte;", "Ljava/lang/Short;",
+            "Ljava/lang/Character;", "Ljava/lang/Integer;", "Ljava/lang/Long;",
+            "Ljava/lang/Float;", "Ljava/lang/Double;",
+        }
 
         def _str_format(a):
             fmt = (self._txt(a[-2]) if len(a) >= 2 else (self._txt(a[0]) if a else "")) or ""
@@ -2010,9 +2779,18 @@ class AndroidStubs:
             for el in arr.data:
                 if isinstance(el, JString):
                     vals.append(el.text)
-                elif isinstance(el, JObject) and "value" in (getattr(el, "fields", None) or {}):
+                elif isinstance(el, JObject) and el.cls in _WRAP_CLS and "value" in (getattr(el, "fields", None) or {}):
                     v = el.fields["value"]
-                    vals.append(bool(v) if el.cls == "Ljava/lang/Boolean;" else v)
+                    if el.cls == "Ljava/lang/Boolean;":
+                        vals.append(bool(v))
+                    elif el.cls == "Ljava/lang/Character;":
+                        vals.append(chr(int(v) & 0xFFFF) if isinstance(v, int) else str(v))
+                    else:
+                        vals.append(v)
+                elif isinstance(el, JObject):
+                    vals.append(self._obj_to_str(el))
+                elif el is None:
+                    vals.append("null")
                 else:
                     vals.append(el)
             try:
@@ -2109,57 +2887,21 @@ class AndroidStubs:
                                     int(obj.fields.get("day", 1)))
                 except Exception:
                     pass
-            return _dt.date.today()
+            return self.current_datetime().date()
 
         def _format_java_date(dt_or_d, pattern, locale_obj=None):
-            pat = pattern or "yyyy-MM-dd"
-            lang = ""
-            if isinstance(locale_obj, JObject):
-                lang = str(locale_obj.fields.get("lang") or "").lower()
-            w_long = _EN_WEEKDAYS if lang == "en" else _DE_WEEKDAYS
-            w_short = _EN_WEEKDAYS_SHORT if lang == "en" else _DE_WEEKDAYS_SHORT
-            hr = getattr(dt_or_d, "hour", 0)
-            mn = getattr(dt_or_d, "minute", 0)
-            sc = getattr(dt_or_d, "second", 0)
-            def _sub(m):
-                tok = m.group(0)
-                if tok == "EEEE":
-                    return w_long[dt_or_d.weekday()]
-                if tok in ("EEE", "EE", "E"):
-                    return w_short[dt_or_d.weekday()]
-                if tok == "yyyy":
-                    return f"{dt_or_d.year:04d}"
-                if tok == "yy":
-                    return f"{dt_or_d.year % 100:02d}"
-                if tok == "MM":
-                    return f"{dt_or_d.month:02d}"
-                if tok == "M":
-                    return str(dt_or_d.month)
-                if tok == "dd":
-                    return f"{dt_or_d.day:02d}"
-                if tok == "d":
-                    return str(dt_or_d.day)
-                if tok == "HH":
-                    return f"{hr:02d}"
-                if tok == "H":
-                    return str(hr)
-                if tok == "mm":
-                    return f"{mn:02d}"
-                if tok == "m":
-                    return str(mn)
-                if tok == "ss":
-                    return f"{sc:02d}"
-                if tok == "s":
-                    return str(sc)
-                return tok
-            return _re.sub(r"EEEE|EEE|EE|E|yyyy|yy|MM|M|dd|d|HH|H|mm|m|ss|s", _sub, pat)
+            from core.java.virtual_clock import format_java_pattern
+            return format_java_pattern(dt_or_d, pattern, locale_obj)
 
-        R("Ljava/time/LocalDate;", "now", "()Ljava/time/LocalDate;", lambda a: _ld_wrap(_dt.date.today()))
-        R("Ljava/time/LocalDate;", "now", "(Ljava/time/ZoneId;)Ljava/time/LocalDate;", lambda a: _ld_wrap(_dt.date.today()))
+        R("Ljava/time/LocalDate;", "now", "()Ljava/time/LocalDate;", lambda a: _ld_wrap(self.current_datetime().date()))
+        R("Ljava/time/LocalDate;", "now", "(Ljava/time/ZoneId;)Ljava/time/LocalDate;",
+          lambda a: _ld_wrap(self.current_datetime(
+              a[0].fields.get("__id") if (a and isinstance(a[0], JObject) and not a[0].fields.get("__sys_default")) else None
+          ).date()))
         R("Ljava/time/LocalDate;", "of", "(III)Ljava/time/LocalDate;",
-          lambda a: _ld_wrap(_dt.date(int(a[0]), int(a[1]), int(a[2])) if len(a) >= 3 else _dt.date.today()))
+          lambda a: _ld_wrap(_dt.date(int(a[0]), int(a[1]), int(a[2])) if len(a) >= 3 else self.current_datetime().date()))
         R("Ljava/time/LocalDate;", "parse", "(Ljava/lang/CharSequence;)Ljava/time/LocalDate;",
-          lambda a: _ld_wrap(_dt.date.fromisoformat(self._txt(a[0]).strip()) if a and self._txt(a[0]) else _dt.date.today()))
+          lambda a: _ld_wrap(_dt.date.fromisoformat(self._txt(a[0]).strip()) if a and self._txt(a[0]) else self.current_datetime().date()))
         def _s64(v):
             iv = int(v or 0) & 0xFFFFFFFFFFFFFFFF
             return iv - 0x10000000000000000 if (iv & 0x8000000000000000) else iv
@@ -2217,40 +2959,47 @@ class AndroidStubs:
               "__locale": a[1] if len(a) > 1 else None,
           }))
         R("Ljava/time/Instant;", "ofEpochSecond", "(J)Ljava/time/Instant;",
-          lambda a: JObject("Ljava/time/Instant;", {"__epoch_sec": int(a[0] or 0) if a else 0}))
+          lambda a: JObject("Ljava/time/Instant;", {"__epoch_sec": int(a[0] or 0) if a else 0, "__epoch_ms": (int(a[0] or 0) * 1000) if a else 0}))
         R("Ljava/time/Instant;", "ofEpochMilli", "(J)Ljava/time/Instant;",
-          lambda a: JObject("Ljava/time/Instant;", {"__epoch_sec": (int(a[0] or 0) // 1000) if a else 0}))
+          lambda a: JObject("Ljava/time/Instant;", {"__epoch_sec": (int(a[0] or 0) // 1000) if a else 0, "__epoch_ms": int(a[0] or 0) if a else 0}))
         R("Ljava/time/Instant;", "getEpochSecond", "()J",
           lambda a: int(a[0].fields.get("__epoch_sec", 0)) if a and isinstance(a[0], JObject) else 0)
         R("Ljava/time/Instant;", "toEpochMilli", "()J",
-          lambda a: int(a[0].fields.get("__epoch_sec", 0)) * 1000 if a and isinstance(a[0], JObject) else 0)
+          lambda a: int(a[0].fields.get("__epoch_ms", int(a[0].fields.get("__epoch_sec", 0)) * 1000)) if a and isinstance(a[0], JObject) else 0)
         R("Ljava/time/ZoneId;", "systemDefault", "()Ljava/time/ZoneId;",
-          lambda a: JObject("Ljava/time/ZoneId;", {"__id": "Europe/Berlin"}))
+          lambda a: JObject("Ljava/time/ZoneId;", {"__id": getattr(self, "_clock_tz", None) or "Europe/Berlin", "__sys_default": getattr(self, "_clock_tz", None) is None}))
         R("Ljava/time/ZoneId;", "of", "(Ljava/lang/String;)Ljava/time/ZoneId;",
           lambda a: JObject("Ljava/time/ZoneId;", {"__id": (self._txt(a[0]) or "UTC") if a else "UTC"}))
         def _inst_at_zone(a):
-            sec = int(a[0].fields.get("__epoch_sec", 0)) if a and isinstance(a[0], JObject) else 0
+            ms = int(a[0].fields.get("__epoch_ms", int(a[0].fields.get("__epoch_sec", 0)) * 1000)) if a and isinstance(a[0], JObject) else 0
+            sec = ms // 1000
+            z_obj = a[1] if len(a) > 1 and isinstance(a[1], JObject) else None
+            zid = z_obj.fields.get("__id") if (z_obj is not None and not z_obj.fields.get("__sys_default")) else getattr(self, "_clock_tz", None)
             try:
-                dt = _dt.datetime.fromtimestamp(sec)
+                if zid:
+                    from core.java.virtual_clock import resolve_tzinfo
+                    dt = _dt.datetime.fromtimestamp(ms / 1000.0, tz=resolve_tzinfo(zid))
+                else:
+                    dt = _dt.datetime.fromtimestamp(ms / 1000.0)
             except Exception:
                 dt = _dt.datetime.fromtimestamp(0)
-            return JObject("Ljava/time/ZonedDateTime;", {"__dt": dt, "__date": dt.date(), "__epoch_sec": sec})
+            return JObject("Ljava/time/ZonedDateTime;", {"__dt": dt, "__date": dt.date(), "__epoch_sec": sec, "__epoch_ms": ms})
         R("Ljava/time/Instant;", "atZone", "(Ljava/time/ZoneId;)Ljava/time/ZonedDateTime;", _inst_at_zone)
         R("Ljava/time/ZonedDateTime;", "toLocalDate", "()Ljava/time/LocalDate;",
-          lambda a: _ld_wrap(a[0].fields.get("__date") if a and isinstance(a[0], JObject) and isinstance(a[0].fields.get("__date"), _dt.date) else _dt.date.today()))
+          lambda a: _ld_wrap(a[0].fields.get("__date") if a and isinstance(a[0], JObject) and isinstance(a[0].fields.get("__date"), _dt.date) else self.current_datetime().date()))
         R("Ljava/time/ZonedDateTime;", "toLocalDateTime", "()Ljava/time/LocalDateTime;",
-          lambda a: JObject("Ljava/time/LocalDateTime;", {"__dt": a[0].fields.get("__dt", _dt.datetime.now()) if a and isinstance(a[0], JObject) else _dt.datetime.now()}))
+          lambda a: JObject("Ljava/time/LocalDateTime;", {"__dt": a[0].fields.get("__dt", self.current_datetime()) if a and isinstance(a[0], JObject) else self.current_datetime()}))
         R("Ljava/time/ZonedDateTime;", "toEpochSecond", "()J",
           lambda a: int(a[0].fields.get("__epoch_sec", 0)) if a and isinstance(a[0], JObject) else 0)
         R("Ljava/time/ZonedDateTime;", "format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;",
           lambda a: JString(_format_java_date(
-              a[0].fields.get("__dt", _dt.datetime.now()) if a and isinstance(a[0], JObject) else _dt.datetime.now(),
+              a[0].fields.get("__dt", self.current_datetime()) if a and isinstance(a[0], JObject) else self.current_datetime(),
               a[1].fields.get("__pattern", "yyyy-MM-dd") if len(a) > 1 and isinstance(a[1], JObject) else "yyyy-MM-dd",
               a[1].fields.get("__locale") if len(a) > 1 and isinstance(a[1], JObject) else None,
           )))
         R("Ljava/time/LocalDateTime;", "format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;",
           lambda a: JString(_format_java_date(
-              a[0].fields.get("__dt", _dt.datetime.now()) if a and isinstance(a[0], JObject) else _dt.datetime.now(),
+              a[0].fields.get("__dt", self.current_datetime()) if a and isinstance(a[0], JObject) else self.current_datetime(),
               a[1].fields.get("__pattern", "yyyy-MM-dd") if len(a) > 1 and isinstance(a[1], JObject) else "yyyy-MM-dd",
               a[1].fields.get("__locale") if len(a) > 1 and isinstance(a[1], JObject) else None,
           )))
@@ -2292,7 +3041,7 @@ class AndroidStubs:
               (self._txt(a[2]) or "").lower() if len(a) > 2 else "",
           ))
         R("Ljava/util/Date;", "<init>", "()V",
-          lambda a: a[0].fields.__setitem__("__ms", int(_time.time() * 1000)) if a and isinstance(a[0], JObject) else None)
+          lambda a: a[0].fields.__setitem__("__ms", int(self.current_time_ms(advance=False))) if a and isinstance(a[0], JObject) else None)
         R("Ljava/util/Date;", "<init>", "(J)V",
           lambda a: a[0].fields.__setitem__("__ms", int(a[1] or 0) if len(a) > 1 else 0) if a and isinstance(a[0], JObject) else None)
         R("Ljava/util/Date;", "getTime", "()J",
@@ -2302,15 +3051,23 @@ class AndroidStubs:
         def _sdf_format(a):
             pat = a[0].fields.get("__pattern", "yyyy-MM-dd") if a and isinstance(a[0], JObject) else "yyyy-MM-dd"
             loc = a[0].fields.get("__locale") if a and isinstance(a[0], JObject) else None
+            tz_name = a[0].fields.get("__tz") if a and isinstance(a[0], JObject) else None
             d_arg = a[1] if len(a) > 1 else None
             if isinstance(d_arg, JObject) and "__ms" in d_arg.fields:
                 ms = int(d_arg.fields.get("__ms", 0) or 0)
+            elif isinstance(d_arg, JObject) and "value" in d_arg.fields and isinstance(d_arg.fields["value"], (int, float)):
+                ms = int(d_arg.fields["value"])
             elif isinstance(d_arg, (int, float)):
                 ms = int(d_arg)
             else:
                 ms = 0
+            eff_tz = tz_name or getattr(self, "_clock_tz", None)
             try:
-                dt = _dt.datetime.fromtimestamp(ms / 1000.0)
+                if eff_tz:
+                    from core.java.virtual_clock import resolve_tzinfo
+                    dt = _dt.datetime.fromtimestamp(ms / 1000.0, tz=resolve_tzinfo(eff_tz))
+                else:
+                    dt = _dt.datetime.fromtimestamp(ms / 1000.0)
             except Exception:
                 dt = _dt.datetime.fromtimestamp(0)
             return JString(_format_java_date(dt, pat, loc))
@@ -2459,7 +3216,7 @@ class AndroidStubs:
         R("Ljava/lang/ClassLoader;", "<init>", "(Ljava/lang/ClassLoader;)V",
           lambda a: a[0].fields.__setitem__("_parent", a[1]) if len(a) > 1 and isinstance(a[0], JObject) else None)
         R("Ljava/nio/ByteOrder;", "nativeOrder", "()Ljava/nio/ByteOrder;",
-          lambda a: JObject("Ljava/nio/ByteOrder;", {"order": "little"}))
+          lambda a: JObject("Ljava/nio/ByteOrder;", {"order": "little", "_le": True}))
         # StrictMode / Environment / Resources (no-op bzw. plausible Objekte)
         R("Landroid/os/StrictMode;", "setThreadPolicy", "(Landroid/os/StrictMode$ThreadPolicy;)V", lambda a: None)
         R("Landroid/os/StrictMode;", "allowThreadDiskReads", "()Landroid/os/StrictMode$ThreadPolicy;",
@@ -2630,10 +3387,22 @@ class AndroidStubs:
             R("Ljava/util/Arrays;", "fill", f"([{_atc}{_atc})V", _arrays_fill_impl)
             R("Ljava/util/Arrays;", "fill", f"([{_atc}II{_atc})V", _arrays_fill_impl)
             R("Ljava/util/Arrays;", "copyOf", f"([{_atc}I)[{_atc}", _arrays_copy_impl(f"[{_atc}"))
+        def _arrays_copy_cls(a):
+            if len(a) > 2 and isinstance(a[2], JObject):
+                td = self._desc_from_class_obj(a[2])
+                if isinstance(td, str):
+                    td = td.replace(".", "/")
+                if isinstance(td, str) and td.startswith("["):
+                    if len(a) > 1 and isinstance(a[0], JArray):
+                        nlen = max(0, int(a[1] or 0))
+                        return JArray(td, (list(a[0].data) + [None] * nlen)[:nlen])
+                    return JArray(td, [])
+            return _arrays_copy_impl("[Ljava/lang/Object;")(a)
+
         R("Ljava/util/Arrays;", "copyOf", "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
-          _arrays_copy_impl("[Ljava/lang/Object;"))
+          _arrays_copy_cls)
         R("Ljava/util/Arrays;", "copyOfRange", "([Ljava/lang/Object;II)[Ljava/lang/Object;",
-          lambda a: JArray("[Ljava/lang/Object;", list(a[0].data[int(a[1]):int(a[2])]))
+          lambda a: JArray(getattr(a[0], "eltype", None) or "[Ljava/lang/Object;", list(a[0].data[int(a[1]):int(a[2])]))
           if len(a) > 2 and isinstance(a[0], JArray) else JArray("[Ljava/lang/Object;", []))
         R("Ljava/util/Arrays;", "copyOfRange", "([BII)[B",
           lambda a: JArray("[B", list(a[0].data[int(a[1]):int(a[2])]))
@@ -2728,6 +3497,49 @@ class AndroidStubs:
                 return bytes(cb)
             return b"\x30\x82\x01\x00" + (b"\x5a" * 60)
 
+        def _resolve_apk_version():
+            v_name = self.profile.get("version_name")
+            v_code = self.profile.get("version_code")
+            if v_name is not None and v_code is not None:
+                return str(v_name), int(v_code)
+            cached = getattr(self, "_cached_apk_version", None)
+            ar = getattr(self, "_app_root", None) or ""
+            if cached and cached[0] == ar:
+                return (str(v_name) if v_name is not None else cached[1]), (int(v_code) if v_code is not None else cached[2])
+            det_name, det_code = "1.0.0", 1
+            if ar:
+                import os as _os
+                import re as _re
+                yml_p = _os.path.join(ar, "apktool.yml")
+                if _os.path.isfile(yml_p):
+                    try:
+                        with open(yml_p, encoding="utf-8", errors="ignore") as _yf:
+                            ytxt = _yf.read(8192)
+                        mn = _re.search(r"^\s*versionName:\s*['\"]?([^'\"\r\n]+)['\"]?", ytxt, _re.M)
+                        mc = _re.search(r"^\s*versionCode:\s*['\"]?(\d+)['\"]?", ytxt, _re.M)
+                        if mn and mn.group(1).strip():
+                            det_name = mn.group(1).strip()
+                        if mc:
+                            det_code = int(mc.group(1))
+                    except Exception:
+                        pass
+                if det_name == "1.0.0":
+                    man_p = _os.path.join(ar, "AndroidManifest.xml")
+                    if _os.path.isfile(man_p):
+                        try:
+                            with open(man_p, encoding="utf-8", errors="ignore") as _mf:
+                                mtxt = _mf.read(8192)
+                            mn2 = _re.search(r'versionName\s*=\s*"([^"]+)"', mtxt)
+                            mc2 = _re.search(r'versionCode\s*=\s*"(\d+)"', mtxt)
+                            if mn2 and mn2.group(1).strip() and not mn2.group(1).startswith("@"):
+                                det_name = mn2.group(1).strip()
+                            if mc2:
+                                det_code = int(mc2.group(1))
+                        except Exception:
+                            pass
+            self._cached_apk_version = (ar, det_name, det_code)
+            return (str(v_name) if v_name is not None else det_name), (int(v_code) if v_code is not None else det_code)
+
         def _make_pkg_info(pkg_name: str):
             raw_cert = _default_cert_bytes()
             sig_obj = JObject("Landroid/content/pm/Signature;", {"_bytes": raw_cert})
@@ -2738,14 +3550,19 @@ class AndroidStubs:
                 if callable(getattr(self, "_mk_appinfo", None))
                 else JObject("Landroid/content/pm/ApplicationInfo;", {"packageName": JString(pkg_name)})
             )
+            vn_str, vc_int = _resolve_apk_version()
             return JObject("Landroid/content/pm/PackageInfo;", {
                 "packageName": JString(pkg_name),
-                "versionName": JString(str(self.profile.get("version_name", "1.0.0"))),
-                "versionCode": int(self.profile.get("version_code", 1)),
+                "versionName": JString(vn_str),
+                "versionCode": int(vc_int),
+                "longVersionCode": int(vc_int),
                 "applicationInfo": app_info,
                 "signatures": sig_arr,
                 "signingInfo": sinfo,
             })
+
+        R("Landroid/content/pm/PackageInfo;", "getLongVersionCode", "()J",
+          lambda a: int(a[0].fields.get("longVersionCode", a[0].fields.get("versionCode", 1)) or 1) if a and isinstance(a[0], JObject) else 1)
 
         R("Landroid/content/pm/PackageManager;", "getPackageInfo",
           "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
@@ -2753,6 +3570,23 @@ class AndroidStubs:
         R("Landroid/content/pm/PackageManager;", "getPackageInfo",
           "(Landroid/content/pm/VersionedPackage;I)Landroid/content/pm/PackageInfo;",
           lambda a: _make_pkg_info(getattr(self.profile, "package", "com.example.app")))
+        _installer_pkg = lambda: str(self.profile.get("installer_package", "com.android.vending") or "com.android.vending")
+        R("Landroid/content/pm/PackageManager;", "getInstallerPackageName",
+          "(Ljava/lang/String;)Ljava/lang/String;",
+          lambda a: JString(_installer_pkg()))
+        R("Landroid/content/pm/PackageManager;", "getInstallSourceInfo",
+          "(Ljava/lang/String;)Landroid/content/pm/InstallSourceInfo;",
+          lambda a: JObject("Landroid/content/pm/InstallSourceInfo;", {
+              "installing": _installer_pkg(),
+              "initiating": _installer_pkg(),
+              "originating": None,
+          }))
+        R("Landroid/content/pm/InstallSourceInfo;", "getInstallingPackageName", "()Ljava/lang/String;",
+          lambda a: JString(a[0].fields.get("installing") or "com.android.vending") if a and isinstance(a[0], JObject) else JString("com.android.vending"))
+        R("Landroid/content/pm/InstallSourceInfo;", "getInitiatingPackageName", "()Ljava/lang/String;",
+          lambda a: JString(a[0].fields.get("initiating") or "com.android.vending") if a and isinstance(a[0], JObject) else JString("com.android.vending"))
+        R("Landroid/content/pm/InstallSourceInfo;", "getOriginatingPackageName", "()Ljava/lang/String;",
+          lambda a: JString(a[0].fields["originating"]) if a and isinstance(a[0], JObject) and a[0].fields.get("originating") else None)
 
         def _sig_bytes(o):
             if isinstance(o, JObject) and o.fields.get("_bytes") is not None:
@@ -2836,7 +3670,7 @@ class AndroidStubs:
         m = a[0].fields.get("map", {})
         raw = a[0].fields.get("__raw_keys", {})
         keys = [raw.get(k, JString(k) if isinstance(k, str) else k) for k in m.keys()]
-        return JObject("Ljava/util/HashSet;", {"__items": keys})
+        return JObject("Ljava/util/HashSet;", {"__items": keys, "$backing_map": a[0], "$backing_kind": "keys"})
 
     def _map_entryset(self, a):
         if not (a and isinstance(a[0], JObject)):
@@ -2850,7 +3684,7 @@ class AndroidStubs:
             })
             for k, v in m.items()
         ]
-        return JObject("Ljava/util/HashSet;", {"__items": ents})
+        return JObject("Ljava/util/HashSet;", {"__items": ents, "$backing_map": a[0], "$backing_kind": "entries"})
 
     @classmethod
     def _map_copy_init(cls, dst, src, sort_keys=False):
@@ -3097,18 +3931,19 @@ class AndroidStubs:
         def _java_split(pat_obj, cs_obj, limit=0):
             txt = (self._txt(cs_obj) or "") if cs_obj is not None else ""
             rx = _pat_rx(pat_obj)
+            lim_i = 0 if limit is None else (((int(limit) + 0x80000000) & 0xFFFFFFFF) - 0x80000000)
             # Java Pattern.split(input, limit)
-            if limit > 0:
-                parts = rx.split(txt, maxsplit=max(0, limit - 1))
+            if lim_i > 0:
+                parts = rx.split(txt, maxsplit=max(0, lim_i - 1))
                 # Python re.split gibt Capture-Gruppen mit aus; bei Java Pattern.split nicht
                 if rx.groups:
-                    parts = _re.split(f"(?:{rx.pattern})", txt, maxsplit=max(0, limit - 1), flags=rx.flags) if rx.pattern else [txt]
+                    parts = _re.split(f"(?:{rx.pattern})", txt, maxsplit=max(0, lim_i - 1), flags=rx.flags) if rx.pattern else [txt]
             else:
                 if rx.groups:
                     parts = _re.split(f"(?:{rx.pattern})", txt, flags=rx.flags) if rx.pattern else [txt]
                 else:
                     parts = rx.split(txt)
-                if limit == 0:
+                if lim_i == 0:
                     while len(parts) > 1 and parts[-1] == "":
                         parts.pop()
             return JArray("[Ljava/lang/String;", [JString(p) for p in parts])
@@ -3451,7 +4286,28 @@ class AndroidStubs:
                          JObject("Ljava/util/concurrent/Future;", {}))[1])
         self.register_by_name("execute", "(Ljava/lang/Runnable;)V",
                               lambda a: (self._queue_runnable(a[1] if len(a) > 1 else None, 0), None)[1])
-        R("Landroid/os/Handler;", "removeCallbacks", "(Ljava/lang/Runnable;)V", lambda a: None)
+        def _remove_callbacks(a):
+            r = a[1] if len(a) > 1 else None
+            tok = a[2] if len(a) > 2 else None
+            if r is not None:
+                kept = []
+                for x in self.pending_runnables:
+                    if x is r:
+                        continue
+                    if (
+                        isinstance(x, JObject)
+                        and x.cls == "Landroid/os/Handler$MessageDispatchRunnable;"
+                        and isinstance(x.fields.get("_msg"), JObject)
+                        and x.fields["_msg"].fields.get("callback") is r
+                        and (tok is None or x.fields["_msg"].fields.get("obj") is tok)
+                    ):
+                        x.fields["_msg"].fields["_cancelled"] = True
+                        continue
+                    kept.append(x)
+                self.pending_runnables[:] = kept
+
+        R("Landroid/os/Handler;", "removeCallbacks", "(Ljava/lang/Runnable;)V", _remove_callbacks)
+        R("Landroid/os/Handler;", "removeCallbacks", "(Ljava/lang/Runnable;Ljava/lang/Object;)V", _remove_callbacks)
         R("Landroid/os/Handler;", "removeCallbacksAndMessages", "(Ljava/lang/Object;)V", lambda a: None)
         R("Landroid/os/Handler;", "sendMessage", "(Landroid/os/Message;)Z", lambda a: 1)
         R("Landroid/os/Handler;", "sendEmptyMessage", "(I)Z", lambda a: 1)
@@ -3476,14 +4332,20 @@ class AndroidStubs:
         R(RQ, "<init>", "()V", lambda a: None)
         R(RQ, "poll", "()Ljava/lang/ref/Reference;", lambda a: None)
         def _rq_remove(a):
+            cnt = 3
             if a and isinstance(a[0], JObject):
                 cnt = int(a[0].fields.get("_polls", 0)) + 1
                 a[0].fields["_polls"] = cnt
-                if cnt <= 2:
+                if cnt <= 1:
                     return None
             from core.java.dalvik import DalvikException
-            raise DalvikException("java.lang.InterruptedException",
-                                  payload=JObject("Ljava/lang/InterruptedException;", {"message": "interrupted"}))
+            if cnt == 2:
+                raise DalvikException("java.lang.InterruptedException",
+                                      payload=JObject("Ljava/lang/InterruptedException;", {"message": "interrupted"}))
+            # Nach einmaligem InterruptedException: viele Daemon-Schleifen (z.B. Glide ActiveResources)
+            # fangen InterruptedException in `while (!isShutdown)` ab. ThreadDeath beendet sie deterministisch.
+            raise DalvikException("java.lang.ThreadDeath",
+                                  payload=JObject("Ljava/lang/ThreadDeath;", {"message": "daemon queue parked"}))
         R(RQ, "remove", "()Ljava/lang/ref/Reference;", _rq_remove)
         R(RQ, "remove", "(J)Ljava/lang/ref/Reference;", _rq_remove)
 
@@ -3686,12 +4548,86 @@ class AndroidStubs:
 
         TL = "Ljava/lang/ThreadLocal;"
         R(TL, "<init>", "()V", lambda a: None)
-        R(TL, "get", "()Ljava/lang/Object;",
-          lambda a: a[0].fields.get("_val") if (a and isinstance(a[0], JObject)) else None)
+        def _tl_get(a):
+            if not (a and isinstance(a[0], JObject)):
+                return None
+            f = a[0].fields
+            if "_val" in f:
+                return f["_val"]
+            vm = getattr(self, "vm", None)
+            sup = f.get("_supplier")
+            if isinstance(sup, JObject) and vm is not None:
+                md = vm._resolve_method(sup.cls, "Ljava/util/function/Supplier;", "get", "()Ljava/lang/Object;")
+                if md is not None:
+                    val = vm._run_mdef(md, [sup])
+                    f["_val"] = val
+                    return val
+            if vm is not None and a[0].cls != TL:
+                md = vm._resolve_method(a[0].cls, TL, "initialValue", "()Ljava/lang/Object;")
+                if md is not None:
+                    val = vm._run_mdef(md, [a[0]])
+                    f["_val"] = val
+                    return val
+            return None
+        R(TL, "get", "()Ljava/lang/Object;", _tl_get)
         R(TL, "set", "(Ljava/lang/Object;)V",
           lambda a: a[0].fields.__setitem__("_val", a[1]) if (a and len(a) > 1 and isinstance(a[0], JObject)) else None)
         R(TL, "remove", "()V",
           lambda a: a[0].fields.pop("_val", None) if (a and isinstance(a[0], JObject)) else None)
+        R(TL, "withInitial", "(Ljava/util/function/Supplier;)Ljava/lang/ThreadLocal;",
+          lambda a: JObject(TL, {"_supplier": a[0] if a else None}))
+
+        # --- dalvik.system.DexFile (z.B. fuer Router-/Plugin-Klassen-Scans) ---
+        DXF = "Ldalvik/system/DexFile;"
+        R(DXF, "<init>", "(Ljava/lang/String;)V",
+          lambda a: a[0].fields.__setitem__("_path", self._txt(a[1]) if len(a) > 1 else "") if a and isinstance(a[0], JObject) else None)
+        R(DXF, "<init>", "(Ljava/io/File;)V",
+          lambda a: a[0].fields.__setitem__("_path", (a[1].fields.get("path", "") if len(a) > 1 and isinstance(a[1], JObject) else "")) if a and isinstance(a[0], JObject) else None)
+        R(DXF, "loadDex", "(Ljava/lang/String;Ljava/lang/String;I)Ldalvik/system/DexFile;",
+          lambda a: JObject(DXF, {"_path": self._txt(a[0]) if a else ""}))
+        R(DXF, "close", "()V", lambda a: None)
+        R(DXF, "loadClass", "(Ljava/lang/String;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
+          lambda a: self._cls_forname([a[1] if len(a) > 1 else None]))
+
+        def _dxf_entries(a):
+            vm = getattr(self, "vm", None)
+            prov = getattr(vm, "class_provider", None) if vm is not None else None
+            descs = prov.all_class_descriptors() if (prov is not None and hasattr(prov, "all_class_descriptors")) else ()
+            prefixes = set()
+            if vm is not None and len(descs) > 3000:
+                for fr in list(getattr(vm, "_frames", ()) or ())[-6:]:
+                    vals = list(getattr(fr, "v", ()) or ())
+                    if vals and isinstance(vals[0], JObject):
+                        vals.extend(vals[0].fields.values())
+                    for val in vals:
+                        if isinstance(val, JString) and val.text:
+                            t = val.text.strip()
+                            if (
+                                "." in t and not t.startswith("/")
+                                and not t.endswith((".apk", ".zip", ".dex", ".tmp", ".so"))
+                                and " " not in t
+                            ):
+                                parts = [p for p in t.split(".") if p]
+                                if parts and all(p.replace("_", "").replace("$", "").isalnum() for p in parts):
+                                    prefixes.add(t)
+            items = []
+            for d in descs:
+                if not (isinstance(d, str) and d.startswith("L") and d.endswith(";")):
+                    continue
+                dotted = d[1:-1].replace("/", ".")
+                if prefixes:
+                    if any(dotted.startswith(px) for px in prefixes):
+                        items.append(JString(dotted))
+                elif len(descs) <= 3000:
+                    items.append(JString(dotted))
+                else:
+                    # R8/ProGuard-Kurzpakete (1-2 Zeichen) ueberspringen, echte Bibliotheks-/Routenpakete behalten
+                    head = dotted.split(".", 1)[0]
+                    if len(head) >= 3:
+                        items.append(JString(dotted))
+            return JObject("Ljava/util/Enumeration;", {"__items": items, "__idx": 0})
+
+        R(DXF, "entries", "()Ljava/util/Enumeration;", _dxf_entries)
 
         # --- Kamera & MediaPlayer (nicht-abstuerzende Hardware-Stubs) ---
         CAM = "Landroid/hardware/Camera;"
@@ -3875,6 +4811,64 @@ class AndroidStubs:
             R(TA, _tm, _ts, lambda a: 0)
         for _tm, _ts in (("recycle", "()V"), ("close", "()V")):
             R(TA, _tm, _ts, lambda a: None)
+
+        # --- NavigableSet / TreeSet, TextUtils.join, PhantomReference, Application.getProcessName, JsonWriter ---
+        def _nav_poll(a, first=True):
+            items = self._coll_items(a[0] if a else None)
+            if not items:
+                return None
+            return items.pop(0 if first else -1)
+
+        def _nav_peek(a, first=True):
+            items = self._coll_items(a[0] if a else None)
+            if not items:
+                return None
+            return items[0 if first else -1]
+
+        for _ns_cls in ("Ljava/util/NavigableSet;", "Ljava/util/TreeSet;"):
+            R(_ns_cls, "pollFirst", "()Ljava/lang/Object;", lambda a: _nav_poll(a, True))
+            R(_ns_cls, "pollLast", "()Ljava/lang/Object;", lambda a: _nav_poll(a, False))
+            R(_ns_cls, "first", "()Ljava/lang/Object;", lambda a: _nav_peek(a, True))
+            R(_ns_cls, "last", "()Ljava/lang/Object;", lambda a: _nav_peek(a, False))
+
+        def _tu_join(a):
+            delim = (self._txt(a[0]) or "") if a else ""
+            src = a[1] if len(a) > 1 else None
+            parts = []
+            if isinstance(src, JArray):
+                items = src.data
+            elif isinstance(src, JObject):
+                items = self._extract_coll_items(src)
+            else:
+                items = []
+            for it in items:
+                parts.append(self._txt(it) or ("" if it in (None, 0) else str(it)))
+            return JString(delim.join(parts))
+
+        R("Landroid/text/TextUtils;", "join", "(Ljava/lang/CharSequence;[Ljava/lang/Object;)Ljava/lang/String;", _tu_join)
+        R("Landroid/text/TextUtils;", "join", "(Ljava/lang/CharSequence;Ljava/lang/Iterable;)Ljava/lang/String;", _tu_join)
+
+        PR_REF = "Ljava/lang/ref/PhantomReference;"
+        R(PR_REF, "<init>", "(Ljava/lang/Object;Ljava/lang/ref/ReferenceQueue;)V", lambda a: None)
+        R(PR_REF, "get", "()Ljava/lang/Object;", lambda a: None)
+        R(PR_REF, "clear", "()V", lambda a: None)
+
+        R("Landroid/app/Application;", "getProcessName", "()Ljava/lang/String;",
+          lambda a: JString(getattr(self.profile, "package", None) or "com.example.app"))
+
+        JW = "Landroid/util/JsonWriter;"
+        R(JW, "<init>", "(Ljava/io/Writer;)V", lambda a: a[0] if a else None)
+        for _jwm, _jws in (("setIndent", "(Ljava/lang/String;)V"), ("setLenient", "(Z)V"), ("flush", "()V"), ("close", "()V")):
+            R(JW, _jwm, _jws, lambda a: None)
+        for _jwm, _jws in (
+            ("beginObject", f"(){JW}"), ("endObject", f"(){JW}"),
+            ("beginArray", f"(){JW}"), ("endArray", f"(){JW}"),
+            ("name", f"(Ljava/lang/String;){JW}"),
+            ("value", f"(Ljava/lang/String;){JW}"), ("value", f"(Z){JW}"),
+            ("value", f"(J){JW}"), ("value", f"(D){JW}"),
+            ("value", f"(Ljava/lang/Number;){JW}"), ("nullValue", f"(){JW}"),
+        ):
+            R(JW, _jwm, _jws, lambda a: a[0] if a else None)
 
     def _reg_act_cb(self, a):
         cb = a[1] if len(a) > 1 else None
@@ -4684,13 +5678,42 @@ class AndroidStubs:
             return JObject("Ljava/lang/Double;", {"value": float(ret or 0.0)})
         return ret
 
-    @classmethod
-    def _parse_int(cls, a):
+    def _parse_java_int(self, raw, radix=10, signed_bits=32):
+        s = None if (raw is None or self._is_dalvik_null(raw)) else self._txt(raw)
+        valid = False
+        val = 0
         try:
-            t = cls._txt(a[0]) if a else None
-            return int(t) if t is not None else 0
+            r = int(radix)
         except Exception:
-            return 0
+            r = -1
+        if s is not None and 2 <= r <= 36 and len(s) > 0 and s == s.strip() and "_" not in s and s.isascii():
+            body = s[1:] if s[0] in "+-" else s
+            if len(body) > 0 and body.isalnum():
+                try:
+                    val = int(s, r)
+                    lo = -(1 << (signed_bits - 1))
+                    hi = (1 << (signed_bits - 1)) - 1
+                    if lo <= val <= hi:
+                        valid = True
+                except Exception:
+                    valid = False
+        if valid:
+            return val
+        msg = "Cannot parse null string" if s is None else f'For input string: "{s}"'
+        exc = JObject("Ljava/lang/NumberFormatException;", {"msg": msg, "detailMessage": JString(msg)})
+        vm = getattr(self, "vm", None)
+        if vm is not None:
+            frames = getattr(vm, "_frames", None) or ()
+            has_handler = any(
+                vm._find_handler(getattr(_fr, "md", None), getattr(_fr, "cur", 0), exc) is not None
+                for _fr in reversed(frames)
+            )
+            if (not getattr(vm, "lenient", False)) or has_handler:
+                raise DalvikException(f"java.lang.NumberFormatException: {msg}", payload=exc)
+        return 0
+
+    def _parse_int(self, a):
+        return self._parse_java_int(a[0] if a else None, 10, 32)
 
     @classmethod
     def _parse_float(cls, a):
@@ -4712,6 +5735,19 @@ class AndroidStubs:
             raw = a[1] if len(a) > 1 else ""
             t = AndroidStubs._txt(raw)
             v = t if t is not None else str(raw)
+            a[0].fields["buf"] = a[0].fields.get("buf", "") + v
+            return a[0]
+        return a[0] if a else None
+
+    @staticmethod
+    def _sb_append_str(a):
+        if a and isinstance(a[0], JObject):
+            raw = a[1] if len(a) > 1 else None
+            if AndroidStubs._is_dalvik_null(raw):
+                v = "null"
+            else:
+                t = AndroidStubs._txt(raw)
+                v = t if t is not None else str(raw)
             a[0].fields["buf"] = a[0].fields.get("buf", "") + v
             return a[0]
         return a[0] if a else None
@@ -4785,6 +5821,51 @@ class AndroidStubs:
                 if v is not None:
                     return v if isinstance(v, str) else str(v)
         return None
+
+    def _obj_to_str(self, val):
+        """Spezifikationsnahe String-Konvertierung (Smali-toString -> Stub-toString -> Fallback) mit Zyklusschutz."""
+        if self._is_dalvik_null(val):
+            return "null"
+        if isinstance(val, JString):
+            return val.text
+        if isinstance(val, str):
+            return val
+        if isinstance(val, JArray):
+            return f"{val.eltype}@{id(val):x}"
+        if isinstance(val, JObject):
+            oid = id(val)
+            if oid in self._tostr_guard:
+                return str(val.fields.get("__ename") or val.cls)
+            self._tostr_guard.add(oid)
+            try:
+                if self.vm is not None:
+                    md = self.vm._resolve_method(val.cls, val.cls, "toString", "()Ljava/lang/String;")
+                    if md is not None:
+                        res = self.vm._run_mdef(md, [val])
+                        t = self._txt(res)
+                        if t is not None:
+                            return t
+                wants = (
+                    self.vm._build_wants(val.cls, val.cls)
+                    if self.vm is not None
+                    else [val.cls, "Ljava/lang/Object;"]
+                )
+                ok, res = self.resolve_phased(
+                    wants, val.cls, val.cls, "toString", "()Ljava/lang/String;", [val], False
+                )
+                if ok:
+                    t = self._txt(res)
+                    if t is not None:
+                        return t
+            except (VmBudgetExceeded, DalvikUnknownOpcode, DebugStop):
+                raise
+            except Exception:
+                pass
+            finally:
+                self._tostr_guard.discard(oid)
+            t = self._txt(val)
+            return t if t is not None else str(val.fields.get("__ename") or val.cls)
+        return str(val)
 
     @staticmethod
     def _charset_py(name):
@@ -5072,8 +6153,8 @@ class AndroidStubs:
                 "Ljava/lang/Class;", {"name": pname, "primitive": pdesc}
             )
         vm.statics.setdefault("Ljava/nio/ByteOrder;", {}).update({
-            "BIG_ENDIAN": JObject("Ljava/nio/ByteOrder;", {"order": "big"}),
-            "LITTLE_ENDIAN": JObject("Ljava/nio/ByteOrder;", {"order": "little"}),
+            "BIG_ENDIAN": JObject("Ljava/nio/ByteOrder;", {"order": "big", "_le": False}),
+            "LITTLE_ENDIAN": JObject("Ljava/nio/ByteOrder;", {"order": "little", "_le": True}),
         })
         vm.statics.setdefault("Ljava/time/DayOfWeek;", {}).update({
             dname: JObject("Ljava/time/DayOfWeek;", {"__ordinal": idx, "__ename": dname, "day": idx + 1})
@@ -5125,6 +6206,31 @@ class AndroidStubs:
         vm.statics.setdefault("Ljava/lang/String;", {}).setdefault(
             "CASE_INSENSITIVE_ORDER", JObject("Ljava/lang/String$CaseInsensitiveComparator;", {})
         )
+        vm.statics.setdefault("Ljava/lang/Boolean;", {}).update({
+            "TRUE": JObject("Ljava/lang/Boolean;", {"value": 1}),
+            "FALSE": JObject("Ljava/lang/Boolean;", {"value": 0}),
+        })
+        _kunit = JObject("Lkotlin/Unit;", {})
+        vm.statics.setdefault("Lkotlin/Unit;", {}).update({
+            "INSTANCE": _kunit,
+            "a": _kunit,
+        })
+        vm.statics.setdefault("Ljava/io/File;", {}).update({
+            "separator": JString("/"),
+            "pathSeparator": JString(":"),
+            "separatorChar": ord("/"),
+            "pathSeparatorChar": ord(":"),
+        })
+        vm.statics.setdefault("Ljava/util/Collections;", {}).update({
+            "EMPTY_LIST": JObject("Ljava/util/ArrayList;", {"__items": [], "$items": []}),
+            "EMPTY_SET": JObject("Ljava/util/LinkedHashSet;", {"__items": [], "$items": []}),
+            "EMPTY_MAP": JObject("Ljava/util/HashMap;", {"map": {}}),
+        })
+        try:
+            from core.java.virtual_clock import seed_calendar_statics
+            seed_calendar_statics(vm)
+        except Exception:
+            pass
 
     def seed_framework_statics(self, vm):
         """Framework-Statics (android.os.Build, Build$VERSION, Wrapper.TYPE, ...) setzen."""
@@ -5148,10 +6254,16 @@ class AndroidStubs:
                 "SRC_OUT", "DST_OUT", "SRC_ATOP", "DST_ATOP", "XOR", "MULTIPLY", "SCREEN",
             )):
                 _m_map.setdefault(_mn, JObject(_m_cls, {"__ename": _mn, "__ordinal": _idx}))
+        try:
+            from core.java.sdk_breadth_g15 import seed_g15_statics
+            seed_g15_statics(self, vm)
+        except ImportError:
+            pass
 
     def set_profile(self, profile, vm=None):
         """Geraete-Profil setzen (z. B. mit Paketname aus dem Manifest) und Statics neu seeden."""
         self.profile = profile or DeviceProfile()
+        self._apply_profile_clock()
         vm = vm or self.vm
         if vm is not None:
             self.seed_framework_statics(vm)
@@ -5175,9 +6287,6 @@ class AndroidStubs:
         # Process.getThreadPriority(tid) -> Profilwert
         self.register("Landroid/os/Process;", "getThreadPriority", "(I)I",
                       lambda a: int(self.profile.get("thread_priority", 0)))
-        # ExpandableListView.getPackedPositionGroup(long) -> faithful Bit-Extraktion (pure)
-        self.register("Landroid/widget/ExpandableListView;", "getPackedPositionGroup", "(J)I",
-                      self._packed_group)
         self.register("Landroid/widget/ExpandableListView;", "getPackedPositionChild", "(J)I",
                       self._packed_child)
 

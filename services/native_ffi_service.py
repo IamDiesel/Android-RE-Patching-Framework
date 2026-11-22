@@ -177,12 +177,13 @@ class NativeFfiService:
 
     def _make_dispatch(self, eng, name: str) -> Callable:
         """Baut den Dispatcher fuer ein Symbol: Args/Ret protokollieren, Handler feuern,
-        None zurueckgeben (=> Rueckkehr nach lr)."""
+        gesicherte Ruecksprungadresse (saved_lr) zurueckgeben."""
         st = self._st(eng)
 
         def _disp(cpu):
             x = cpu.x
             args = [int(x[i]) & _M64 for i in range(8)]
+            saved_lr = int(cpu.lr) & _M64
             err = None
             ret = None
             handler = st.handlers.get(name)
@@ -192,14 +193,20 @@ class NativeFfiService:
                 except Exception as e:  # Handler darf den Lauf nie sprengen
                     err = repr(e)
                     ret = None
+                    try:
+                        eng.__dict__.setdefault("_deviations", []).append(
+                            {"kind": "ffi_exc", "site": name, "detail": err}
+                        )
+                    except Exception:
+                        pass
             if ret is None:
                 ret = st.default_ret
             cpu.x[0] = int(ret) & _M64
             if len(st.log) < st.max_log:
                 st.log.append({"name": name, "args": args,
                                "ret": int(cpu.x[0]) & _M64,
-                               "lr": int(cpu.lr) & _M64, "err": err})
-            return None  # => pc = lr
+                               "lr": saved_lr, "err": err})
+            return saved_lr
 
         return _disp
 

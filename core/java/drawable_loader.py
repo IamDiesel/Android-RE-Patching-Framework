@@ -560,8 +560,11 @@ class DrawableResolver:
     def __init__(self, app_root: Optional[str]):
         self.app_root = os.path.abspath(app_root) if app_root else ""
         self.colors: Dict[str, str] = {}
+        self.night_colors: Dict[str, str] = {}
         self.dimens: Dict[str, str] = {}
         self.styles: Dict[str, Dict[str, Any]] = {}
+        self.night_styles: Dict[str, Dict[str, Any]] = {}
+        self.night_mode: bool = False
         self.id2name: Dict[int, str] = {}
         self.attr_id2name: Dict[int, str] = {}
         self.raster_index: Dict[str, Tuple[int, str, bool]] = {}
@@ -638,6 +641,44 @@ class DrawableResolver:
                         cur["items"].update(items)
             except Exception:
                 pass
+        nvdir = os.path.join(res_dir, "values-night")
+        if os.path.isdir(nvdir):
+            try:
+                n_files = sorted(f for f in os.listdir(nvdir) if f.lower().endswith(".xml") and f.lower() != "public.xml")
+            except Exception:
+                n_files = ["colors.xml", "styles.xml", "themes.xml"]
+            for fname in n_files:
+                xp = os.path.join(nvdir, fname)
+                if not os.path.isfile(xp):
+                    continue
+                try:
+                    tree = ET.parse(xp)
+                    for el in tree.getroot():
+                        tag = _strip_ns(el.tag).lower()
+                        nm = el.get("name") or ""
+                        if not nm:
+                            continue
+                        if tag == "color" and el.text:
+                            self.night_colors[nm] = el.text.strip()
+                        elif tag == "style":
+                            items_n: Dict[str, str] = {}
+                            for ch in el:
+                                if _strip_ns(ch.tag).lower() == "item" and ch.get("name") and ch.text:
+                                    items_n[ch.get("name", "")] = ch.text.strip()
+                            cur_n = self.night_styles.setdefault(nm, {"parent": "", "items": {}})
+                            if el.get("parent"):
+                                cur_n["parent"] = el.get("parent", "")
+                            cur_n["items"].update(items_n)
+                except Exception:
+                    pass
+
+    def active_colors(self, night: Optional[bool] = None) -> Dict[str, str]:
+        use_night = self.night_mode if night is None else bool(night)
+        if use_night and self.night_colors:
+            merged = dict(self.colors)
+            merged.update(self.night_colors)
+            return merged
+        return self.colors
 
     @staticmethod
     def _is_dark_hex(hex_rgb: Optional[str]) -> bool:
@@ -651,11 +692,50 @@ class DrawableResolver:
         except Exception:
             return False
 
-    def resolve_color_int(self, res_id: int, default: Optional[int] = None) -> Optional[int]:
+    def resolve_color_hex_alpha(
+        self, res_id: int, night: Optional[bool] = None
+    ) -> Tuple[Optional[str], float]:
         nm = self.id2name.get(int(res_id))
-        if not nm or nm not in self.colors:
-            return default
-        hex_rgb, alpha = resolve_color(self.colors[nm], self.colors)
+        cmap = self.active_colors(night=night)
+        if not nm:
+            return None, 1.0
+        if nm in cmap:
+            return resolve_color(cmap[nm], cmap)
+        if nm in self.color_xml_index:
+            sp = self.resolve(nm)
+            if isinstance(sp, dict):
+                col = sp.get("color") or sp.get("fill")
+                if col:
+                    return str(col), float(sp.get("alpha", 1.0) or 1.0)
+        return None, 1.0
+
+    def resolve_dimen_px(self, res_id_or_name: Any, default: float = 0.0) -> float:
+        nm = (
+            self.id2name.get(int(res_id_or_name))
+            if isinstance(res_id_or_name, int)
+            else str(res_id_or_name or "").strip()
+        )
+        for _ in range(8):
+            if not nm:
+                return default
+            for pref in ("@dimen/", "dimen/"):
+                if nm.startswith(pref):
+                    nm = nm[len(pref):]
+            raw = self.dimens.get(nm)
+            if not raw:
+                return default
+            s = raw.strip()
+            if s.startswith("@dimen/") or s.startswith("dimen/"):
+                nm = s
+                continue
+            m = re.match(r"^([+-]?\d+(?:\.\d+)?)\s*(dp|dip|sp|px)?$", s, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+            return _parse_float(s, default)
+        return default
+
+    def resolve_color_int(self, res_id: int, default: Optional[int] = None) -> Optional[int]:
+        hex_rgb, alpha = self.resolve_color_hex_alpha(int(res_id))
         if not hex_rgb:
             return default
         try:
@@ -1149,6 +1229,7 @@ class DrawableResolver:
                         "pivotX": _parse_float(_attr(ch, "pivotX"), 0.0),
                         "pivotY": _parse_float(_attr(ch, "pivotY"), 0.0),
                         "rotation": _parse_float(_attr(ch, "rotation"), 0.0),
+                        "alpha": _parse_float(_attr(ch, "alpha"), 1.0),
                     }
                     _walk(ch, stack + [tr])
                 elif t == "path":
@@ -1156,25 +1237,32 @@ class DrawableResolver:
                     subpaths = parse_svg_path_data(pd)
                     if not subpaths:
                         continue
+                    grp_alpha = 1.0
+                    for g_tr in stack:
+                        grp_alpha *= float(g_tr.get("alpha", 1.0))
                     raw_fill = _attr(ch, "fillColor")
                     fill, fill_a = _resolve_vec_color(raw_fill)
                     fa_attr = _parse_float(_attr(ch, "fillAlpha"), 1.0)
-                    if fill_a * fa_attr <= 0.01:
+                    eff_fill_a = max(0.0, min(1.0, fill_a * fa_attr * grp_alpha))
+                    if eff_fill_a <= 0.01:
                         fill = None
                     explicit_no_fill = (raw_fill is not None) and (fill is None)
                     raw_stroke = _attr(ch, "strokeColor")
                     stroke, st_a = _resolve_vec_color(raw_stroke)
                     sa_attr = _parse_float(_attr(ch, "strokeAlpha"), 1.0)
-                    if st_a * sa_attr <= 0.01:
+                    eff_stroke_a = max(0.0, min(1.0, st_a * sa_attr * grp_alpha))
+                    if eff_stroke_a <= 0.01:
                         stroke = None
                     sw = _parse_float(_attr(ch, "strokeWidth"), 0.0 if not raw_stroke else 1.0)
                     if explicit_no_fill and (raw_stroke is not None or sw > 0):
                         fill = None
                         if stroke is None:
                             stroke = tint or "#3b4963"
+                            eff_stroke_a = max(0.05, grp_alpha)
                         sw = max(1.0, sw)
                     elif fill is None and stroke is None:
                         fill = tint or "#3b4963"
+                        eff_fill_a = max(0.05, fa_attr * grp_alpha)
                     elif tint and fill is not None:
                         fill = tint
                     fill_type = (_attr(ch, "fillType") or "nonZero").strip()
@@ -1186,13 +1274,17 @@ class DrawableResolver:
                             "points": tpts,
                             "closed": closed,
                             "fill": fill,
+                            "fill_alpha": eff_fill_a,
                             "stroke": stroke,
+                            "stroke_alpha": eff_stroke_a,
                             "stroke_w": sw,
                         })
                     path_groups.append({
                         "subpaths": t_subs,
                         "fill": fill,
+                        "fill_alpha": eff_fill_a,
                         "stroke": stroke,
+                        "stroke_alpha": eff_stroke_a,
                         "stroke_w": sw,
                         "fill_type": fill_type,
                     })
@@ -1421,13 +1513,15 @@ def rasterize_vector_to_png(
                 else:
                     mask = ImageChops.lighter(mask, sub_m)
                     outer_boxes.append(cur_box)
-            solid = Image.new("RGBA", (sw, sh), _hex_to_rgba(fill, 255))
+            fill_a_byte = max(1, min(255, int(round(255.0 * float(grp.get("fill_alpha", 1.0))))))
+            solid = Image.new("RGBA", (sw, sh), _hex_to_rgba(fill, fill_a_byte))
             layer = Image.new("RGBA", (sw, sh), (0, 0, 0, 0))
             layer.paste(solid, (0, 0), mask)
             canvas = Image.alpha_composite(canvas, layer)
             draw = ImageDraw.Draw(canvas)
         if stroke:
-            s_rgba = _hex_to_rgba(stroke, 255)
+            stroke_a_byte = max(1, min(255, int(round(255.0 * float(grp.get("stroke_alpha", 1.0))))))
+            s_rgba = _hex_to_rgba(stroke, stroke_a_byte)
             lw = max(1, int(round(float(grp.get("stroke_w", 1.0)) * sc)))
             for pts, closed in subs:
                 spts = [(ox + px * sc, oy + py * sc) for px, py in pts]
@@ -1525,36 +1619,41 @@ def drawable_to_paint_commands(
         if fixed_y:
             cmd["fixed_y"] = True
         return [cmd]
+    def _color_scrim_cmd(col, eff_a, name="scrim"):
+        try:
+            from PIL import Image
+            a_byte = max(1, min(255, int(round(eff_a * 255))))
+            scrim_key = (str(col).lower(), a_byte)
+            png_bytes = _COLOR_SCRIM_CACHE.get(scrim_key)
+            if png_bytes is None:
+                im = Image.new("RGBA", (4, 4), _hex_to_rgba(col, a_byte))
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                png_bytes = buf.getvalue()
+                if len(_COLOR_SCRIM_CACHE) >= 256:
+                    _COLOR_SCRIM_CACHE.clear()
+                _COLOR_SCRIM_CACHE[scrim_key] = png_bytes
+            return [{
+                "op": "image",
+                "x": x, "y": y, "w": w, "h": h,
+                "data": png_bytes,
+                "name": name,
+                "scale": "stretch",
+                "pre_tinted": True,
+                "dark_bg": True,
+            }]
+        except Exception:
+            return None
+
     if kind == "color":
         eff_a = max(0.0, min(1.0, float(spec.get("alpha", 1.0)) * float(alpha)))
         col = spec.get("color")
         if eff_a <= 0.01 or not col:
             return []
         if eff_a < 0.96:
-            try:
-                from PIL import Image
-                a_byte = max(1, min(255, int(round(eff_a * 255))))
-                scrim_key = (str(col).lower(), a_byte)
-                png_bytes = _COLOR_SCRIM_CACHE.get(scrim_key)
-                if png_bytes is None:
-                    im = Image.new("RGBA", (4, 4), _hex_to_rgba(col, a_byte))
-                    buf = io.BytesIO()
-                    im.save(buf, format="PNG")
-                    png_bytes = buf.getvalue()
-                    if len(_COLOR_SCRIM_CACHE) >= 256:
-                        _COLOR_SCRIM_CACHE.clear()
-                    _COLOR_SCRIM_CACHE[scrim_key] = png_bytes
-                return [{
-                    "op": "image",
-                    "x": x, "y": y, "w": w, "h": h,
-                    "data": png_bytes,
-                    "name": spec.get("name", "scrim"),
-                    "scale": "stretch",
-                    "pre_tinted": True,
-                    "dark_bg": True,
-                }]
-            except Exception:
-                pass
+            scrim = _color_scrim_cmd(col, eff_a, spec.get("name", "scrim"))
+            if scrim:
+                return scrim
         return [{"op": "rect", "x": x, "y": y, "w": w, "h": h,
                  "fill": col, "outline": "", "r": 0}]
     if kind == "shape":
@@ -1563,6 +1662,19 @@ def drawable_to_paint_commands(
         rad = float(spec.get("radius", 0.0) or 0.0)
         if not fill and not outline:
             return []
+        spec_a = float(spec.get("alpha", 1.0) if spec.get("alpha") is not None else 1.0)
+        if isinstance(fill, str) and len(fill) == 9 and fill.startswith("#"):
+            try:
+                spec_a *= int(fill[1:3], 16) / 255.0
+            except Exception:
+                pass
+        eff_a = max(0.0, min(1.0, spec_a * float(alpha)))
+        if eff_a <= 0.01 and not outline:
+            return []
+        if 0.01 < eff_a < 0.96 and fill and rad <= 4.0 and spec.get("shape") != "oval":
+            scrim = _color_scrim_cmd(fill, eff_a, spec.get("name", "scrim"))
+            if scrim:
+                return scrim
         if is_background and not dark_bg and fill and not outline and _is_very_light(fill) and rad > 0:
             if fill.lower() in ("#ffffff", "#ffffffff", "#fafafa", "#f9fafb"):
                 fill = "#f1f5f9"
@@ -1575,7 +1687,9 @@ def drawable_to_paint_commands(
             "r": rad,
         }]
     if kind == "vector":
-        png_bytes = rasterize_vector_to_png(spec, w, h, dark_bg=dark_bg, alpha=alpha, tint=tint)
+        vw_px = w * 2.0 if (w < 40.0 and h < 40.0) else w
+        vh_px = h * 2.0 if (w < 40.0 and h < 40.0) else h
+        png_bytes = rasterize_vector_to_png(spec, vw_px, vh_px, dark_bg=dark_bg, alpha=alpha, tint=tint)
         if png_bytes:
             vcmd: Dict[str, Any] = {
                 "op": "image",

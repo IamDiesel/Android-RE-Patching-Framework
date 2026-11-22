@@ -414,3 +414,90 @@ def test_settings_tab_triggers_on_app_switched_on_package_change(tmp_path, monke
 
     SettingsTab.save_settings(tab)
     assert switched == ["com.app.two"]
+
+
+def test_startup_threads_guard_against_main_thread_not_in_main_loop(tmp_path, monkeypatch):
+    import threading
+    import tkinter as tk
+
+    # 1) AppManagerTab.__init__ darf load_packages nicht vor mainloop() synchron starten,
+    #    sondern muss per after(0, self.load_packages) aufs Mainloop verschieben.
+    scheduled = []
+    loaded_sync = []
+    monkeypatch.setattr("ui.tabs.app_manager_tab.ttk.Frame.__init__", lambda self, _p: None)
+    monkeypatch.setattr("ui.tabs.app_manager_tab.AppManagerTab.create_widgets", lambda self: None)
+    monkeypatch.setattr("ui.tabs.app_manager_tab.AppManagerTab._load_devices", lambda self: None)
+    monkeypatch.setattr("ui.tabs.app_manager_tab.AppManagerTab.load_packages", lambda self: loaded_sync.append(True))
+    monkeypatch.setattr("ui.tabs.app_manager_tab.AppManagerTab.after", lambda self, ms, fn=None: scheduled.append((ms, fn)))
+
+    tab = AppManagerTab(None, str(tmp_path / "src"), None)
+    assert loaded_sync == []
+    assert len(scheduled) == 1 and scheduled[0][0] == 0
+    scheduled[0][1]()
+    assert loaded_sync == [True]
+
+    # 2) Worker-Thread in load_packages() darf bei RuntimeError("main thread is not in main loop")
+    #    weder beim Fehler-Callback noch im except-Fallback eine unbehandelte Thread-Exception werfen.
+    monkeypatch.undo()
+    thread_errors = []
+    old_excepthook = threading.excepthook
+    threading.excepthook = lambda args: thread_errors.append(args.exc_value)
+    try:
+        done_ev = threading.Event()
+
+        def _fake_adb(_cmd, _cwd):
+            try:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="offline")
+            finally:
+                done_ev.set()
+
+        monkeypatch.setattr("ui.tabs.app_manager_tab.CommandRunner.run_blocking", staticmethod(_fake_adb))
+
+        def _raise_main_loop(_ms, _fn=None):
+            raise RuntimeError("main thread is not in main loop")
+
+        fake_tab = types.SimpleNamespace(
+            source_dir=str(tmp_path),
+            listbox=types.SimpleNamespace(delete=lambda *a: None, insert=lambda *a: None),
+            packages=[],
+            winfo_exists=lambda: True,
+            update_idletasks=lambda: None,
+            after=_raise_main_loop,
+            _handle_adb_error=lambda _e: None,
+            _update_list=lambda _p: None,
+        )
+        fake_tab._safe_after = lambda fn: AppManagerTab._safe_after(fake_tab, fn)
+        AppManagerTab.load_packages(fake_tab)
+        assert done_ev.wait(timeout=3.0)
+        time.sleep(0.05)
+        assert thread_errors == []
+
+        # Auch bei zerstörtem Widget (winfo_exists() == False) darf _safe_after Callback nicht ausführen
+        ran = []
+        fake_tab_dead = types.SimpleNamespace(
+            winfo_exists=lambda: False,
+            after=lambda _ms, fn: fn(),
+        )
+        AppManagerTab._safe_after(fake_tab_dead, lambda: ran.append(1))
+        assert ran == []
+
+        # TclError in after() wird ebenfalls sauber abgefangen
+        fake_tab_tcl = types.SimpleNamespace(
+            winfo_exists=lambda: True,
+            after=lambda _ms, _fn: (_ for _ in ()).throw(tk.TclError("application has been destroyed")),
+        )
+        AppManagerTab._safe_after(fake_tab_tcl, lambda: ran.append(2))
+        assert ran == []
+    finally:
+        threading.excepthook = old_excepthook
+
+    # 3) ReFrameworkApp.log() puffert Log-Zeilen sicher weiter, falls after() vor mainloop() scheitert
+    fake_app = types.SimpleNamespace(
+        _log_buf=[],
+        _log_sinks=[],
+        _LOG_CAP=3,
+        after=lambda _ms, _fn: (_ for _ in ()).throw(RuntimeError("main thread is not in main loop")),
+    )
+    for msg in ("line1", "line2", "line3", "line4"):
+        ReFrameworkApp.log(fake_app, msg)
+    assert fake_app._log_buf == ["line2\n", "line3\n", "line4\n"]

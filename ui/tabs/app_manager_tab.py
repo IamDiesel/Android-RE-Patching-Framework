@@ -20,7 +20,26 @@ class AppManagerTab(ttk.Frame):
         os.makedirs(self.source_dir, exist_ok=True)
         self.create_widgets()
         self._load_devices()
-        self.load_packages()
+        try:
+            self.after(0, self.load_packages)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _safe_after(self, fn):
+        """Führt UI-Callbacks aus Worker-Threads nur aus, solange das Widget/Mainloop aktiv ist."""
+        def _run():
+            winfo_fn = getattr(self, "winfo_exists", None)
+            if callable(winfo_fn):
+                try:
+                    if not winfo_fn():
+                        return
+                except Exception:
+                    return
+            fn()
+        try:
+            self.after(0, _run)
+        except (RuntimeError, tk.TclError):
+            pass
 
     def log(self, msg: str) -> None:
         EventBus.publish("LOG_INFO", msg)
@@ -129,6 +148,13 @@ class AppManagerTab(ttk.Frame):
         self.load_packages()
 
     def load_packages(self):
+        winfo_fn = getattr(self, "winfo_exists", None)
+        if callable(winfo_fn):
+            try:
+                if not winfo_fn():
+                    return
+            except Exception:
+                return
         self.listbox.delete(0, tk.END)
         self.packages = []
         self.listbox.insert(tk.END, "Lade Apps... (Warte auf ADB)")
@@ -140,15 +166,15 @@ class AppManagerTab(ttk.Frame):
                 result = CommandRunner.run_blocking("adb shell pm list packages -3", self.source_dir)
 
                 if result.returncode != 0:
-                    self.after(0, lambda: self._handle_adb_error("ADB reagiert nicht oder Gerät offline."))
+                    self._safe_after(lambda: self._handle_adb_error("ADB reagiert nicht oder Gerät offline."))
                     return
 
                 pkgs = [line.replace("package:", "").strip() for line in result.stdout.strip().split('\n') if
                         line.startswith("package:")]
-                self.after(0, lambda p=pkgs: self._update_list(p))
+                self._safe_after(lambda p=pkgs: self._update_list(p))
             except Exception as e:
                 err_msg = str(e)
-                self.after(0, lambda m=err_msg: self._handle_adb_error(m))
+                self._safe_after(lambda m=err_msg: self._handle_adb_error(m))
 
         threading.Thread(target=task, daemon=True).start()
 
@@ -247,8 +273,8 @@ class AppManagerTab(ttk.Frame):
                 path_result = CommandRunner.run_blocking(f"adb shell pm path {pkg}", target_folder)
 
                 if path_result.returncode != 0:
-                    self.after(0, lambda: self.lbl_status.config(text="Fehler beim Ermitteln der Pfade.",
-                                                                 foreground="red"))
+                    self._safe_after(lambda: self.lbl_status.config(text="Fehler beim Ermitteln der Pfade.",
+                                                                    foreground="red"))
                     self.log(f"[!] ADB Error: {path_result.stderr}")
                     return
 
@@ -256,8 +282,8 @@ class AppManagerTab(ttk.Frame):
                          line]
 
                 if not paths:
-                    self.after(0,
-                               lambda: self.lbl_status.config(text="Fehler: Keine Pfade gefunden.", foreground="red"))
+                    self._safe_after(
+                        lambda: self.lbl_status.config(text="Fehler: Keine Pfade gefunden.", foreground="red"))
                     return
 
                 for apk_path in paths:
@@ -266,8 +292,8 @@ class AppManagerTab(ttk.Frame):
                     if pull_res.returncode != 0:
                         self.log(f"[!] Warnung/Fehler beim Pull von {apk_path}: {pull_res.stderr}")
 
-                self.after(0, lambda: self.lbl_status.config(text="Erfolgreich gezogen! Analysiere...",
-                                                             foreground="orange"))
+                self._safe_after(lambda: self.lbl_status.config(text="Erfolgreich gezogen! Analysiere...",
+                                                                foreground="orange"))
 
                 detected_arch = "ARM32"
                 for path in paths:
@@ -278,11 +304,11 @@ class AppManagerTab(ttk.Frame):
                         detected_arch = "x86_64";
                         break
 
-                self.after(0, lambda: self._finalize_pull(pkg, target_folder, detected_arch))
+                self._safe_after(lambda: self._finalize_pull(pkg, target_folder, detected_arch))
 
             except Exception as e:
                 self.log(f"[!] Systemfehler beim Pull: {e}")
-                self.after(0, lambda: self.lbl_status.config(text="Systemfehler beim Pull", foreground="red"))
+                self._safe_after(lambda: self.lbl_status.config(text="Systemfehler beim Pull", foreground="red"))
 
         # Asynchron ausführen, da adb pull mehrere hundert Megabyte kopieren kann
         threading.Thread(target=task, daemon=True).start()

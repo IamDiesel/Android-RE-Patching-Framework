@@ -14,7 +14,12 @@ import tkinter as tk
 from tkinter import ttk
 
 from core.java.view_tree import demo_screen, widgets_demo, paint_commands, info_screen, swipe_pager
-from core.java.app_runtime import detect_runtime, is_unrendered_surface_shell, inspect_engine_details
+from core.java.app_runtime import (
+    detect_runtime,
+    is_unrendered_surface_shell,
+    inspect_engine_details,
+    mount_inphone_runtime_if_needed,
+)
 
 # Telefon-Geometrie (logische Pixel, Hochformat ~ 19.5:9)
 BEZEL = 16
@@ -49,18 +54,45 @@ class DisplayTab(ttk.Frame):
         self._nav_regions = []         # (name, x0, y0, x1, y1) Hardware/Nav-Flaechen (logisch)
         self._photo_cache = {}
         self._active_photos = []
+        self._paint_cache = None
+        self._event_subs = []
         self._build()
         try:
             from core.application.event_bus import EventBus
-            EventBus.subscribe("GLASS_STARTED", self._on_glass_event)
-            EventBus.subscribe("GLASS_STATE", self._on_glass_event)
-            EventBus.subscribe("GLASS_SURFACE", self._on_surface_event)
-            EventBus.subscribe("DEBUG_PAUSED", self._on_debug_paused)
-            EventBus.subscribe("WEBVIEW_EVENT", self._on_webview_event)
-            EventBus.subscribe("APP_IMPORTED", lambda d=None: self.after(0, lambda d=d: self.on_app_changed(d)))
+            self._event_subs = [
+                ("GLASS_STARTED", self._on_glass_event),
+                ("GLASS_STATE", self._on_glass_event),
+                ("GLASS_SURFACE", self._on_surface_event),
+                ("DEBUG_PAUSED", self._on_debug_paused),
+                ("WEBVIEW_EVENT", self._on_webview_event),
+                ("APP_IMPORTED", self._on_app_imported),
+            ]
+            for _ev, _cb in self._event_subs:
+                EventBus.subscribe(_ev, _cb)
+            self.bind("<Destroy>", self._on_destroy, add="+")
         except Exception:
             pass
         self.after(60, self.render)
+
+    def _on_app_imported(self, data=None):
+        try:
+            self.after(0, lambda d=data: self.on_app_changed(d))
+        except Exception:
+            pass
+
+    def _on_destroy(self, event=None):
+        if event is not None and getattr(event, "widget", self) is not self:
+            return
+        subs = getattr(self, "_event_subs", None)
+        if not subs:
+            return
+        self._event_subs = []
+        try:
+            from core.application.event_bus import EventBus
+            for ev, cb in subs:
+                EventBus.unsubscribe(ev, cb)
+        except Exception:
+            pass
 
     def on_app_changed(self, _data=None):
         """Setzt die Anzeige/Surface beim App-Wechsel auf neutralen Zustand zurueck."""
@@ -77,6 +109,7 @@ class DisplayTab(ttk.Frame):
         self._dl_focus_xy = None
         self._dl_text = ""
         self._glass_mode = None
+        self._paint_cache = None
         self.scroll_y = 0
         if hasattr(self, "_entry_var") and self._entry_var is not None:
             try:
@@ -111,13 +144,23 @@ class DisplayTab(ttk.Frame):
         except Exception:
             pass
 
+    def _inphone_ctrl(self, tree=None):
+        t = tree if tree is not None else self.tree
+        if t is None:
+            return None
+        return (
+            getattr(t, "_flutter_ctrl", None)
+            or getattr(t, "_rn_ctrl", None)
+            or getattr(t, "_hybrid_ctrl", None)
+        )
+
     def _update_web_badge(self):
         btn = getattr(self, "_web_btn", None)
         if btn is None:
             return
         try:
             cnt = len(getattr(self.tree, "web_events", ()) or ())
-            fctrl = getattr(self.tree, "_flutter_ctrl", None) if self.tree is not None else None
+            fctrl = self._inphone_ctrl()
             in_browser = bool(getattr(self, "_browser_mode", False) or (fctrl is not None and getattr(fctrl, "screen", "") == "browser"))
             if in_browser:
                 btn.config(text="📱 App")
@@ -184,7 +227,7 @@ class DisplayTab(ttk.Frame):
         """Schaltet direkt IN DER HANDY-SIMULATION (380x800) zwischen App und In-Phone-Browser um (keine Auslagerung!)."""
         from core.java.flutter_app_producer import InPhoneBrowserController
 
-        fctrl = getattr(self.tree, "_flutter_ctrl", None) if self.tree is not None else None
+        fctrl = self._inphone_ctrl()
         if fctrl is not None and not getattr(self, "_browser_mode", False):
             fctrl.set_async_updater(self._on_inphone_browser_async)
             fctrl.toggle_browser(url=url)
@@ -368,6 +411,11 @@ class DisplayTab(ttk.Frame):
 
     # ---- Aufbau -----------------------------------------------------------
     def _build(self):
+        try:
+            from ui.widgets.tooltip import add_tooltip
+        except Exception:
+            add_tooltip = lambda *_a, **_kw: None
+
         bar = ttk.Frame(self); bar.pack(side="top", fill="x")
         demos_mb = ttk.Menubutton(bar, text="Demos \u25be")
         demos_menu = tk.Menu(demos_mb, tearoff=0)
@@ -387,8 +435,13 @@ class DisplayTab(ttk.Frame):
             demos_menu.add_command(label=lbl, command=cb)
         demos_mb.configure(menu=demos_menu)
         demos_mb.pack(side="left", padx=2, pady=3)
-        ttk.Button(bar, text="Aus App-Lauf", command=self._load_from_run).pack(side="left", padx=2)
-        ttk.Button(bar, text="Gläsern starten", command=self._load_glass).pack(side="left", padx=2)
+        add_tooltip(demos_mb, "Lädt eingebaute UI-Demo-Szenen (Compose, RN/Hermes, Flutter/Skia, XML) zum Testen der Anzeige.")
+        b_run = ttk.Button(bar, text="Aus App-Lauf", command=self._load_from_run)
+        b_run.pack(side="left", padx=2)
+        add_tooltip(b_run, "Startet einen schnellen App-Lifecycle direkt in der UI-Anzeige ohne vollständiges Debugger-Stepping.")
+        b_gls = ttk.Button(bar, text="Gläsern starten", command=self._load_glass)
+        b_gls.pack(side="left", padx=2)
+        add_tooltip(b_gls, "Startet den gläsernen App-Lauf über den Debugger (Dalvik + VFS/ARM64 + Breakpoints) und koppelt diesen Screen.")
         self.zone_var = tk.StringVar(value="original")
         self._entry_var = tk.StringVar(value="")
         if not self.embedded:
@@ -405,6 +458,7 @@ class DisplayTab(ttk.Frame):
         )
         zoom_cb.pack(side="left", padx=(0, 4))
         zoom_cb.bind("<<ComboboxSelected>>", self._on_zoom_select)
+        add_tooltip(zoom_cb, "Skaliert die virtuelle Handy-Anzeige (Auto-Fit oder feste Prozentstufen).")
         self._pw_mask = False
         self._ui_inspect_mode = False
         self._drag_start = None
@@ -417,7 +471,7 @@ class DisplayTab(ttk.Frame):
             self._inspect_btn.pack(side="left", padx=2, pady=(0, 2))
             self._pw_btn = ttk.Button(bar2, text="👁 PW", command=self.toggle_password_mask)
             self._pw_btn.pack(side="left", padx=2, pady=(0, 2))
-            self._ui_inspect_btn = ttk.Button(bar2, text="🎯 UI", command=self.toggle_ui_inspect)
+            self._ui_inspect_btn = ttk.Button(bar2, text="🎯 UI-Lupe", command=self.toggle_ui_inspect)
             self._ui_inspect_btn.pack(side="left", padx=2, pady=(0, 2))
             self.status = ttk.Label(bar2, text="", anchor="w")
             self.status.pack(side="left", padx=4, pady=(0, 2))
@@ -426,13 +480,23 @@ class DisplayTab(ttk.Frame):
             self._web_btn.pack(side="left", padx=2)
             self._inspect_btn = ttk.Button(bar, text="🔬 Inspect", command=self.open_browser_inspector)
             self._inspect_btn.pack(side="left", padx=2)
-            ttk.Button(bar, text="🔍 Engine-APIs", command=self._open_engine_apis).pack(side="left", padx=2)
+            b_eapi = ttk.Button(bar, text="🔍 Engine-APIs", command=self._open_engine_apis)
+            b_eapi.pack(side="left", padx=2)
+            add_tooltip(b_eapi, "Öffnet den statischen Engine-API-Scanner für Flutter/Hybrid/RN-Endpunkte.")
             self._pw_btn = ttk.Button(bar, text="👁 PW", command=self.toggle_password_mask)
             self._pw_btn.pack(side="left", padx=2)
-            self._ui_inspect_btn = ttk.Button(bar, text="🎯 UI", command=self.toggle_ui_inspect)
+            self._ui_inspect_btn = ttk.Button(bar, text="🎯 UI-Lupe", command=self.toggle_ui_inspect)
             self._ui_inspect_btn.pack(side="left", padx=2)
             self.status = ttk.Label(bar, text="", anchor="w")
             self.status.pack(side="left", padx=6)
+        add_tooltip(self._web_btn, "Schaltet auf den eingebauten In-Phone-Browser / WebView um.")
+        add_tooltip(self._inspect_btn, "Öffnet den DOM-/HTTP-WebView-Inspektor für geladene Seiten.")
+        add_tooltip(self._pw_btn, "Maskiert bzw. zeigt Passwort-Eingabefelder in der Handy-Ansicht.")
+        add_tooltip(
+            self._ui_inspect_btn,
+            "UI-Element-Lupe (An/Aus): Hebt App-Elemente unter dem Mauszeiger hervor und zeigt Klasse, ID, Text & Bounds.\n"
+            "Solange '🟢 UI-Lupe: AN' aktiv ist, wählen Klicks das Element zur Inspektion aus, statt App-Buttons auszulösen.",
+        )
         wrap = ttk.Frame(self); wrap.pack(side="top", fill="both", expand=True)
         self._wrap = wrap
         self._browser_mode = False
@@ -459,6 +523,7 @@ class DisplayTab(ttk.Frame):
         self._activity = activity
         self._focus = None
         self._focus_anchor = None
+        self._paint_cache = None
         self.scroll_y = 0
         self.render()
 
@@ -475,6 +540,7 @@ class DisplayTab(ttk.Frame):
             self.tree = None
             self._focus = None
             self._focus_anchor = None
+            self._paint_cache = None
             self.scroll_y = 0
             self._render_dl()
 
@@ -704,8 +770,12 @@ class DisplayTab(ttk.Frame):
                                   fill=cmd.get("color") or "#000", anchor=anchor, font=f_main)
             c.create_rectangle(BEZEL * s, BEZEL * s, (BEZEL + SCREEN_W) * s, (BEZEL + STATUS_H) * s,
                                fill="#e7e9ee", outline="")
-            self.status.config(text="%dx%d · %d Zeichenbefehle · Zoom %d%%"
-                               % (SCREEN_W, SCREEN_H, len(cmds), int(round(s * 100))))
+            if getattr(self, "_ui_inspect_mode", False):
+                self.status.config(text="🟢 UI-Lupe aktiv (Detail-Bounds nur im View-Baum verfügbar)")
+            else:
+                self.status.config(text="%dx%d · %d Zeichenbefehle · Zoom %d%%"
+                                   % (SCREEN_W, SCREEN_H, len(cmds), int(round(s * 100))))
+            self._sync_mcp_snapshot(dl=dl)
         except Exception as e:
             self._log("render(dl): %r" % e)
 
@@ -925,7 +995,7 @@ class DisplayTab(ttk.Frame):
                 self.vm = "glass"
                 self._glass_mode = mode
                 self._resolve_live_focus()
-                fctrl = getattr(tree, "_flutter_ctrl", None)
+                fctrl = self._inphone_ctrl(tree)
                 if fctrl is not None and hasattr(fctrl, "set_async_updater"):
                     fctrl.set_async_updater(self._on_inphone_browser_async)
                 self._update_web_badge()
@@ -990,7 +1060,7 @@ class DisplayTab(ttk.Frame):
         try:
             badge = "RUNTIME-GRENZE" if rt_label else (mode or "LAUF").upper()[:10]
             title = ("%s-App (%s)" % (rt_label, mode or "lauf")) if rt_label else "Live-App-Status"
-            self.set_tree(info_screen(title, lines, badge=badge))
+            self.set_tree(info_screen(title, lines, badge=badge), vm="glass" if self.vm == "glass" else None)
         except Exception:
             pass
 
@@ -1048,14 +1118,13 @@ class DisplayTab(ttk.Frame):
             try:
                 tree, vm = self._run_lifecycle(root, zone, entry)
                 label, why = detect_runtime(root)
-                if label == "Flutter" and (tree is None or tree.root is None or is_unrendered_surface_shell(tree)):
+                if tree is None or tree.root is None or is_unrendered_surface_shell(tree):
+                    if tree is None:
+                        from core.java.view_tree import ViewTree
+                        tree = ViewTree()
+                    stubs = getattr(getattr(vm, "runtime", None), "stubs", None)
                     try:
-                        from core.java.flutter_app_producer import mount_flutter_app_into_tree
-                        if tree is None:
-                            from core.java.view_tree import ViewTree
-                            tree = ViewTree()
-                        stubs = getattr(getattr(vm, "runtime", None), "stubs", None)
-                        mount_flutter_app_into_tree(
+                        mount_inphone_runtime_if_needed(
                             tree, root, stubs=stubs, on_async_update=self._on_inphone_browser_async,
                         )
                     except Exception:
@@ -1127,6 +1196,48 @@ class DisplayTab(ttk.Frame):
             self._log("Lifecycle (teilweise): %r" % e)
         return tree, vm
 
+    # ---- MCP Live-Sync (nur bei Aenderung) --------------------------------
+    def _sync_mcp_snapshot(self, *, tree=None, dl=None, status_clock="12:00", foc=None):
+        """Exportiert den aktuellen GUI-Screen fuer `native.ui_view` nach `last_ui.json`."""
+        try:
+            key = (
+                id(tree) if tree is not None else 0,
+                getattr(tree, "version", -1) if tree is not None else -1,
+                id(dl) if dl is not None else 0,
+                getattr(dl, "_frame", -1) if dl is not None else -1,
+                int(getattr(self, "scroll_y", 0) or 0),
+                str(status_clock or "12:00"),
+                bool(getattr(self, "_pw_mask", False)),
+                getattr(tree, "_toast_text", None) if tree is not None else None,
+                getattr(tree, "last_toast", None) if tree is not None else None,
+                tuple(getattr(foc, "bounds", ()) or ()) if foc is not None else (),
+            )
+            if key == getattr(self, "_last_mcp_snap_key", None):
+                return
+            self._last_mcp_snap_key = key
+            from core.java.ui_mcp_bridge import build_ui_snapshot_dict, persist_live_ui_snapshot
+            cfg = getattr(getattr(self, "app", None), "cfg", None)
+            pkg = ""
+            out_dir = None
+            if cfg is not None and hasattr(cfg, "config"):
+                pkg = str(cfg.config.get("APP_PACKAGE") or "")
+                base = str(cfg.config.get("BASE_DIR") or "").strip()
+                if base:
+                    out_dir = os.path.join(base, "secrets", "probe", "out", "glass")
+            snap = build_ui_snapshot_dict(
+                tree=tree,
+                dl=dl,
+                scroll_y=int(getattr(self, "scroll_y", 0) or 0),
+                max_scroll=int(getattr(self, "_max_scroll", 0) or 0),
+                status_clock=status_clock,
+                focused_bounds=list(foc.bounds) if (foc is not None and getattr(foc, "bounds", None)) else None,
+                package=pkg,
+                source="gui_live",
+            )
+            persist_live_ui_snapshot(snap, out_dir=out_dir)
+        except Exception:
+            pass
+
     # ---- Rendering (Telefonrahmen) ---------------------------------------
     def render(self):
         if not self._alive():
@@ -1156,16 +1267,46 @@ class DisplayTab(ttk.Frame):
             vy0, vy1 = oy, oy + view_h
             f_main = ("Segoe UI", -max(8, int(round(12 * s))))
             f_sm = ("Segoe UI", -max(7, int(round(10 * s))))
+            foc = None
             if t is not None and t.root is not None:
                 t.width = SCREEN_W
                 t.height = view_h
                 t.mask_passwords = bool(getattr(self, "_pw_mask", False))
-                t.layout()
+                if hasattr(t, "ensure_layout"):
+                    t.ensure_layout()
+                else:
+                    t.layout()
                 content_h = t.root.bounds[3]
                 self._max_scroll = max(0, content_h - view_h)
                 sy = max(0, min(self.scroll_y, self._max_scroll))
                 self.scroll_y = sy
-                for cmd in paint_commands(t):
+                cache_key = (
+                    id(t),
+                    getattr(t, "version", 0),
+                    t.width,
+                    t.height,
+                    bool(getattr(t, "mask_passwords", False)),
+                )
+                pcache = getattr(self, "_paint_cache", None)
+                if pcache is not None and pcache[0] is t and pcache[1] == cache_key:
+                    cmds = pcache[2]
+                else:
+                    cmds = paint_commands(t)
+                    hl_cur = getattr(t, "_highlight_node", None)
+                    if hl_cur is not None and getattr(hl_cur, "bounds", None):
+                        hb = tuple(hl_cur.bounds)
+                        cmds = [
+                            cmd for cmd in cmds
+                            if not (
+                                cmd.get("op") == "rect"
+                                and cmd.get("outline") == "#00e5ff"
+                                and cmd.get("width") == 2
+                                and cmd.get("fill") == ""
+                                and (cmd.get("x"), cmd.get("y"), cmd.get("w"), cmd.get("h")) == hb
+                            )
+                        ]
+                    self._paint_cache = (t, cache_key, cmds)
+                for cmd in cmds:
                     if self._draw_extra_cmd(c, cmd, ox, oy, sy, s, vy0, vy1):
                         continue
                     cy = (oy + cmd["y"]) if cmd.get("fixed_y") else (oy + cmd["y"] - sy)
@@ -1173,20 +1314,24 @@ class DisplayTab(ttk.Frame):
                     if op in ("rect", "oval"):
                         if cy + cmd["h"] <= vy0 or cy >= vy1:   # ausserhalb -> cullen
                             continue
-                        x0 = ox + cmd["x"]
+                        raw_x0 = ox + cmd["x"]
+                        raw_x1 = raw_x0 + cmd["w"]
+                        rx0 = max(ox, raw_x0) if op == "rect" else raw_x0
+                        rx1 = min(ox + SCREEN_W, raw_x1) if op == "rect" else raw_x1
                         ry0 = max(vy0, cy) if op == "rect" else cy
                         ry1 = min(vy1, cy + cmd["h"]) if op == "rect" else (cy + cmd["h"])
-                        if ry1 <= ry0:
+                        if rx1 <= rx0 or ry1 <= ry0:
                             continue
                         fn = c.create_oval if op == "oval" else c.create_rectangle
                         kw_shape = {"fill": cmd["fill"] or "", "outline": cmd["outline"]}
                         if cmd.get("width"):
                             kw_shape["width"] = max(1, int(round(cmd["width"] * s)))
-                        fn(x0 * s, ry0 * s, (x0 + cmd["w"]) * s, ry1 * s, **kw_shape)
+                        fn(rx0 * s, ry0 * s, rx1 * s, ry1 * s, **kw_shape)
                     elif op == "line":
                         c.create_line((ox + cmd.get("x", 0)) * s, cy * s,
                                       (ox + cmd.get("x2", 0)) * s, (oy + cmd.get("y2", 0) - sy) * s,
-                                      fill=cmd.get("color") or "#000")
+                                      fill=cmd.get("color") or "#000",
+                                      width=max(1, int(round(cmd.get("width", 1) * s))))
                     else:
                         if cy < vy0 - 40 or cy > vy1 + 40:
                             continue
@@ -1217,8 +1362,19 @@ class DisplayTab(ttk.Frame):
             c.create_rectangle(BEZEL * s, BEZEL * s, (BEZEL + SCREEN_W) * s, (BEZEL + STATUS_H) * s,
                                fill="#181b20" if dark else "#e7e9ee", outline="")
             st_col = "#cfd4dc" if dark else "#333"
-            c.create_text((BEZEL + 8) * s, (BEZEL + STATUS_H / 2) * s, text="12:00", anchor="w",
+            _st_clk = getattr(t, "_stubs_ref", None) if t is not None else None
+            _clk_txt = (
+                _st_clk.format_status_clock()
+                if (_st_clk is not None and hasattr(_st_clk, "format_status_clock"))
+                else "12:00"
+            )
+            c.create_text((BEZEL + 8) * s, (BEZEL + STATUS_H / 2) * s, text=_clk_txt, anchor="w",
                           font=f_sm, fill=st_col)
+            _is_reconstructed = t is not None and getattr(t, "render_source", "executed") == "reconstructed"
+            if _is_reconstructed:
+                c.create_text((BEZEL + SCREEN_W / 2) * s, (BEZEL + STATUS_H / 2) * s,
+                              text="[Rekonstruiert]", anchor="c", font=f_sm,
+                              fill="#fbbf24" if dark else "#b45309")
             c.create_text((BEZEL + SCREEN_W - 8) * s, (BEZEL + STATUS_H / 2) * s, text="100%",
                           anchor="e", font=f_sm, fill=st_col)
             # Scroll-Indikator
@@ -1261,11 +1417,60 @@ class DisplayTab(ttk.Frame):
                     c.create_text(((vx0 + vx1) / 2) * s, ((y0 + y1) / 2) * s, text=lbl,
                                   fill="#cfd4dc", font=f_sm)
                 self._nav_regions.append((name, vx0, y0, vx1, y1))
+            hl = getattr(t, "_highlight_node", None) if t is not None else None
+            if hl is not None and getattr(hl, "bounds", None):
+                hx, hy, hw, hh = hl.bounds
+                if hw > 0 and hh > 0:
+                    from core.java.view_tree import _is_fixed_y_node
+                    hl_y = (oy + hy) if _is_fixed_y_node(hl) else (oy + hy - sy)
+                    if hl_y + hh > vy0 and hl_y < vy1:
+                        c.create_rectangle(
+                            (ox + hx) * s, max(vy0, hl_y) * s,
+                            (ox + hx + hw) * s, min(vy1, hl_y + hh) * s,
+                            fill="", outline="#00e5ff", width=max(1, int(round(2 * s))),
+                        )
+            if getattr(self, "_ui_inspect_mode", False):
+                if hl is not None and getattr(hl, "bounds", None):
+                    hx, hy, hw, hh = hl.bounds
+                    hud_lbl = "%s%s (%dx%d)" % (
+                        getattr(hl, "cls", "View"),
+                        (" #%s" % hl.vid) if getattr(hl, "vid", None) else "",
+                        hw, hh,
+                    )
+                    pil_w = max(84, min(SCREEN_W - 12, len(hud_lbl) * 6 + 14))
+                    pil_h = 18
+                    px0 = max(BEZEL + 4, min(BEZEL + SCREEN_W - pil_w - 4, ox + hx))
+                    py_above = oy + hy - sy - pil_h - 4
+                    py_below = oy + hy + hh - sy + 4
+                    py0 = py_above if py_above >= (BEZEL + STATUS_H + 2) else min(BEZEL + SCREEN_H - pil_h - 4, py_below)
+                    py0 = max(BEZEL + STATUS_H + 2, py0)
+                    c.create_rectangle(px0 * s, py0 * s, (px0 + pil_w) * s, (py0 + pil_h) * s,
+                                       fill="#0f172a", outline="#00e5ff", width=max(1, int(s)))
+                    c.create_text((px0 + 6) * s, (py0 + pil_h / 2) * s, text=hud_lbl,
+                                  anchor="w", fill="#e0f2fe", font=f_sm)
+                else:
+                    msg = "🎯 UI-Lupe aktiv — Maus über ein Element bewegen"
+                    pil_w = min(SCREEN_W - 16, len(msg) * 6 + 16)
+                    px0 = BEZEL + 8
+                    py0 = BEZEL + STATUS_H + 6
+                    c.create_rectangle(px0 * s, py0 * s, (px0 + pil_w) * s, (py0 + 20) * s,
+                                       fill="#0f172a", outline="#00e5ff", width=max(1, int(s)))
+                    c.create_text((px0 + 8) * s, (py0 + 10) * s, text=msg,
+                                  anchor="w", fill="#e0f2fe", font=f_sm)
             n = len(t.nodes()) if t else 0
             _gm = (" · ⏸ %s" % self._glass_mode) if getattr(self, "_glass_mode", None) in ("paused",) else ""
-            self.status.config(text="%dx%d · %d Views · %d%%%s%s"
-                               % (SCREEN_W, SCREEN_H, n, int(round(s * 100)),
-                                  " (Demo)" if self.vm is None else "", _gm))
+            _rs = " · [Rekonstruiert]" if _is_reconstructed else ""
+            if getattr(self, "_ui_inspect_mode", False):
+                if hl is not None:
+                    self.status.config(text=self._format_inspect_node(hl))
+                else:
+                    self.status.config(text="🟢 UI-Lupe aktiv — Maus über App-Element bewegen (Klick = Fokus, kein App-Tap)")
+            else:
+                self.status.config(text="%dx%d · %d Views · %d%%%s%s%s"
+                                   % (SCREEN_W, SCREEN_H, n, int(round(s * 100)),
+                                      " (Demo)" if self.vm is None else "", _gm, _rs))
+            if t is not None and t.root is not None:
+                self._sync_mcp_snapshot(tree=t, status_clock=_clk_txt, foc=foc)
         except Exception as e:
             self._log("render: %r" % e)
 
@@ -1364,13 +1569,30 @@ class DisplayTab(ttk.Frame):
         self.render()
         self._sync_sibling_displays()
 
+    @staticmethod
+    def _format_inspect_node(nd):
+        cls = getattr(nd, "cls", "View") or "View"
+        vid = f" #{nd.vid}" if getattr(nd, "vid", None) else ""
+        props = getattr(nd, "props", None) or {}
+        raw_txt = (getattr(nd, "text", None) or props.get("hint") or "").strip()
+        txt = f' "{raw_txt[:24]}"' if raw_txt else ""
+        clk = " [klickbar]" if getattr(nd, "clickable", False) else ""
+        bx, by, bw, bh = getattr(nd, "bounds", (0, 0, 0, 0))
+        return f"🎯 {cls}{vid}{txt} · ({bx},{by} {bw}×{bh}){clk}"
+
     def toggle_ui_inspect(self):
         self._ui_inspect_mode = not bool(getattr(self, "_ui_inspect_mode", False))
         if not self._ui_inspect_mode and self.tree is not None:
             self.tree._highlight_node = None
         if hasattr(self, "_ui_inspect_btn") and self._ui_inspect_btn is not None:
             try:
-                self._ui_inspect_btn.config(text="🎯 UI*" if self._ui_inspect_mode else "🎯 UI")
+                self._ui_inspect_btn.config(text="🟢 UI-Lupe: AN" if self._ui_inspect_mode else "🎯 UI-Lupe")
+                self._ui_inspect_btn.state(["pressed"] if self._ui_inspect_mode else ["!pressed"])
+            except Exception:
+                pass
+        if hasattr(self, "canvas") and self.canvas is not None:
+            try:
+                self.canvas.config(cursor="crosshair" if self._ui_inspect_mode else "")
             except Exception:
                 pass
         self.render()
@@ -1404,6 +1626,12 @@ class DisplayTab(ttk.Frame):
         max_v = int((cur.props or {}).get("max", 100) or 100)
         prog = int(round(max(0.0, min(1.0, (tx - bx) / float(bw))) * max_v))
         cur.props["progress"] = prog
+        prog_fn = (cur.props or {}).get("$on_progress_fn")
+        if callable(prog_fn):
+            try:
+                prog_fn(prog)
+            except Exception:
+                pass
         lst = (cur.props or {}).get("$seek_listener")
         stubs = self._get_active_stubs()
         if lst is not None and stubs is not None:
@@ -1457,8 +1685,6 @@ class DisplayTab(ttk.Frame):
                 _lx, _ly, tx, ty = self._canvas_to_tree_xy(e)
                 nd = self.tree.node_at(tx, ty)
                 self.tree._highlight_node = nd
-                if nd is not None and hasattr(self, "status"):
-                    self.status.config(text=f"Inspect: {nd.short()} {nd.bounds}")
                 self.render()
                 self._sync_sibling_displays()
                 return
@@ -1476,14 +1702,13 @@ class DisplayTab(ttk.Frame):
     def _on_hover_motion(self, e):
         if not getattr(self, "_ui_inspect_mode", False) or self.tree is None or not self._alive():
             return
-        _lx, _ly, tx, ty = self._canvas_to_tree_xy(e)
-        if not (0 <= tx < SCREEN_W and ty >= 0):
+        _lx, ly, tx, ty = self._canvas_to_tree_xy(e)
+        vy = ly - (BEZEL + STATUS_H)
+        if not (0 <= tx < SCREEN_W and vy >= 0):
             return
-        nd = self.tree.node_at(tx, ty)
+        nd = (self.tree.fixed_node_at(tx, vy) if hasattr(self.tree, "fixed_node_at") else None) or self.tree.node_at(tx, ty)
         if nd is not getattr(self.tree, "_highlight_node", None):
             self.tree._highlight_node = nd
-            if nd is not None and hasattr(self, "status"):
-                self.status.config(text=f"Inspect: {nd.short()} {nd.bounds}")
             self.render()
 
     def _on_click(self, e):
@@ -1524,7 +1749,10 @@ class DisplayTab(ttk.Frame):
         if not (0 <= tx < t.width and 0 <= vy < view_h):   # nur im Screen-Bereich
             return
         ty = vy + self.scroll_y                            # Scroll-Offset
-        node = t.node_at(tx, ty)
+        fix_nd = t.fixed_node_at(tx, vy) if hasattr(t, "fixed_node_at") else None
+        fix_clk = t.fixed_clickable_at(tx, vy) if hasattr(t, "fixed_clickable_at") else None
+        is_fixed_hit = (fix_nd is not None) or (fix_clk is not None)
+        node = fix_nd if is_fixed_hit else t.node_at(tx, ty)
         foc_node = None
         if node is not None:
             if getattr(node, "focusable", False):
@@ -1543,7 +1771,8 @@ class DisplayTab(ttk.Frame):
                         None,
                     )
         self._set_focus_node(foc_node)
-        clk = t.clickable_at(tx, ty)
+        clk = fix_clk if is_fixed_hit else t.clickable_at(tx, ty)
+        ty_eff = vy if is_fixed_hit else ty
         if clk is not None and clk.cls == "WebView" and clk.on_click is None and (clk.props or {}).get("web_url"):
             self.toggle_browser_view(clk.props["web_url"])
             return
@@ -1562,8 +1791,8 @@ class DisplayTab(ttk.Frame):
                 return
             ctrl = getattr(getattr(self.app, "debugger_tab", None), "ctrl", None)
             if ctrl is not None and hasattr(ctrl, "dispatch_ui_event"):
-                self._log("Glass-Tap (%d, %d)" % (tx, ty))
-                ctrl.dispatch_ui_event("tap", x=tx, y=ty)
+                self._log("Glass-Tap (%d, %d)" % (tx, ty_eff))
+                ctrl.dispatch_ui_event("tap", x=tx, y=ty_eff, fixed=is_fixed_hit)
                 self._update_web_badge()
                 self.render()
                 return
@@ -1594,7 +1823,7 @@ class DisplayTab(ttk.Frame):
             if getattr(self, "_browser_mode", False):
                 self.toggle_browser_view()
                 return
-            fctrl = getattr(self.tree, "_flutter_ctrl", None) if self.tree is not None else None
+            fctrl = self._inphone_ctrl()
             if self.vm != "glass" and fctrl is not None and fctrl.handle_home():
                 self._update_web_badge()
                 self.render()
@@ -1610,7 +1839,7 @@ class DisplayTab(ttk.Frame):
                 self._update_web_badge()
                 self.render()
                 return
-            fctrl = getattr(self.tree, "_flutter_ctrl", None) if self.tree is not None else None
+            fctrl = self._inphone_ctrl()
             if self.vm != "glass" and fctrl is not None and fctrl.handle_back():
                 self._update_web_badge()
                 self.render()
@@ -1667,14 +1896,27 @@ class DisplayTab(ttk.Frame):
         def _w():
             try:
                 from core.java.objects import JObject
-                view = JObject("Landroid/view/View;")
+                view = getattr(node, "_jobj", None)
+                if not isinstance(view, JObject):
+                    view = JObject("Landroid/view/View;")
+                    node._jobj = view
                 view.fields["$view"] = node
                 cls = getattr(listener, "cls", None)
                 if hasattr(self.vm, "invoke_virtual"):
                     self.vm.invoke_virtual(listener, "onClick", "(Landroid/view/View;)V", (listener, view))
                 elif cls:
                     self.vm.invoke(cls, "onClick", "(Landroid/view/View;)V", (listener, view))
-                self.app.after(0, self.render)
+                stubs = (
+                    getattr(self.vm, "_stubs_ref", None)
+                    or getattr(getattr(self.vm, "runtime", None), "stubs", None)
+                    or (getattr(self.tree, "_stubs_ref", None) if self.tree is not None else None)
+                )
+                if stubs is not None and callable(getattr(stubs, "_flush_fragment_transactions", None)):
+                    stubs._flush_fragment_transactions()
+                if self.tree is not None:
+                    self.tree.touch()
+                if self.app is not None and hasattr(self.app, "after"):
+                    self.app.after(0, self.render)
             except Exception as e:
                 self._log("onClick-Dispatch FEHLER: %r" % e)
             finally:

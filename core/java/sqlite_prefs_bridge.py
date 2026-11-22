@@ -2,6 +2,7 @@
 """core.java.sqlite_prefs_bridge — G3: Echte sqlite3-SQLite/Room-Bridge, SharedPreferences-Sync & ActivityResultRegistry."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -30,7 +31,7 @@ _SP_TYPE_CLASSES = (
 
 
 def _s(v: Any) -> Optional[str]:
-    if v is None:
+    if v is None or (isinstance(v, int) and not isinstance(v, bool) and v == 0):
         return None
     if isinstance(v, JString):
         return v.text
@@ -138,6 +139,20 @@ def _auto_commit_if_idle(stubs: Any, key: str, conn: sqlite3.Connection) -> None
         conn.commit()
 
 
+def _record_sqlite_err(stubs: Any, key: str, op: str, sql: Any, err: Any) -> None:
+    counts = stubs.__dict__.setdefault("_sqlite_err_count", {})
+    counts[key] = int(counts.get(key, 0) or 0) + 1
+    vm = getattr(stubs, "vm", None)
+    devs = getattr(vm, "deviations", None) if vm is not None else None
+    if callable(getattr(devs, "record", None)):
+        devs.record(
+            "sqlite_error",
+            f"{key}:{op}",
+            f"{err!r} | {str(sql)[:140]}",
+            step=getattr(vm, "steps", 0),
+        )
+
+
 def _sanitize_sql(sql: str) -> str:
     """Normalisiert haeufige dekompilierte DDL-Artefakte (z. B. `<col> 0 not null` -> `<col> TEXT not null`)."""
     s = str(sql or "")
@@ -196,15 +211,27 @@ def _extract_support_query(stubs: Any, q_obj: Any) -> tuple[str, List[Any]]:
     return "", []
 
 
+def _norm_pref_int(v: int) -> int:
+    """Heilt vorzeichenlose 64-Bit-Zweierkomplement-Werte (z. B. -1 = 0xFFFFFFFFFFFFFFFF)."""
+    x = int(v)
+    if x >= (1 << 63):
+        x &= (1 << 64) - 1
+        return x - (1 << 64)
+    return x
+
+
 def _encode_pref_val(v: Any) -> Any:
     if isinstance(v, JString):
         return {"__t": "s", "v": v.text}
     if isinstance(v, JObject) and v.cls == "Ljava/lang/String;":
         return {"__t": "s", "v": str(v.fields.get("value", ""))}
+    if isinstance(v, JObject) and ("__items" in (v.fields or {}) or "$items" in (v.fields or {})):
+        items = v.fields.get("__items") or v.fields.get("$items") or ()
+        return {"__t": "ss", "v": [_s(it) or "" for it in items]}
     if isinstance(v, bool):
         return {"__t": "b", "v": 1 if v else 0}
     if isinstance(v, int):
-        return {"__t": "i", "v": v}
+        return {"__t": "i", "v": _norm_pref_int(v)}
     if isinstance(v, float):
         return {"__t": "f", "v": v}
     if isinstance(v, str):
@@ -218,21 +245,34 @@ def _decode_pref_val(raw: Any) -> Any:
         v = raw.get("v")
         if t == "s":
             return JString(str(v or ""))
+        if t == "ss":
+            items = [JString(str(x or "")) for x in (v or ())]
+            return JObject("Ljava/util/LinkedHashSet;", {"__items": list(items), "$items": list(items)})
         if t == "b":
             return 1 if v else 0
         if t == "i":
-            return int(v or 0)
+            return _norm_pref_int(int(v or 0))
         if t == "f":
             return float(v or 0.0)
     if isinstance(raw, str):
         return JString(raw)
     if isinstance(raw, bool):
         return 1 if raw else 0
+    if isinstance(raw, int):
+        return _norm_pref_int(raw)
     return raw
 
 
+def _ks_key_bytes(alias: str) -> bytes:
+    return hashlib.sha256(f"glaesern-ks:{alias}".encode("utf-8")).digest()
+
+
+def _make_secret_key(alias: str) -> JObject:
+    return JObject("Ljavax/crypto/SecretKey;", {"_alias": alias, "_key_bytes": _ks_key_bytes(alias)})
+
+
 def sync_java_appdata_from_dir(stubs: Any, host_dir: str) -> int:
-    """Lädt persistierte SharedPreferences und aktiviert SQLite-Disk-Pfade unter ``host_dir``."""
+    """Lädt persistierte SharedPreferences, KeyStore-Aliases und aktiviert SQLite-Disk-Pfade unter ``host_dir``."""
     if stubs is None or not host_dir:
         return 0
     stubs._appdata_dir = os.path.abspath(host_dir)
@@ -261,11 +301,78 @@ def sync_java_appdata_from_dir(stubs: Any, host_dir: str) -> int:
                     count += 1
             except Exception:
                 continue
+    ks_path = os.path.join(stubs._appdata_dir, "keystore.json")
+    if os.path.isfile(ks_path):
+        try:
+            with open(ks_path, "r", encoding="utf-8") as kfh:
+                kpayload = json.load(kfh)
+            aliases = kpayload.get("aliases", []) if isinstance(kpayload, dict) else []
+            if isinstance(aliases, list):
+                ks_store = stubs.__dict__.setdefault("_keystore_aliases", {})
+                for al in aliases:
+                    al_s = str(al or "")
+                    if al_s:
+                        ks_store[al_s] = _make_secret_key(al_s)
+                count += 1
+        except Exception:
+            pass
     return count
 
 
+def clear_java_appdata_state(
+    stubs: Any = None,
+    app_dir: Optional[str] = None,
+    fusion: Any = None,
+    package: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Schliesst SQLite-Handles, leert In-Memory-Prefs/KeyStore/VFS und loescht das AppData-Verzeichnis."""
+    import shutil
+
+    target_dir = os.path.abspath(app_dir) if app_dir else None
+    if not target_dir and stubs is not None:
+        raw_dir = getattr(stubs, "_appdata_dir", None)
+        if raw_dir:
+            target_dir = os.path.abspath(raw_dir)
+
+    if stubs is not None:
+        conns = getattr(stubs, "_sqlite_conns", None)
+        if isinstance(conns, dict):
+            for conn in list(conns.values()):
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            conns.clear()
+        for attr in ("_sqlite_db_paths", "_sqlite_tx_depth", "_prefs_store", "_keystore_aliases"):
+            dct = getattr(stubs, attr, None)
+            if isinstance(dct, dict):
+                dct.clear()
+
+    if fusion and isinstance(fusion, dict) and fusion.get("eng") is not None and package:
+        try:
+            from core.java.fs_bridge import get_shared_fs
+            fs = get_shared_fs(fusion["eng"])
+            prefixes = (f"/data/data/{package}", f"/data/user/0/{package}")
+            for fp in [k for k in list(getattr(fs, "files", {}).keys()) if k.startswith(prefixes)]:
+                fs.files.pop(fp, None)
+        except Exception:
+            pass
+
+    removed_files = 0
+    if target_dir and os.path.isdir(target_dir):
+        for _root, _dirs, files in os.walk(target_dir):
+            removed_files += len(files)
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+    return {
+        "ok": True,
+        "appdata_dir": target_dir,
+        "removed_files": removed_files,
+    }
+
+
 def persist_java_appdata_to_dir(stubs: Any, host_dir: str) -> int:
-    """Persistiert SharedPreferences nach ``<host_dir>/shared_prefs`` und flusht SQLite-DBs."""
+    """Persistiert SharedPreferences nach ``<host_dir>/shared_prefs``, KeyStore-Aliases und flusht SQLite-DBs."""
     if stubs is None or not host_dir:
         return 0
     abs_dir = os.path.abspath(host_dir)
@@ -292,6 +399,19 @@ def persist_java_appdata_to_dir(stubs: Any, host_dir: str) -> int:
                 count += 1
             except Exception:
                 continue
+
+    ks_aliases = getattr(stubs, "_keystore_aliases", None) or {}
+    if isinstance(ks_aliases, dict) and ks_aliases:
+        os.makedirs(abs_dir, exist_ok=True)
+        ks_path = os.path.join(abs_dir, "keystore.json")
+        try:
+            tmp_ks = ks_path + ".tmp"
+            with open(tmp_ks, "w", encoding="utf-8") as kfh:
+                json.dump({"aliases": sorted(str(k) for k in ks_aliases.keys() if k)}, kfh, ensure_ascii=False, indent=2)
+            os.replace(tmp_ks, ks_path)
+            count += 1
+        except Exception:
+            pass
 
     conns = getattr(stubs, "_sqlite_conns", None) or {}
     db_paths = getattr(stubs, "_sqlite_db_paths", None) or {}
@@ -492,14 +612,14 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             try:
                 conn.execute(sql, params)
                 _auto_commit_if_idle(stubs, key, conn)
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as _sqe:
+                _record_sqlite_err(stubs, key, "execSQL", sql, _sqe)
         return None
 
     def _raw_query(a):
         if not a or len(a) < 2:
             return _make_cursor([], [])
-        _, conn = _db_conn(a[0])
+        key, conn = _db_conn(a[0])
         if len(a) == 2 and not isinstance(a[1], (str, JString)):
             sql, params = _extract_support_query(stubs, a[1])
         else:
@@ -513,7 +633,8 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             cols = [d[0] for d in (cur.description or ())]
             rows = cur.fetchall()
             return _make_cursor(rows, cols)
-        except sqlite3.Error:
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, "rawQuery", sql, _sqe)
             return _make_cursor([], [])
 
     def _query_structured(a):
@@ -524,7 +645,7 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             return _make_cursor([], [])
         if len(a) == 2:
             return _raw_query(a)
-        _, conn = _db_conn(a[0])
+        key, conn = _db_conn(a[0])
         idx = 1
         distinct = False
         if isinstance(a[1], int):
@@ -550,11 +671,13 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             parts.append(f"ORDER BY {ord_by}")
         if lim:
             parts.append(f"LIMIT {lim}")
+        sql = " ".join(parts)
         try:
-            cur = conn.execute(" ".join(parts), sel_args)
+            cur = conn.execute(sql, sel_args)
             cnames = [d[0] for d in (cur.description or ())]
             return _make_cursor(cur.fetchall(), cnames)
-        except sqlite3.Error:
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, "query", sql, _sqe)
             return _make_cursor([], [])
 
     def _db_insert(a, replace: bool = False):
@@ -582,7 +705,8 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             cur = conn.execute(sql, vals)
             _auto_commit_if_idle(stubs, key, conn)
             return int(cur.lastrowid or 0)
-        except sqlite3.Error:
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, "replace" if replace else "insert", sql, _sqe)
             return -1
 
     def _db_insert_conflict(a):
@@ -603,7 +727,8 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
                     cur = conn.execute(sql, [cv[k] for k in keys])
                     _auto_commit_if_idle(stubs, key, conn)
                     return int(cur.lastrowid or 0)
-                except sqlite3.Error:
+                except sqlite3.Error as _sqe:
+                    _record_sqlite_err(stubs, key, "insertWithOnConflict", sql, _sqe)
                     return -1
         return _db_insert(a[:4], replace=False)
 
@@ -632,7 +757,8 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             cur = conn.execute(sql, [cv[k] for k in keys] + wargs)
             _auto_commit_if_idle(stubs, key, conn)
             return int(cur.rowcount or 0)
-        except sqlite3.Error:
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, "update", sql, _sqe)
             return 0
 
     def _db_delete(a):
@@ -647,7 +773,8 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
             cur = conn.execute(sql, wargs)
             _auto_commit_if_idle(stubs, key, conn)
             return int(cur.rowcount or 0)
-        except sqlite3.Error:
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, "delete", sql, _sqe)
             return 0
 
     def _db_begin_tx(a):
@@ -763,9 +890,11 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
         binds = stmt_obj.fields.get("_binds") or {}
         max_idx = max(binds.keys(), default=0)
         params = [binds.get(i) for i in range(1, max_idx + 1)] if max_idx else []
+        san_sql = _sanitize_sql(sql)
         try:
-            cur = conn.execute(_sanitize_sql(sql), params)
-        except sqlite3.Error:
+            cur = conn.execute(san_sql, params)
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, f"stmt_{mode}", san_sql, _sqe)
             return 0 if mode in ("insert", "update", "long") else (JString("") if mode == "str" else None)
         if mode == "insert":
             _auto_commit_if_idle(stubs, key, conn)
@@ -827,27 +956,60 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
         if helper_obj.fields.get("_db_init_done"):
             return db_obj
         helper_obj.fields["_db_init_done"] = True
-        conn = _get_conn(stubs, db_obj.fields["_db_key"])
+        db_key = db_obj.fields.get("_db_key", ":memory:")
+        conn = _get_conn(stubs, db_key)
         row = conn.execute("PRAGMA user_version").fetchone()
         cur_v = int(row[0]) if row else 0
         target_v = int(helper_obj.fields.get("_target_version", 1) or 1)
         vm_cur = _vm or getattr(stubs, "vm", None)
         if vm_cur is not None and hasattr(vm_cur, "invoke_virtual"):
             def _try_cb(mname, msig, cargs):
+                from core.java.deviation_journal import DebugStop
                 try:
                     vm_cur.invoke_virtual(helper_obj, mname, msig, cargs)
-                except Exception:
-                    pass
+                    return True
+                except DebugStop:
+                    raise
+                except Exception as _e:
+                    if type(_e).__name__ == "DebugStop":
+                        raise
+                    devs = getattr(vm_cur, "deviations", None)
+                    if callable(getattr(devs, "record", None)):
+                        devs.record(
+                            "sqlite_lifecycle_error",
+                            f"{getattr(helper_obj, 'cls', '?')}->{mname}",
+                            repr(_e),
+                            step=getattr(vm_cur, "steps", 0),
+                        )
+                    return False
+
+            def _run_migration_cb(mname, msig, cargs):
+                err_counts = stubs.__dict__.setdefault("_sqlite_err_count", {})
+                errs_before = err_counts.get(db_key, 0)
+                cb_ok = _try_cb(mname, msig, cargs)
+                errs_after = err_counts.get(db_key, 0)
+                if cb_ok and errs_after == errs_before:
+                    helper_obj.fields["_db_init_failed"] = False
+                    conn.execute(f"PRAGMA user_version = {target_v}")
+                    conn.commit()
+                    return True
+                helper_obj.fields["_db_init_failed"] = True
+                helper_obj.fields["_db_init_done"] = False
+                if getattr(conn, "in_transaction", False):
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                return False
+
             _try_cb("onConfigure", "(Landroid/database/sqlite/SQLiteDatabase;)V", (helper_obj, db_obj))
+            init_ok = True
             if cur_v == 0:
-                _try_cb("onCreate", "(Landroid/database/sqlite/SQLiteDatabase;)V", (helper_obj, db_obj))
-                conn.execute(f"PRAGMA user_version = {target_v}")
-                conn.commit()
+                init_ok = _run_migration_cb("onCreate", "(Landroid/database/sqlite/SQLiteDatabase;)V", (helper_obj, db_obj))
             elif cur_v < target_v:
-                _try_cb("onUpgrade", "(Landroid/database/sqlite/SQLiteDatabase;II)V", (helper_obj, db_obj, cur_v, target_v))
-                conn.execute(f"PRAGMA user_version = {target_v}")
-                conn.commit()
-            _try_cb("onOpen", "(Landroid/database/sqlite/SQLiteDatabase;)V", (helper_obj, db_obj))
+                init_ok = _run_migration_cb("onUpgrade", "(Landroid/database/sqlite/SQLiteDatabase;II)V", (helper_obj, db_obj, cur_v, target_v))
+            if init_ok:
+                _try_cb("onOpen", "(Landroid/database/sqlite/SQLiteDatabase;)V", (helper_obj, db_obj))
         return db_obj
 
     stubs._g3_helper_get_db = _helper_get_db
@@ -858,45 +1020,272 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
     R("Landroid/database/sqlite/SQLiteOpenHelper;", "setWriteAheadLoggingEnabled", "(Z)V", lambda a: None)
     R("Landroid/database/sqlite/SQLiteOpenHelper;", "close", "()V", lambda a: None)
 
+    def _room_builder(a, in_mem=False):
+        raw_cls = a[1] if len(a) > 1 else None
+        if isinstance(raw_cls, JObject) and "$jclass" in raw_cls.fields:
+            raw_cls = raw_cls.fields["$jclass"]
+        raw_nm = ":memory:" if in_mem else ((_s(a[2]) if len(a) > 2 else None) or ":memory:")
+        return JObject("Landroidx/room/RoomDatabase$Builder;", {"_ctx": a[0] if a else None, "_db_cls": raw_cls, "_db_name": raw_nm})
+
     R("Landroidx/room/Room;", "databaseBuilder",
       "(Landroid/content/Context;Ljava/lang/Class;Ljava/lang/String;)Landroidx/room/RoomDatabase$Builder;",
-      lambda a: JObject("Landroidx/room/RoomDatabase$Builder;", {"_ctx": a[0] if a else None, "_db_cls": a[1] if len(a) > 1 else None, "_db_name": _s(a[2]) if len(a) > 2 else ":memory:"}))
+      lambda a: _room_builder(a, False))
+    R("Landroidx/room/Room;", "databaseBuilder",
+      "(Landroid/content/Context;Lkotlin/reflect/KClass;Ljava/lang/String;)Landroidx/room/RoomDatabase$Builder;",
+      lambda a: _room_builder(a, False))
+    R("Landroidx/room/Room;", "databaseBuilder",
+      "(Landroid/content/Context;Lkotlin/reflect/KClass;Ljava/lang/String;Lkotlin/jvm/functions/Function0;)Landroidx/room/RoomDatabase$Builder;",
+      lambda a: _room_builder(a, False))
     R("Landroidx/room/Room;", "inMemoryDatabaseBuilder",
       "(Landroid/content/Context;Ljava/lang/Class;)Landroidx/room/RoomDatabase$Builder;",
-      lambda a: JObject("Landroidx/room/RoomDatabase$Builder;", {"_ctx": a[0] if a else None, "_db_cls": a[1] if len(a) > 1 else None, "_db_name": ":memory:"}))
+      lambda a: _room_builder(a, True))
+    R("Landroidx/room/Room;", "inMemoryDatabaseBuilder",
+      "(Landroid/content/Context;Lkotlin/reflect/KClass;)Landroidx/room/RoomDatabase$Builder;",
+      lambda a: _room_builder(a, True))
 
     def _room_build(a):
         b = a[0] if a and isinstance(a[0], JObject) else None
         db_name = b.fields.get("_db_name", ":memory:") if b else ":memory:"
         jcls = b.fields.get("_db_cls") if b else None
+        if isinstance(jcls, JObject) and "$jclass" in jcls.fields:
+            jcls = jcls.fields["$jclass"]
         raw_nm = str(jcls.fields.get("name", "")) if isinstance(jcls, JObject) else ""
         impl_desc = ("L" + raw_nm.replace(".", "/") + "_Impl;") if raw_nm else "Landroidx/room/RoomDatabase;"
         db_obj = open_db_obj(stubs, db_name, "Landroidx/sqlite/db/SupportSQLiteDatabase;")
         helper = JObject("Landroidx/sqlite/db/SupportSQLiteOpenHelper;", {"_db_name": db_name, "_db_obj": db_obj})
+        sql_conn = JObject("Landroidx/sqlite/SQLiteConnection;", {"_db_key": db_obj.fields.get("_db_key", db_name), "_db_name": db_name, "_db_obj": db_obj})
         vm_cur = getattr(stubs, "vm", None)
         if impl_desc != "Landroidx/room/RoomDatabase;" and vm_cur is not None and hasattr(vm_cur, "_lazy_class"):
             try:
                 vm_cur._lazy_class(impl_desc)
                 if (impl_desc, "<init>", "()V") in vm_cur.registry:
-                    inst = JObject(impl_desc, {"_db_obj": db_obj, "_helper": helper, "_db_name": db_name})
+                    inst = JObject(impl_desc, {"_db_obj": db_obj, "_helper": helper, "_db_name": db_name, "_sql_conn": sql_conn})
                     vm_cur.invoke(impl_desc, "<init>", "()V", (inst,))
+                    # Room 2.7 KMP: Tabellen ueber createOpenDelegate()->createAllTables(SQLiteConnection) anlegen
+                    for _d_sig in ("()Landroidx/room/RoomOpenDelegate;", "()Landroidx/room/RoomOpenDelegateMarker;"):
+                        if (impl_desc, "createOpenDelegate", _d_sig) in vm_cur.registry:
+                            try:
+                                open_del = vm_cur.invoke(impl_desc, "createOpenDelegate", _d_sig, (inst,))
+                                if isinstance(open_del, JObject):
+                                    vm_cur.invoke_virtual(open_del, "createAllTables", "(Landroidx/sqlite/SQLiteConnection;)V", (open_del, sql_conn))
+                            except Exception:
+                                pass
+                            break
                     return inst
             except Exception:
                 pass
-        return JObject("Landroidx/room/RoomDatabase;", {"_db_obj": db_obj, "_helper": helper, "_db_name": db_name})
+        return JObject("Landroidx/room/RoomDatabase;", {"_db_obj": db_obj, "_helper": helper, "_db_name": db_name, "_sql_conn": sql_conn})
 
     RB_CLS = "Landroidx/room/RoomDatabase$Builder;"
     R(RB_CLS, "build", "()Landroidx/room/RoomDatabase;", _room_build)
     for _bm, _bs in (
         ("allowMainThreadQueries", "()Landroidx/room/RoomDatabase$Builder;"),
         ("fallbackToDestructiveMigration", "()Landroidx/room/RoomDatabase$Builder;"),
+        ("fallbackToDestructiveMigration", "(Z)Landroidx/room/RoomDatabase$Builder;"),
         ("fallbackToDestructiveMigrationOnDowngrade", "()Landroidx/room/RoomDatabase$Builder;"),
+        ("fallbackToDestructiveMigrationOnDowngrade", "(Z)Landroidx/room/RoomDatabase$Builder;"),
+        ("fallbackToDestructiveMigrationFrom", "([I)Landroidx/room/RoomDatabase$Builder;"),
+        ("fallbackToDestructiveMigrationFrom", "(Z[I)Landroidx/room/RoomDatabase$Builder;"),
         ("enableMultiInstanceInvalidation", "()Landroidx/room/RoomDatabase$Builder;"),
         ("addMigrations", "([Landroidx/room/migration/Migration;)Landroidx/room/RoomDatabase$Builder;"),
         ("addCallback", "(Landroidx/room/RoomDatabase$Callback;)Landroidx/room/RoomDatabase$Builder;"),
         ("setJournalMode", "(Landroidx/room/RoomDatabase$JournalMode;)Landroidx/room/RoomDatabase$Builder;"),
+        ("setQueryCoroutineContext", "(Lkotlin/coroutines/CoroutineContext;)Landroidx/room/RoomDatabase$Builder;"),
     ):
         R(RB_CLS, _bm, _bs, lambda a: a[0] if a else None)
+
+    # ---- Room 2.7 KMP SQLite (androidx.sqlite.* / DBUtil / SQLiteStatementUtil) ----
+    import struct as _st_room
+
+    def _kmp_conn_pair(obj):
+        if isinstance(obj, JObject):
+            db_o = obj.fields.get("_db_obj")
+            if isinstance(db_o, JObject):
+                return _db_conn(db_o)
+            key = obj.fields.get("_db_key") or obj.fields.get("_db_name") or ":memory:"
+            return str(key), _get_conn(stubs, str(key))
+        return ":memory:", _get_conn(stubs, ":memory:")
+
+    def _kmp_exec_sql(a):
+        if len(a) < 2:
+            return None
+        key, conn = _kmp_conn_pair(a[0])
+        sql = _sanitize_sql(_s(a[1]) or "")
+        if sql.strip():
+            try:
+                conn.execute(sql)
+                _auto_commit_if_idle(stubs, key, conn)
+            except sqlite3.Error as _sqe:
+                _record_sqlite_err(stubs, key, "sqliteExecSQL", sql, _sqe)
+        return None
+
+    R("Landroidx/sqlite/SQLite;", "execSQL", "(Landroidx/sqlite/SQLiteConnection;Ljava/lang/String;)V", _kmp_exec_sql)
+
+    def _kmp_prepare(a):
+        sql_s = _s(a[1]) if len(a) > 1 else ""
+        key = (a[0].fields.get("_db_key") or a[0].fields.get("_db_name") or ":memory:") if a and isinstance(a[0], JObject) else ":memory:"
+        db_o = a[0].fields.get("_db_obj") if a and isinstance(a[0], JObject) else None
+        return JObject("Landroidx/sqlite/SQLiteStatement;", {
+            "_db_key": key,
+            "_db_obj": db_o,
+            "_sql": sql_s or "",
+            "_binds": {},
+            "_executed": False,
+            "_is_query": False,
+            "_cols": [],
+            "_rows": [],
+            "_idx": -1,
+        })
+
+    SC_CLS = "Landroidx/sqlite/SQLiteConnection;"
+    R(SC_CLS, "prepare", "(Ljava/lang/String;)Landroidx/sqlite/SQLiteStatement;", _kmp_prepare)
+    R(SC_CLS, "close", "()V", lambda a: None)
+
+    def _stmt_exec_if_needed(stmt):
+        if not isinstance(stmt, JObject):
+            return
+        if stmt.fields.get("_executed"):
+            return
+        stmt.fields["_executed"] = True
+        sql = _sanitize_sql(stmt.fields.get("_sql", ""))
+        if not sql.strip():
+            stmt.fields.update({"_is_query": False, "_cols": [], "_rows": [], "_idx": -1})
+            return
+        binds = stmt.fields.get("_binds") or {}
+        n_q = sql.count("?")
+        max_k = max([n_q] + [int(k) for k in binds.keys()]) if binds else n_q
+        params = [binds.get(i) for i in range(1, max_k + 1)]
+        key, conn = _kmp_conn_pair(stmt)
+        try:
+            cur = conn.execute(sql, params)
+            if cur.description is not None:
+                stmt.fields["_is_query"] = True
+                stmt.fields["_cols"] = [d[0] for d in cur.description]
+                stmt.fields["_rows"] = cur.fetchall()
+                stmt.fields["_idx"] = -1
+            else:
+                _auto_commit_if_idle(stubs, key, conn)
+                stmt.fields["_is_query"] = False
+                stmt.fields["_cols"] = []
+                stmt.fields["_rows"] = []
+                stmt.fields["_idx"] = -1
+        except sqlite3.IntegrityError as _ie:
+            _record_sqlite_err(stubs, key, "stmtStep", sql, _ie)
+            from core.java.dalvik import DalvikException
+            msg = f"Error code 1555 SQLITE_CONSTRAINT_PRIMARYKEY: {_ie}"
+            raise DalvikException(msg, payload=JObject("Landroid/database/SQLException;", {"detailMessage": JString(msg), "message": JString(msg)}))
+        except sqlite3.Error as _sqe:
+            _record_sqlite_err(stubs, key, "stmtStep", sql, _sqe)
+            stmt.fields.update({"_is_query": False, "_cols": [], "_rows": [], "_idx": -1})
+
+    def _stmt_bind(stmt, idx, val):
+        if isinstance(stmt, JObject):
+            stmt.fields.setdefault("_binds", {})[int(idx)] = val
+            stmt.fields["_executed"] = False
+            stmt.fields["_idx"] = -1
+        return None
+
+    def _stmt_f32(v):
+        if isinstance(v, float):
+            return v
+        return _st_room.unpack("<f", _st_room.pack("<I", int(v or 0) & 0xFFFFFFFF))[0]
+
+    def _stmt_f64(v):
+        if isinstance(v, float):
+            return v
+        return _st_room.unpack("<d", _st_room.pack("<Q", int(v or 0) & 0xFFFFFFFFFFFFFFFF))[0]
+
+    def _stmt_cell(a):
+        if not a or not isinstance(a[0], JObject):
+            return None
+        _stmt_exec_if_needed(a[0])
+        idx = int(a[0].fields.get("_idx", -1))
+        rows = a[0].fields.get("_rows") or ()
+        col = int(a[1]) if len(a) > 1 else -1
+        if 0 <= idx < len(rows) and 0 <= col < len(rows[idx]):
+            return rows[idx][col]
+        return None
+
+    def _stmt_step(a):
+        if not a or not isinstance(a[0], JObject):
+            return 0
+        _stmt_exec_if_needed(a[0])
+        if not a[0].fields.get("_is_query"):
+            return 0
+        idx = int(a[0].fields.get("_idx", -1)) + 1
+        a[0].fields["_idx"] = idx
+        return 1 if idx < len(a[0].fields.get("_rows") or ()) else 0
+
+    def _stmt_col_idx(a, throw_missing=False):
+        if not a or not isinstance(a[0], JObject) or len(a) < 2:
+            return -1
+        _stmt_exec_if_needed(a[0])
+        cname = (_s(a[1]) or "").strip("`").lower()
+        cols = [str(c).strip("`").lower() for c in (a[0].fields.get("_cols") or ())]
+        if cname in cols:
+            return cols.index(cname)
+        for i, col in enumerate(cols):
+            if col.endswith("." + cname):
+                return i
+        return -1
+
+    SS_CLS = "Landroidx/sqlite/SQLiteStatement;"
+    R(SS_CLS, "bindLong", "(IJ)V", lambda a: _stmt_bind(a[0], a[1], int(a[2])) if len(a) > 2 else None)
+    R(SS_CLS, "bindInt", "(II)V", lambda a: _stmt_bind(a[0], a[1], int(a[2])) if len(a) > 2 else None)
+    R(SS_CLS, "bindBoolean", "(IZ)V", lambda a: _stmt_bind(a[0], a[1], 1 if a[2] else 0) if len(a) > 2 else None)
+    R(SS_CLS, "bindDouble", "(ID)V", lambda a: _stmt_bind(a[0], a[1], _stmt_f64(a[2])) if len(a) > 2 else None)
+    R(SS_CLS, "bindFloat", "(IF)V", lambda a: _stmt_bind(a[0], a[1], _stmt_f32(a[2])) if len(a) > 2 else None)
+    R(SS_CLS, "bindText", "(ILjava/lang/String;)V", lambda a: _stmt_bind(a[0], a[1], _s(a[2])) if len(a) > 2 else None)
+    R(SS_CLS, "bindBlob", "(I[B)V", lambda a: _stmt_bind(a[0], a[1], _to_py(a[2])) if len(a) > 2 else None)
+    R(SS_CLS, "bindNull", "(I)V", lambda a: _stmt_bind(a[0], a[1], None) if len(a) > 1 else None)
+    R(SS_CLS, "clearBindings", "()V", lambda a: a[0].fields.update({"_binds": {}, "_executed": False, "_idx": -1}) if a and isinstance(a[0], JObject) else None)
+    R(SS_CLS, "reset", "()V", lambda a: a[0].fields.update({"_executed": False, "_idx": -1}) if a and isinstance(a[0], JObject) else None)
+    R(SS_CLS, "close", "()V", lambda a: None)
+    R(SS_CLS, "step", "()Z", _stmt_step)
+    R(SS_CLS, "getLong", "(I)J", lambda a: (lambda v: 0 if v is None else int(v))(_stmt_cell(a)))
+    R(SS_CLS, "getInt", "(I)I", lambda a: (lambda v: 0 if v is None else int(v))(_stmt_cell(a)))
+    R(SS_CLS, "getBoolean", "(I)Z", lambda a: 1 if _stmt_cell(a) else 0)
+    R(SS_CLS, "getDouble", "(I)D", lambda a: (lambda v: 0.0 if v is None else float(v))(_stmt_cell(a)))
+    R(SS_CLS, "getFloat", "(I)F", lambda a: (lambda v: 0.0 if v is None else float(v))(_stmt_cell(a)))
+    R(SS_CLS, "getText", "(I)Ljava/lang/String;", lambda a: (lambda v: JString("") if v is None else JString(str(v)))(_stmt_cell(a)))
+    R(SS_CLS, "getBlob", "(I)[B", lambda a: (lambda v: JArray("[B", []) if v is None else JArray("[B", list(bytes(v) if isinstance(v, (bytes, bytearray)) else str(v).encode("utf-8"))))(_stmt_cell(a)))
+    R(SS_CLS, "isNull", "(I)Z", lambda a: 1 if _stmt_cell(a) is None else 0)
+    R(SS_CLS, "getColumnCount", "()I", lambda a: (_stmt_exec_if_needed(a[0]), len(a[0].fields.get("_cols") or ()))[1] if a and isinstance(a[0], JObject) else 0)
+    R(SS_CLS, "getColumnName", "(I)Ljava/lang/String;",
+      lambda a: (_stmt_exec_if_needed(a[0]), JString((a[0].fields.get("_cols") or [])[int(a[1])]) if 0 <= int(a[1]) < len(a[0].fields.get("_cols") or ()) else JString(""))[1] if a and len(a) > 1 and isinstance(a[0], JObject) else JString(""))
+    R(SS_CLS, "getColumnNames", "()Ljava/util/List;",
+      lambda a: (_stmt_exec_if_needed(a[0]), JObject("Ljava/util/ArrayList;", {"__items": [JString(str(c)) for c in (a[0].fields.get("_cols") or ())] }))[1] if a and isinstance(a[0], JObject) else JObject("Ljava/util/ArrayList;", {"__items": []}))
+
+    SSU_CLS = "Landroidx/room/util/SQLiteStatementUtil;"
+    for _mn in ("getColumnIndex", "getColumnIndexOrThrow", "columnIndexOf", "columnIndexOfCommon"):
+        R(SSU_CLS, _mn, "(Landroidx/sqlite/SQLiteStatement;Ljava/lang/String;)I", lambda a: _stmt_col_idx(a))
+
+    def _room_db_perform(a, fn_idx):
+        db_inst = a[0] if a and isinstance(a[0], JObject) else None
+        fn1 = a[fn_idx] if len(a) > fn_idx else None
+        if db_inst is None or not isinstance(fn1, JObject):
+            return None
+        sql_conn = db_inst.fields.get("_sql_conn")
+        if not isinstance(sql_conn, JObject):
+            db_o = _room_db_obj((db_inst,))
+            db_name = db_inst.fields.get("_db_name", ":memory:")
+            sql_conn = JObject("Landroidx/sqlite/SQLiteConnection;", {"_db_key": db_o.fields.get("_db_key", db_name), "_db_name": db_name, "_db_obj": db_o})
+            db_inst.fields["_sql_conn"] = sql_conn
+        vm_cur = getattr(stubs, "vm", None)
+        if vm_cur is not None and hasattr(vm_cur, "invoke_virtual"):
+            return vm_cur.invoke_virtual(fn1, "invoke", "(Ljava/lang/Object;)Ljava/lang/Object;", (fn1, sql_conn))
+        return None
+
+    DBU_CLS = "Landroidx/room/util/DBUtil;"
+    R(DBU_CLS, "performSuspending",
+      "(Landroidx/room/RoomDatabase;ZZLkotlin/jvm/functions/Function1;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+      lambda a: _room_db_perform(a, 3))
+    R(DBU_CLS, "performBlocking",
+      "(Landroidx/room/RoomDatabase;ZZLkotlin/jvm/functions/Function1;)Ljava/lang/Object;",
+      lambda a: _room_db_perform(a, 3))
+    R(DBU_CLS, "performInTransactionSuspending",
+      "(Landroidx/room/RoomDatabase;Lkotlin/jvm/functions/Function1;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;",
+      lambda a: _room_db_perform(a, 1))
 
     R("Landroidx/sqlite/db/SupportSQLiteOpenHelper;", "getWritableDatabase", "()Landroidx/sqlite/db/SupportSQLiteDatabase;",
       lambda a: a[0].fields.get("_db_obj") if a and isinstance(a[0], JObject) and a[0].fields.get("_db_obj") else open_db_obj(stubs, ":memory:", "Landroidx/sqlite/db/SupportSQLiteDatabase;"))
@@ -1041,8 +1430,25 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
     # ---- AndroidKeyStore & JCA Cipher (G3-Grundset) ------------------------
     ks_store: Dict[str, Any] = stubs.__dict__.setdefault("_keystore_aliases", {})
 
-    def _ks_key_bytes(alias: str) -> bytes:
-        return hashlib.sha256(f"glaesern-ks:{alias}".encode("utf-8")).digest()
+    def _ensure_ks_alias_if_matching_prefs(alias: str) -> bool:
+        if not alias:
+            return False
+        if alias in ks_store:
+            return True
+        kbytes = _ks_key_bytes(alias)
+        expected_iv = hashlib.sha256(kbytes).digest()[:12]
+        iv_b64_prefix = base64.b64encode(expected_iv).decode("ascii")
+        prefs_store = getattr(stubs, "_prefs_store", None) or {}
+        if isinstance(prefs_store, dict):
+            for store in list(prefs_store.values()):
+                if not isinstance(store, dict):
+                    continue
+                for val in list(store.values()):
+                    sval = _s(val)
+                    if sval and len(sval) >= 20 and sval.startswith(iv_b64_prefix):
+                        ks_store[alias] = _make_secret_key(alias)
+                        return True
+        return False
 
     def _xor_stream(key_bytes: bytes, iv: bytes, data: bytes) -> bytes:
         if not data:
@@ -1065,29 +1471,44 @@ def install_sqlite_and_prefs_grundset(stubs: Any) -> None:
     R(KS, "load", "(Ljava/security/KeyStore$LoadStoreParameter;)V", lambda a: None)
     R(KS, "load", "(Ljava/io/InputStream;[C)V", lambda a: None)
     R(KS, "containsAlias", "(Ljava/lang/String;)Z",
-      lambda a: 1 if (len(a) > 1 and (_s(a[1]) or "") in ks_store) else 0)
+      lambda a: 1 if (len(a) > 1 and _ensure_ks_alias_if_matching_prefs(_s(a[1]) or "")) else 0)
     R(KS, "deleteEntry", "(Ljava/lang/String;)V",
       lambda a: (ks_store.pop(_s(a[1]) or "", None), None)[1] if len(a) > 1 else None)
     R(KS, "getKey", "(Ljava/lang/String;[C)Ljava/security/Key;",
-      lambda a: ks_store.get(_s(a[1]) or "") if len(a) > 1 else None)
+      lambda a: ks_store.get(_s(a[1]) or "") if (len(a) > 1 and _ensure_ks_alias_if_matching_prefs(_s(a[1]) or "")) else None)
     R(KS, "getEntry", "(Ljava/lang/String;Ljava/security/KeyStore$ProtectionParameter;)Ljava/security/KeyStore$Entry;",
-      lambda a: JObject("Ljava/security/KeyStore$SecretKeyEntry;", {"_key": ks_store.get(_s(a[1]) or "")}) if (len(a) > 1 and (_s(a[1]) or "") in ks_store) else None)
+      lambda a: JObject("Ljava/security/KeyStore$SecretKeyEntry;", {"_key": ks_store.get(_s(a[1]) or "")}) if (len(a) > 1 and _ensure_ks_alias_if_matching_prefs(_s(a[1]) or "")) else None)
     R("Ljava/security/KeyStore$SecretKeyEntry;", "getSecretKey", "()Ljavax/crypto/SecretKey;",
       lambda a: a[0].fields.get("_key") if a and isinstance(a[0], JObject) else None)
 
+    KGS = "Landroid/security/keystore/KeyGenParameterSpec;"
     KGSB = "Landroid/security/keystore/KeyGenParameterSpec$Builder;"
     R(KGSB, "<init>", "(Ljava/lang/String;I)V",
-      lambda a: a[0].fields.update({"_alias": _s(a[1]) or "default", "_purposes": int(a[2]) if len(a) > 2 else 3}) if a and isinstance(a[0], JObject) else None)
-    R(KGSB, "build", "()Landroid/security/keystore/KeyGenParameterSpec;",
-      lambda a: JObject("Landroid/security/keystore/KeyGenParameterSpec;", {"_alias": a[0].fields.get("_alias", "default") if a and isinstance(a[0], JObject) else "default"}))
+      lambda a: a[0].fields.update({"_alias": _s(a[1]) or "default", "_purposes": int(a[2]) if len(a) > 2 else 3, "_key_size": 256}) if a and isinstance(a[0], JObject) else None)
+    R(KGSB, "setKeySize", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+      lambda a: (a[0].fields.__setitem__("_key_size", int(a[1] or 256)) if a and len(a) > 1 and isinstance(a[0], JObject) else None, a[0] if a else None)[1])
+    R(KGSB, "build", f"(){KGS}",
+      lambda a: JObject(KGS, {
+          "_alias": a[0].fields.get("_alias", "default") if a and isinstance(a[0], JObject) else "default",
+          "_key_size": int(a[0].fields.get("_key_size", 256)) if a and isinstance(a[0], JObject) else 256,
+          "_purposes": int(a[0].fields.get("_purposes", 3)) if a and isinstance(a[0], JObject) else 3,
+      }))
     for _bm, _bs in (
         ("setBlockModes", "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;"),
         ("setEncryptionPaddings", "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;"),
-        ("setKeySize", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;"),
         ("setRandomizedEncryptionRequired", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;"),
         ("setUserAuthenticationRequired", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;"),
     ):
         R(KGSB, _bm, _bs, lambda a: a[0] if a else None)
+    R(KGS, "getKeySize", "()I",
+      lambda a: int(a[0].fields.get("_key_size", 256)) if a and isinstance(a[0], JObject) else 256)
+    R(KGS, "getKeystoreAlias", "()Ljava/lang/String;",
+      lambda a: JString(a[0].fields.get("_alias", "_androidx_security_master_key_") if a and isinstance(a[0], JObject) else "_androidx_security_master_key_"))
+    R(KGS, "getPurposes", "()I",
+      lambda a: int(a[0].fields.get("_purposes", 3)) if a and isinstance(a[0], JObject) else 3)
+    R(KGS, "getBlockModes", "()[Ljava/lang/String;", lambda a: JArray("[Ljava/lang/String;", [JString("GCM")]))
+    R(KGS, "getEncryptionPaddings", "()[Ljava/lang/String;", lambda a: JArray("[Ljava/lang/String;", [JString("NoPadding")]))
+    R(KGS, "isUserAuthenticationRequired", "()Z", lambda a: 0)
 
     KG = "Ljavax/crypto/KeyGenerator;"
     R(KG, "getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",

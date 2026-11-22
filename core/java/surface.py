@@ -76,9 +76,35 @@ class SceneGraphSurface(SurfaceSource):
         stubs = getattr(self.vm, "_stubs_ref", None) if self.vm is not None else None
         if stubs is not None and hasattr(stubs, "_tick_ms"):
             stubs._tick_ms(1500)
+        if (
+            self.vm is not None
+            and isinstance(getattr(self.vm, "step_budget", None), int)
+            and self.vm.step_budget > 0
+        ):
+            per_ev = max(int(getattr(self.vm, "max_steps", 0) or 0), self.vm.step_budget, 400_000)
+            self.vm.step_budget = int(getattr(self.vm, "steps", 0) or 0) + per_ev
+        def _post_dispatch():
+            st = stubs or (getattr(self.tree, "_stubs_ref", None) if self.tree is not None else None)
+            if st is None:
+                return
+            fl = getattr(st, "_flush_fragment_transactions", None)
+            if callable(fl):
+                try:
+                    fl()
+                except Exception:
+                    pass
+            ar = getattr(st, "_active_runner", None)
+            dr = getattr(ar, "_drain_runnables", None) if ar is not None else None
+            if callable(dr):
+                try:
+                    dr()
+                except Exception:
+                    pass
+
         cb = getattr(node, "on_click", None)
         if callable(cb):
             cb(node)
+            _post_dispatch()
             return True
         if cb is not None and self.vm is not None:
             try:
@@ -88,6 +114,7 @@ class SceneGraphSurface(SurfaceSource):
                     self.vm.invoke_virtual(cb, "onClick", "(Landroid/view/View;)V", (cb, view))
                 else:
                     self.vm.invoke(cb.cls, "onClick", "(Landroid/view/View;)V", (cb, view))
+                _post_dispatch()
                 return True
             except Exception:
                 return False
@@ -95,6 +122,7 @@ class SceneGraphSurface(SurfaceSource):
             try:
                 self.vm.invoke(self.activity.cls, "onClick", "(Landroid/view/View;)V",
                                (self.activity, None))
+                _post_dispatch()
                 return True
             except Exception:
                 return False

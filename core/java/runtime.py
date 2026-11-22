@@ -14,6 +14,7 @@ Marshalling ist bewusst bounded: jint/jlong direkt; jobject/jstring/Array ueber 
 from __future__ import annotations
 
 import re
+import struct
 
 from core.java.dalvik import DalvikVM
 from core.java.bridge import JavaToNativeBridge
@@ -24,22 +25,179 @@ from core.java.objects import JString, JObject, JArray
 _M64 = (1 << 64) - 1
 
 
-def sig_argcount(sig: str) -> int:
-    """Anzahl der Parameter einer JNI-Signatur ``(args)ret`` (ohne ``this``)."""
+def sig_param_types(sig: str) -> list[str]:
+    """Zerlegt den Parameter-Teil von ``(args)ret`` in JNI-Typdeskriptoren (ohne ``this``)."""
+    if "(" not in sig or ")" not in sig:
+        return []
     inner = sig[sig.index("(") + 1:sig.index(")")]
-    n = 0
+    out = []
     i = 0
-    while i < len(inner):
-        c = inner[i]
-        if c == "[":
+    n = len(inner)
+    while i < n:
+        start = i
+        while i < n and inner[i] == "[":
             i += 1
-            continue
-        if c == "L":
-            i = inner.index(";", i) + 1
+        if i >= n:
+            break
+        if inner[i] == "L":
+            end = inner.find(";", i)
+            if end < 0:
+                out.append(inner[start:])
+                break
+            i = end + 1
+            out.append(inner[start:i])
         else:
             i += 1
-        n += 1
-    return n
+            out.append(inner[start:i])
+    return out
+
+
+def sig_ret_type(sig: str) -> str:
+    """Liefert den Rueckgabe-Deskriptor aus ``(args)ret``."""
+    if ")" not in sig:
+        return "V"
+    return sig[sig.rindex(")") + 1:] or "V"
+
+
+def sig_argcount(sig: str) -> int:
+    """Anzahl der Parameter einer JNI-Signatur ``(args)ret`` (ohne ``this``)."""
+    return len(sig_param_types(sig))
+
+
+def _norm_jni_cls(cls: str) -> str:
+    """Normalisiert JNI-Klassennamen ('com/foo/Bar' -> 'Lcom/foo/Bar;', Arrays unveraendert)."""
+    s = str(cls or "").strip()
+    if not s:
+        return s
+    if s.startswith("["):
+        return s.replace(".", "/")
+    if s.startswith("L") and s.endswith(";"):
+        return "L" + s[1:-1].replace(".", "/") + ";"
+    return "L" + s.replace(".", "/") + ";"
+
+
+def _sx(val: int, bits: int) -> int:
+    mask = (1 << bits) - 1
+    v = int(val) & mask
+    sign = 1 << (bits - 1)
+    return v - (1 << bits) if (v & sign) else v
+
+
+def _unmarshal_arg(word, ptype: str | None, h2py: dict, jni):
+    """Konvertiert ein natives JNI-Argumentwort anhand seines Deskriptors in einen Python-/Dalvik-Wert."""
+    handles = getattr(getattr(jni, "st", None), "handles", None)
+    if ptype is None or ptype[0] in ("L", "["):
+        if word is None:
+            return None
+        if isinstance(word, (JString, JObject, JArray)):
+            return word
+        if isinstance(word, float):
+            return word
+        w = int(word) & _M64
+        if w == 0:
+            return None if ptype is not None else 0
+        if w in h2py:
+            return h2py[w]
+        if isinstance(handles, dict) and w in handles:
+            rec = handles[w]
+            kind = rec.get("kind")
+            if kind == "jstring":
+                obj = JString(rec.get("text", ""))
+                h2py[w] = obj
+                return obj
+            if kind in ("jbyteArray", "jarray"):
+                el = rec.get("eltype") or ("B" if kind == "jbyteArray" else (ptype or "B"))
+                raw = rec.get("data") or ()
+                obj = JArray(el, list(raw))
+                h2py[w] = obj
+                return obj
+            if kind in ("jobject", "jclass", "jthrowable"):
+                obj = JObject(rec.get("cls") or (ptype if ptype and ptype.startswith("L") else "Ljava/lang/Object;"),
+                              rec.get("fields"))
+                h2py[w] = obj
+                return obj
+        return w
+    pt0 = ptype[0]
+    if pt0 == "F":
+        if isinstance(word, float):
+            return word
+        return struct.unpack("<f", struct.pack("<I", int(word) & 0xffffffff))[0]
+    if pt0 == "D":
+        if isinstance(word, float):
+            return word
+        return struct.unpack("<d", struct.pack("<Q", int(word) & _M64))[0]
+    if pt0 == "Z":
+        return 1 if (int(word) & 0xff) else 0
+    if pt0 == "C":
+        return int(word) & 0xffff
+    if pt0 == "B":
+        return _sx(word, 8)
+    if pt0 == "S":
+        return _sx(word, 16)
+    if pt0 == "I":
+        return _sx(word, 32)
+    return int(word) & _M64
+
+
+def _marshal_ret(val, ret_type: str | None, h2py: dict, jni, cpu=None) -> int:
+    """Konvertiert einen Java-Rueckgabewert in ein natives jvalue-Wort (+ vset fuer F/D)."""
+    if ret_type == "V":
+        return 0
+    if ret_type in ("F", "D") or isinstance(val, float):
+        is_f = (ret_type == "F")
+        if isinstance(val, float):
+            raw = struct.pack("<f" if is_f else "<d", val)
+            bits = int.from_bytes(raw, "little")
+        else:
+            bits = int(val or 0) & (0xffffffff if is_f else _M64)
+            raw = struct.pack("<I" if is_f else "<Q", bits)
+        if cpu is not None and hasattr(cpu, "vset"):
+            cpu.vset(0, raw)
+        return bits
+    if val is None:
+        return 0
+    if isinstance(val, bool):
+        return 1 if val else 0
+    if isinstance(val, int):
+        return val & _M64
+    if isinstance(val, str):
+        val = JString(val)
+    if isinstance(val, JString):
+        kind, kw = "jstring", {"text": val.text}
+    elif isinstance(val, JObject):
+        kind, kw = "jobject", {"cls": val.cls, "fields": dict(val.fields)}
+    elif isinstance(val, JArray):
+        if val.eltype in ("B", "[B"):
+            kind = "jbyteArray"
+            kw = {"eltype": val.eltype,
+                  "data": bytearray(int(x) & 0xff for x in val.data),
+                  "length": len(val.data)}
+        else:
+            kind = "jarray"
+            kw = {"eltype": val.eltype, "data": list(val.data), "length": len(val.data)}
+    else:
+        kind, kw = "jobject", {}
+    try:
+        h = int(jni._new_handle(kind, **kw)) & _M64
+    except Exception:
+        return 0
+    h2py[h] = val
+    return h
+
+
+def _prepare_native_args(sig: str, arg_words, static: bool, param_types, h2py: dict, jni):
+    ptypes = list(param_types) if param_types is not None else sig_param_types(sig)
+    raw = list(arg_words or ())
+    args = []
+    if not static and len(raw) > len(ptypes):
+        args.append(_unmarshal_arg(raw[0], "Ljava/lang/Object;", h2py, jni))
+        param_raw = raw[1:]
+    else:
+        param_raw = raw
+    for i, w in enumerate(param_raw):
+        pt = ptypes[i] if i < len(ptypes) else None
+        args.append(_unmarshal_arg(w, pt, h2py, jni))
+    return args
 
 
 class JavaRuntime:
@@ -49,7 +207,7 @@ class JavaRuntime:
         self.eng = eng
         self.jni = jni
         self.vm = DalvikVM()
-        self.bridge = JavaToNativeBridge(eng, jni, emu)
+        self.bridge = JavaToNativeBridge(eng, jni, emu, vm=self.vm)
         self.vm.bridge = self.bridge
         self.vm.runtime = self
         self._h2py = {}   # native Handle -> Python-Referenz
@@ -91,14 +249,20 @@ class JavaRuntime:
 
     # ---- J2: Rueckruf aus nativem Code ------------------------------------
     def has_method(self, cls, name, sig) -> bool:
-        return (cls, name, sig) in self.vm.registry
+        ncls = _norm_jni_cls(cls)
+        return (cls, name, sig) in self.vm.registry or (ncls, name, sig) in self.vm.registry
 
-    def call_from_native(self, cls, name, sig, arg_words, static: bool):
+    def call_from_native(self, cls, name, sig, arg_words, static: bool,
+                         param_types=None, ret_type=None, nonvirtual: bool = False):
         """Von der JNIEnv-Fassade gerufen: marshallt native Argumentworte -> Python, fuehrt die
         Dalvik-Methode aus, marshallt die Rueckgabe zurueck in ein jvalue (int/Handle)."""
-        args = [self._to_py(w) for w in arg_words]
-        ret = self.vm.invoke(cls, name, sig, args)
-        return self._to_jni(ret)
+        ncls = _norm_jni_cls(cls)
+        use_cls = cls if (cls, name, sig) in self.vm.registry else ncls
+        args = _prepare_native_args(sig, arg_words, static, param_types, self._h2py, self.jni)
+        ret = self.vm.invoke(use_cls, name, sig, args)
+        rtype = ret_type if ret_type is not None else sig_ret_type(sig)[0]
+        cpu = getattr(getattr(self, "eng", None), "cpu", None)
+        return _marshal_ret(ret, rtype, self._h2py, self.jni, cpu=cpu)
 
     # Fallback fuer DalvikVM._do_invoke (nicht registrierte Methoden): nichts behandeln.
     def resolve_invoke(self, cls, name, sig, args, static):
@@ -117,22 +281,13 @@ class JavaRuntime:
         return False, 0
 
     # ---- Marshalling -------------------------------------------------------
-    def _to_py(self, word):
-        if word in self._h2py:
-            return self._h2py[word]
-        return int(word) & _M64
+    def _to_py(self, word, ptype=None):
+        return _unmarshal_arg(word, ptype, self._h2py, self.jni)
 
-    def _to_jni(self, val):
-        if val is None:
-            return 0
-        if isinstance(val, int):
-            return val & _M64
-        # Referenz -> neues Handle ueber die Fassade, in der Tabelle hinterlegen
-        kind = "jstring" if isinstance(val, JString) else ("jobject" if isinstance(val, JObject) else "jarray")
-        kw = {"text": val.text} if isinstance(val, JString) else ({"cls": val.cls} if isinstance(val, JObject) else {})
-        h = int(self.jni._new_handle(kind, **kw)) & _M64
-        self._h2py[h] = val
-        return h
+    def _to_jni(self, val, ret_type=None, cpu=None):
+        if cpu is None:
+            cpu = getattr(getattr(self, "eng", None), "cpu", None)
+        return _marshal_ret(val, ret_type, self._h2py, self.jni, cpu=cpu)
 
 
 class VmBackedJavaRuntime:
@@ -150,42 +305,33 @@ class VmBackedJavaRuntime:
 
     # ---- J2: native -> Java ------------------------------------------------
     def has_method(self, cls, name, sig) -> bool:
-        if (cls, name, sig) in self.vm.registry:
+        ncls = _norm_jni_cls(cls)
+        if (cls, name, sig) in self.vm.registry or (ncls, name, sig) in self.vm.registry:
             return True
         prov = getattr(self.vm, "class_provider", None)
         if prov is not None:                       # lazy: Klasse (inkl. Methoden) nachladen
-            try:
-                for md in (prov.get_class(cls) or []):
-                    self.vm.registry.setdefault((md.cls, md.name, md.sig), md)
-            except Exception:
-                pass
-        return (cls, name, sig) in self.vm.registry
+            for cand in ((ncls, cls) if ncls != cls else (cls,)):
+                try:
+                    for md in (prov.get_class(cand) or []):
+                        self.vm.registry.setdefault((md.cls, md.name, md.sig), md)
+                except Exception:
+                    pass
+        return (cls, name, sig) in self.vm.registry or (ncls, name, sig) in self.vm.registry
 
-    def call_from_native(self, cls, name, sig, arg_words, static: bool):
+    def call_from_native(self, cls, name, sig, arg_words, static: bool,
+                         param_types=None, ret_type=None, nonvirtual: bool = False):
         """Native Argumentworte -> Python marshallen, Dalvik-Methode auf der laufenden VM ausfuehren,
         Rueckgabe zurueck in ein jvalue (int/Handle) marshallen."""
-        args = [self._to_py(w) for w in arg_words]
-        ret = self.vm.invoke(cls, name, sig, args)
-        return self._to_jni(ret)
+        ncls = _norm_jni_cls(cls)
+        use_cls = cls if (cls, name, sig) in self.vm.registry else ncls
+        args = _prepare_native_args(sig, arg_words, static, param_types, self._h2py, self.jni)
+        ret = self.vm.invoke(use_cls, name, sig, args)
+        rtype = ret_type if ret_type is not None else sig_ret_type(sig)[0]
+        return _marshal_ret(ret, rtype, self._h2py, self.jni)
 
     # ---- Marshalling -------------------------------------------------------
-    def _to_py(self, word):
-        if word in self._h2py:
-            return self._h2py[word]
-        return int(word) & _M64
+    def _to_py(self, word, ptype=None):
+        return _unmarshal_arg(word, ptype, self._h2py, self.jni)
 
-    def _to_jni(self, val):
-        if val is None:
-            return 0
-        if isinstance(val, int):
-            return val & _M64
-        kind = ("jstring" if isinstance(val, JString)
-                else ("jobject" if isinstance(val, JObject) else "jarray"))
-        kw = ({"text": val.text} if isinstance(val, JString)
-              else ({"cls": val.cls} if isinstance(val, JObject) else {}))
-        try:
-            h = int(self.jni._new_handle(kind, **kw)) & _M64
-        except Exception:
-            return 0
-        self._h2py[h] = val
-        return h
+    def _to_jni(self, val, ret_type=None, cpu=None):
+        return _marshal_ret(val, ret_type, self._h2py, self.jni, cpu=cpu)

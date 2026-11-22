@@ -1111,14 +1111,20 @@ class LinuxArm64SyscallHandler(iface.SyscallHandler):
 
     # ---- Zeit --------------------------------------------------------------
     def _clock_gettime(self, cpu, mem, env):
-        ns = int(env.clock_ns()) if env is not None else 0
+        clk_id = int(cpu.x[0]) & 0xFFFFFFFF
+        rt_fn = getattr(env, "_realtime_ns_fn", None) if env is not None else None
+        if clk_id in (0, 5) and callable(rt_fn):   # CLOCK_REALTIME (0), CLOCK_REALTIME_COARSE (5)
+            ns = int(rt_fn())
+        else:
+            ns = int(env.clock_ns()) if env is not None else 0
         ts = int(cpu.x[1]) & _M64
         self._wr_u64(cpu, ts, ns // 1_000_000_000)      # tv_sec
         self._wr_u64(cpu, ts + 8, ns % 1_000_000_000)   # tv_nsec
         cpu.x[0] = 0
 
     def _gettimeofday(self, cpu, mem, env):
-        ns = int(env.clock_ns()) if env is not None else 0
+        rt_fn = getattr(env, "_realtime_ns_fn", None) if env is not None else None
+        ns = int(rt_fn()) if callable(rt_fn) else (int(env.clock_ns()) if env is not None else 0)
         tv = int(cpu.x[0]) & _M64
         self._wr_u64(cpu, tv, ns // 1_000_000_000)              # tv_sec
         self._wr_u64(cpu, tv + 8, (ns // 1000) % 1_000_000)     # tv_usec

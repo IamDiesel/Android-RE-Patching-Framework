@@ -152,13 +152,32 @@ def analyze_flutter_libapp_deep(so_path_or_bytes: Any, max_bytes: int = 16 * 102
 
     gql_queries: List[str] = []
     seen_gql = set()
-    for m in re.finditer(rb"\b(?:query|mutation|subscription)\s+([A-Za-z0-9_]{3,48})\b", blob):
-        qn = m.group(0).decode("ascii", "ignore")
+    for m in re.finditer(rb"\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]{2,47})(\s*[({])?", blob):
+        kind_b, op_b, tail_b = m.group(1), m.group(2), m.group(3)
+        op_name = op_b.decode("ascii", "ignore")
+        if not op_name:
+            continue
+        is_ident = (
+            op_name[0].isupper()
+            or any(ch.isupper() or ch == "_" for ch in op_name[1:])
+            or bool(tail_b)
+        )
+        if not is_ident:
+            continue
+        qn = f"{kind_b.decode('ascii', 'ignore')} {op_name}"
         if qn not in seen_gql:
             seen_gql.add(qn)
             gql_queries.append(qn)
-            if len(gql_queries) >= 32:
+            if len(gql_queries) >= 48:
                 break
+    if len(gql_queries) < 48:
+        for m in re.finditer(rb"\b(Query|Mutation|Subscription)\$([A-Za-z_][A-Za-z0-9_]{2,48})\b", blob):
+            qn = f"{m.group(1).decode('ascii', 'ignore').lower()} {m.group(2).decode('ascii', 'ignore')}"
+            if qn not in seen_gql:
+                seen_gql.add(qn)
+                gql_queries.append(qn)
+                if len(gql_queries) >= 48:
+                    break
 
     rest_endpoints: List[str] = []
     seen_ep = set()

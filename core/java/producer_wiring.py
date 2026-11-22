@@ -17,9 +17,12 @@ def ensure_default_producers(reg):
     from core.java.rn_hermes_bridge import rn_hermes_producer, hermes_host_available
 
     # Eindeutige Einzel-Keys (kein Ueberschreiben)
+    from core.java.hybrid_web_producer import hybrid_web_producer
+
     reg.register("compose", canvas_producer)
     reg.register("jetpack compose", canvas_producer)
     reg.register("flutter", skia_producer)
+    reg.register("hybrid web", hybrid_web_producer)
     reg.register("rn-s3a", rn_s3a_producer)
     reg.register("rn-js", rn_js_producer)
     reg.register("rn-hermes", rn_hermes_producer)

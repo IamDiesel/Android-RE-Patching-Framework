@@ -6,6 +6,235 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from core.java.objects import JObject
 
+try:
+    from core.java.dalvik import DalvikUnknownOpcode, DebugStop, VmBudgetExceeded
+    _VM_STOP_EXCS = (VmBudgetExceeded, DalvikUnknownOpcode, DebugStop)
+except Exception:
+    _VM_STOP_EXCS = ()
+
+
+def _c_pack(max_w: int, max_h: int) -> int:
+    w = max(0, min(0x7FFFFFFF, int(max_w)))
+    h = max(0, min(0x7FFFFFFF, int(max_h)))
+    return ((w & 0xFFFFFFFF) << 32) | (h & 0xFFFFFFFF)
+
+
+def _c_unpack(val: Any, tree: Any) -> Tuple[int, int]:
+    def_w = int(getattr(tree, "width", 420) or 420)
+    def_h = int(getattr(tree, "height", 760) or 760)
+    if isinstance(val, JObject):
+        val = val.fields.get("v", 0)
+    try:
+        u64 = int(val or 0) & 0xFFFFFFFFFFFFFFFF
+    except Exception:
+        return def_w, def_h
+    if u64 == 0:
+        return def_w, def_h
+    w = (u64 >> 32) & 0xFFFFFFFF
+    h = u64 & 0xFFFFFFFF
+    return (w if 0 < w < 0x100000 else def_w), (h if 0 < h < 0x100000 else def_h)
+
+
+def _ltr_enum(vm: Any) -> JObject:
+    try:
+        v = vm._sget("Landroidx/compose/ui/unit/LayoutDirection;", "Ltr")
+        if isinstance(v, JObject):
+            return v
+    except Exception:
+        pass
+    return JObject("Landroidx/compose/ui/unit/LayoutDirection;", {"__ename": "Ltr", "__ordinal": 0})
+
+
+def _handle_subcompose_and_constraints(
+    cls: str,
+    rcls: str,
+    name: str,
+    sig: str,
+    args: tuple,
+    static: bool,
+    vm: Any,
+    state: Dict[str, Any],
+    tree: Any,
+    helpers: Dict[str, Callable[..., Any]],
+) -> Tuple[bool, Any]:
+    """Behandelt Constraints, SubcomposeLayout, BoxWithConstraints, Measurable, Placeable und MeasureScope."""
+    ViewNode = helpers["ViewNode"]
+    _args_by_type = helpers["_args_by_type"]
+    _f32_num = helpers["_f32_num"]
+    _cur_parent = helpers["_cur_parent"]
+    _apply_mod_layout_props = helpers["_apply_mod_layout_props"]
+    _invoke_fn2 = helpers["_invoke_fn2"]
+    _invoke_fn3 = helpers["_invoke_fn3"]
+    _unwrap_fn = helpers["_unwrap_fn"]
+
+    if cls in ("Landroidx/compose/ui/unit/Constraints;", "Landroidx/compose/ui/unit/ConstraintsKt;"):
+        if name == "<clinit>":
+            return True, None
+        if name == "box-impl":
+            return True, JObject("Landroidx/compose/ui/unit/Constraints;", {"v": int(args[0] or 0) if args else 0})
+        if name == "unbox-impl":
+            if args and isinstance(args[0], JObject):
+                return True, int(args[0].fields.get("v", 0))
+            return True, int(args[0] or 0) if args else 0
+        if name.startswith(("getMinWidth-impl", "getMinHeight-impl")):
+            return True, 0
+        if name.startswith("getMaxWidth-impl"):
+            mw, _ = _c_unpack(args[0] if args else 0, tree)
+            return True, mw
+        if name.startswith("getMaxHeight-impl"):
+            _, mh = _c_unpack(args[0] if args else 0, tree)
+            return True, mh
+        if name.startswith(("getHasBounded", "getHasFixed")):
+            return True, 1
+        if name.startswith("copy"):
+            ow, oh = _c_unpack(args[0] if args else 0, tree)
+            mask = int(args[5] or 0) if (name.endswith("$default") and len(args) > 5) else 0
+            nw = ow if (mask & 2 or len(args) <= 2) else int(args[2] or ow)
+            nh = oh if (mask & 8 or len(args) <= 4) else int(args[4] or oh)
+            if not (0 < nw < 100_000):
+                nw = ow
+            if not (0 < nh < 100_000):
+                nh = oh
+            return True, _c_pack(nw, nh)
+        return True, 0
+
+    if cls in ("Landroidx/compose/ui/layout/SubcomposeLayoutState;", "Landroidx/compose/ui/layout/SubcomposeLayoutState$Companion;"):
+        if name in ("<clinit>", "<init>", "forceRecomposeChildren$ui") or sig.endswith(")V"):
+            return True, None
+        if "Function2" in sig:
+            return True, JObject("Lkotlin/jvm/functions/Function2;")
+        return True, None
+
+    if cls == "Landroidx/compose/ui/layout/SubcomposeLayoutKt;" and name.startswith("SubcomposeLayout"):
+        pairs = _args_by_type(sig, static, args)
+        mod = next((v for pt, v in pairs if "Modifier" in pt and isinstance(v, JObject)), None)
+        fn2 = next((_unwrap_fn(v) for pt, v in pairs if "Function2" in pt and isinstance(v, JObject)), None)
+        sbox = ViewNode(cls="LinearLayout", props={"orientation": "vertical", "compose_kind": "SubcomposeLayout"})
+        _apply_mod_layout_props(sbox, mod)
+        _cur_parent().add(sbox)
+        if isinstance(fn2, JObject):
+            c_raw = _c_pack(getattr(tree, "width", 420) or 420, getattr(tree, "height", 760) or 760)
+            scope = JObject("Landroidx/compose/ui/layout/SubcomposeMeasureScope;", {"$box": sbox})
+            c_obj = JObject("Landroidx/compose/ui/unit/Constraints;", {"v": c_raw})
+            state["stack"].append(sbox)
+            try:
+                for call_args in ((fn2, scope, c_obj), (fn2, scope, c_raw)):
+                    try:
+                        vm.invoke(fn2.cls, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", call_args)
+                        break
+                    except _VM_STOP_EXCS:
+                        raise
+                    except Exception:
+                        continue
+            finally:
+                if state["stack"] and state["stack"][-1] is sbox:
+                    state["stack"].pop()
+        tree.touch()
+        return True, None
+
+    if cls == "Landroidx/compose/foundation/layout/BoxWithConstraintsKt;" and name.startswith("BoxWithConstraints"):
+        pairs = _args_by_type(sig, static, args)
+        mod = next((v for pt, v in pairs if "Modifier" in pt and isinstance(v, JObject)), None)
+        fn3 = next((_unwrap_fn(v) for pt, v in pairs if "Function3" in pt and isinstance(v, JObject)), None)
+        sbox = ViewNode(cls="LinearLayout", props={"orientation": "vertical", "compose_kind": "Box"})
+        _apply_mod_layout_props(sbox, mod)
+        _cur_parent().add(sbox)
+        if isinstance(fn3, JObject):
+            bwc_scope = JObject("Landroidx/compose/foundation/layout/BoxWithConstraintsScopeImpl;", {
+                "$w": float(getattr(tree, "width", 420) or 420),
+                "$h": float(getattr(tree, "height", 760) or 760),
+            })
+            state["stack"].append(sbox)
+            try:
+                _invoke_fn3(fn3, bwc_scope)
+            finally:
+                if state["stack"] and state["stack"][-1] is sbox:
+                    state["stack"].pop()
+        tree.touch()
+        return True, None
+
+    if cls in (
+        "Landroidx/compose/foundation/layout/BoxWithConstraintsScope;",
+        "Landroidx/compose/foundation/layout/BoxWithConstraintsScopeImpl;",
+    ) or (not static and args and isinstance(args[0], JObject) and "$w" in args[0].fields and "$h" in args[0].fields and "BoxWithConstraintsScope" in (args[0].cls or "")):
+        sc = args[0] if args and isinstance(args[0], JObject) else None
+        if name.startswith("getMaxWidth"):
+            return True, float(sc.fields.get("$w", getattr(tree, "width", 420) or 420)) if sc else 420.0
+        if name.startswith("getMaxHeight"):
+            return True, float(sc.fields.get("$h", getattr(tree, "height", 760) or 760)) if sc else 760.0
+        if name.startswith(("getMinWidth", "getMinHeight")):
+            return True, 0.0
+        if name.startswith("getConstraints"):
+            return True, _c_pack(
+                int(sc.fields.get("$w", getattr(tree, "width", 420) or 420)) if sc else 420,
+                int(sc.fields.get("$h", getattr(tree, "height", 760) or 760)) if sc else 760,
+            )
+
+    if cls in (
+        "Landroidx/compose/ui/layout/SubcomposeMeasureScope;",
+        "Landroidx/compose/ui/layout/MeasureScope;",
+        "Landroidx/compose/ui/layout/IntrinsicMeasureScope;",
+    ) or (not static and args and isinstance(args[0], JObject) and "$box" in args[0].fields):
+        recv_s = args[0] if args and isinstance(args[0], JObject) else None
+        if name == "subcompose" and recv_s is not None and "$box" in recv_s.fields:
+            sbox = recv_s.fields["$box"]
+            fn2 = args[2] if len(args) > 2 else None
+            n0 = len(sbox.children)
+            if isinstance(fn2, JObject):
+                state["stack"].append(sbox)
+                try:
+                    _invoke_fn2(fn2)
+                finally:
+                    if state["stack"] and state["stack"][-1] is sbox:
+                        state["stack"].pop()
+            added = sbox.children[n0:]
+            meas = [JObject("Landroidx/compose/ui/layout/Measurable;", {"$view": ch}) for ch in added]
+            return True, JObject("Ljava/util/ArrayList;", {"__items": meas, "$items": list(meas)})
+        if name == "getLayoutDirection":
+            return True, _ltr_enum(vm)
+        if name in ("getDensity", "getFontScale"):
+            return True, 1.0
+        if name.startswith("toPx"):
+            return True, _f32_num(args[1] if len(args) > 1 else 0.0, 0.0)
+        if name.startswith("roundToPx"):
+            return True, int(round(_f32_num(args[1] if len(args) > 1 else 0.0, 0.0)))
+        if name.startswith("layout"):
+            return True, JObject("Landroidx/compose/ui/layout/MeasureResult;")
+
+    if cls in ("Landroidx/compose/ui/layout/Measurable;", "Landroidx/compose/ui/layout/IntrinsicMeasurable;"):
+        if name.startswith("measure") and args and isinstance(args[0], JObject):
+            ch = args[0].fields.get("$view")
+            pw = int((ch.props.get("w") if ch is not None else None) or 56)
+            ph = int((ch.props.get("h") if ch is not None else None) or 56)
+            return True, JObject("Landroidx/compose/ui/layout/Placeable;", {"$w": pw, "$h": ph, "$view": ch})
+        if name == "getParentData":
+            return True, None
+
+    if cls == "Landroidx/compose/ui/layout/Placeable;" or (
+        not static and args and isinstance(args[0], JObject) and (args[0].cls or "") == "Landroidx/compose/ui/layout/Placeable;"
+    ):
+        po = args[0] if args and isinstance(args[0], JObject) else None
+        if name in ("getWidth", "getMeasuredWidth"):
+            return True, int(po.fields.get("$w", 56)) if po is not None else 56
+        if name in ("getHeight", "getMeasuredHeight"):
+            return True, int(po.fields.get("$h", 56)) if po is not None else 56
+        if name.startswith("place"):
+            return True, None
+
+    if cls.startswith("Landroidx/compose/ui/layout/Placeable$PlacementScope"):
+        return True, None
+
+    if cls == "Landroidx/compose/ui/layout/MeasureResult;":
+        if name == "getWidth":
+            return True, int(getattr(tree, "width", 420) or 420)
+        if name == "getHeight":
+            return True, int(getattr(tree, "height", 760) or 760)
+        if name == "getAlignmentLines":
+            return True, JObject("Ljava/util/HashMap;", {"map": {}})
+        return True, None
+
+    return False, None
+
 
 def unpack_compose_color(val: Any) -> Tuple[Optional[str], float]:
     """Dekodiert Jetpack-Compose 64-Bit-ULong ``Color`` oder 32-Bit ARGB-Int zu ``(#rrggbb, alpha)``."""
@@ -51,10 +280,22 @@ def apply_compose_mod_props(vn: Any, mod_obj: Any) -> None:
         vn.props["layout_weight"] = f["$weight"]
     if f.get("$fill_max_h"):
         vn.props["$fill_max_h"] = True
+    if f.get("$fill_max_w"):
+        vn.props["$fill_max_w"] = True
+    if "$box_align" in f:
+        vn.props["$box_align"] = f["$box_align"]
     if "$h" in f:
         vn.props["h"] = f["$h"]
     if "$w" in f:
         vn.props["w"] = f["$w"]
+    if "$aspect_ratio" in f:
+        vn.props["$aspect_ratio"] = float(f["$aspect_ratio"])
+        vn.props["$cl_ratio"] = str(f["$aspect_ratio"])
+        if "$h" not in f:
+            vn.props.pop("h", None)
+    for pk in ("$pad_l", "$pad_t", "$pad_r", "$pad_b"):
+        if pk in f:
+            vn.props[pk] = int(f[pk])
     if "$pad_x" in f:
         vn.props["$pad_x"] = int(f["$pad_x"])
     if "$pad_y" in f:
@@ -137,6 +378,13 @@ def handle_compose_grundset(
             rad = f_vals[0] if f_vals else (float(i_vals[0]) if i_vals else 12.0)
             return True, JObject("Landroidx/compose/foundation/shape/RoundedCornerShape;", {"$radius": max(0.0, rad)})
 
+    # 1b) SubcomposeLayout, BoxWithConstraints, Constraints, Measurable, Placeable
+    sc_ok, sc_val = _handle_subcompose_and_constraints(
+        cls, rcls, name, sig, args, static, vm, state, tree, helpers
+    )
+    if sc_ok:
+        return True, sc_val
+
     # 2) Extended Modifiers (PaddingKt, BackgroundKt, BorderKt, ClipKt, ShadowKt, AlphaKt, ScrollKt)
     if cls in (
         "Landroidx/compose/foundation/layout/PaddingKt;",
@@ -168,18 +416,34 @@ def handle_compose_grundset(
         f_vals = [_f32_num(v, 0.0) for pt, v in pairs if pt == "F"]
 
         if cls == "Landroidx/compose/foundation/layout/PaddingKt;" and m_base == "padding":
+            pl = int(fields.get("$pad_l", fields.get("$pad_x", 0)) or 0)
+            pt_v = int(fields.get("$pad_t", fields.get("$pad_y", 0)) or 0)
+            pr = int(fields.get("$pad_r", fields.get("$pad_x", 0)) or 0)
+            pb = int(fields.get("$pad_b", fields.get("$pad_y", 0)) or 0)
             if len(f_vals) >= 4:
-                px = int(round(max(f_vals[0], f_vals[2])))
-                py = int(round(max(f_vals[1], f_vals[3])))
-                fields["$pad_x"] = max(0, min(64, px))
-                fields["$pad_y"] = max(0, min(64, py))
+                pl = max(0, min(180, pl + max(0, int(round(f_vals[0])))))
+                pt_v = max(0, min(180, pt_v + max(0, int(round(f_vals[1])))))
+                pr = max(0, min(180, pr + max(0, int(round(f_vals[2])))))
+                pb = max(0, min(180, pb + max(0, int(round(f_vals[3])))))
             elif len(f_vals) >= 2:
-                fields["$pad_x"] = max(0, min(64, int(round(f_vals[0]))))
-                fields["$pad_y"] = max(0, min(64, int(round(f_vals[1]))))
+                dx = max(0, int(round(f_vals[0])))
+                dy = max(0, int(round(f_vals[1])))
+                pl = max(0, min(180, pl + dx))
+                pr = max(0, min(180, pr + dx))
+                pt_v = max(0, min(180, pt_v + dy))
+                pb = max(0, min(180, pb + dy))
             elif len(f_vals) == 1:
-                pv = max(0, min(64, int(round(f_vals[0]))))
-                fields["$pad_x"] = pv
-                fields["$pad_y"] = pv
+                pv = max(0, int(round(f_vals[0])))
+                pl = max(0, min(180, pl + pv))
+                pr = max(0, min(180, pr + pv))
+                pt_v = max(0, min(180, pt_v + pv))
+                pb = max(0, min(180, pb + pv))
+            fields["$pad_l"] = pl
+            fields["$pad_t"] = pt_v
+            fields["$pad_r"] = pr
+            fields["$pad_b"] = pb
+            fields["$pad_x"] = (pl + pr) // 2
+            fields["$pad_y"] = (pt_v + pb) // 2
             return True, JObject("Landroidx/compose/ui/Modifier;", fields)
 
         if cls == "Landroidx/compose/foundation/BackgroundKt;" and m_base == "background":
@@ -231,7 +495,9 @@ def handle_compose_grundset(
         flow_obj = args[0] if args else None
         cur_val = None
         if isinstance(flow_obj, JObject):
-            if "$state_val" in flow_obj.fields:
+            if "$val" in flow_obj.fields:
+                cur_val = flow_obj.fields.get("$val")
+            elif "$state_val" in flow_obj.fields:
                 cur_val = flow_obj.fields.get("$state_val")
             elif "$last" in flow_obj.fields:
                 cur_val = flow_obj.fields.get("$last")
@@ -244,7 +510,7 @@ def handle_compose_grundset(
                     cur_val = flow_obj.fields.get("value")
         if cur_val is None and len(args) > 1 and not (isinstance(args[1], JObject) and "Lifecycle" in (args[1].cls or "")):
             cur_val = args[1]
-        return True, JObject("Landroidx/compose/runtime/MutableState;", {"$state_val": cur_val, "$source_flow": flow_obj})
+        return True, JObject("Landroidx/compose/runtime/MutableState;", {"$val": cur_val, "$state_val": cur_val, "$source_flow": flow_obj})
 
     # 4) Compose Widgets: Spacer, Divider, LazyVerticalGrid, HorizontalPager, ModalBottomSheet, Chip, Slider, RadioButton
     m_base = name.split("-")[0].split("$")[0]

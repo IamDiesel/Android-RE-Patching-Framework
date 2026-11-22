@@ -161,6 +161,7 @@ class DebuggerTab(ttk.Frame):
         ttk.Label(det_hdr, text="Request / Response Details:").pack(side="left", anchor="w")
         to_mock_btn = ttk.Button(det_hdr, text="Auswahl → Mock-Felder")
         to_mock_btn.pack(side="right", padx=2)
+        self._add_tooltip(to_mock_btn, "Übernimmt Methode, URL, Code und Body des gewählten Netz-Eintrags in die Mock-Felder unten.")
 
         det_frame = ttk.Frame(right_f)
         det_frame.pack(side="top", fill="both", expand=True)
@@ -347,8 +348,12 @@ class DebuggerTab(ttk.Frame):
             c.clear_net_mocks(); _refresh_mocks()
 
         mb = ttk.Frame(bot_pane); mb.pack(side="top", fill="x")
-        ttk.Button(mb, text="Mock +", command=_add_mock).pack(side="left", padx=2)
-        ttk.Button(mb, text="Mocks leeren", command=_clear_mocks).pack(side="left", padx=2)
+        b_madd = ttk.Button(mb, text="Mock +", command=_add_mock)
+        b_madd.pack(side="left", padx=2)
+        self._add_tooltip(b_madd, "Speichert eine neue Mock/Replay-Regel für passende URL-Treffer.")
+        b_mclr = ttk.Button(mb, text="Mocks leeren", command=_clear_mocks)
+        b_mclr.pack(side="left", padx=2)
+        self._add_tooltip(b_mclr, "Entfernt alle aktiven Mock/Replay-Regeln.")
         # AP1.5/6C: Netz-Modus + Konditionen (Online | Gedrosselt | Offline | Timeout)
         ttk.Label(mb, text="Modus:").pack(side="left", padx=(8, 1))
         _cur_nm = getattr(c, "net_mode", "mock")
@@ -358,21 +363,26 @@ class DebuggerTab(ttk.Frame):
                           values=("Mock/Replay", "DB-Replay", "Live-HTTP"))
         cb.pack(side="left")
         nmv.trace_add("write", lambda *_: c.set_net_mode(nmv.get()))
+        self._add_tooltip(cb, "Schaltet sofort live um zwischen Mock/Replay, DB-Replay und echten Live-HTTP-Anfragen.")
 
         nc_bar = ttk.Frame(bot_pane); nc_bar.pack(side="top", fill="x", pady=(2, 2))
         ttk.Label(nc_bar, text="Leitung:").pack(side="left")
         _nc0 = getattr(c, "net_condition", None)
         ncv = tk.StringVar(value=getattr(_nc0, "mode", "online") if _nc0 else "online")
-        ttk.Combobox(nc_bar, textvariable=ncv, width=10, state="readonly",
-                     values=("online", "throttled", "offline", "timeout")).pack(side="left", padx=(2, 6))
+        cb_nc = ttk.Combobox(nc_bar, textvariable=ncv, width=10, state="readonly",
+                             values=("online", "throttled", "offline", "timeout"))
+        cb_nc.pack(side="left", padx=(2, 6))
+        self._add_tooltip(cb_nc, "Netzwerkleitung simulieren: online, throttled (gedrosselt), offline oder timeout.")
         ttk.Label(nc_bar, text="Latenz(ms):").pack(side="left")
         latv = tk.StringVar(value=str(getattr(_nc0, "latency_ms", 0) if _nc0 else 0))
         ttk.Entry(nc_bar, textvariable=latv, width=5).pack(side="left", padx=(1, 6))
         ttk.Label(nc_bar, text="kbit/s:").pack(side="left")
         kbv = tk.StringVar(value=str(getattr(_nc0, "kbps", 0) if _nc0 else 0))
         ttk.Entry(nc_bar, textvariable=kbv, width=6).pack(side="left", padx=(1, 6))
-        ttk.Button(nc_bar, text="Setzen",
-                   command=lambda: c.set_net_condition(ncv.get(), latv.get(), kbv.get())).pack(side="left", padx=2)
+        b_nc_set = ttk.Button(nc_bar, text="Setzen",
+                              command=lambda: c.set_net_condition(ncv.get(), latv.get(), kbv.get()))
+        b_nc_set.pack(side="left", padx=2)
+        self._add_tooltip(b_nc_set, "Übernimmt Leitung, Latenz und Bandbreite für Java- & Native-Netzwerkaufrufe.")
 
         def _clear_net_trace():
             lb.delete(0, "end")
@@ -448,13 +458,18 @@ class DebuggerTab(ttk.Frame):
                 fn()
 
         br = ttk.Frame(f); br.pack(side="top", fill="x")
-        ttk.Button(br, text="Aktualisieren", command=lambda: (_fill(), _refresh_mocks())).pack(side="left", padx=2)
-        ttk.Button(br, text="Leeren", command=_clear_net_trace).pack(side="left", padx=2)
-        ttk.Button(br, text="\U0001f4be Log speichern", command=_save_net_log).pack(side="left", padx=2)
-        ttk.Button(br, text="\U0001f4c2 Log/Replay laden", command=_load_net_log).pack(side="left", padx=2)
-        ttk.Button(br, text="\u21c4 Aus API-Inspector", command=_import_api_inspector).pack(side="left", padx=2)
-        ttk.Button(br, text="\U0001f50d Engine-APIs…", command=_open_flutter_extract).pack(side="left", padx=2)
-        ttk.Button(br, text="\U0001f310 Browser & Inspect", command=_open_browser_inspect).pack(side="left", padx=2)
+        for _blbl, _bcmd, _btip in (
+            ("Aktualisieren", lambda: (_fill(), _refresh_mocks()), "Lädt die aufgezeichneten Java-/Native-Netzrequests und Mock-Regeln neu."),
+            ("Leeren", _clear_net_trace, "Leert die aktuelle Netz-Anzeige und das Session-NetLog."),
+            ("\U0001f4be Log speichern", _save_net_log, "Speichert alle aufgezeichneten Netz-Requests als JSON-Datei."),
+            ("\U0001f4c2 Log/Replay laden", _load_net_log, "Lädt ein JSON- oder SQLite-API-Log als Mock/Replay-Antworten."),
+            ("\u21c4 Aus API-Inspector", _import_api_inspector, "Importiert gesammelte Endpunkte aus dem API-Inspector als Mock/Replay-Regeln."),
+            ("\U0001f50d Engine-APIs…", _open_flutter_extract, "Scannt statisch Flutter-, Cognito-, GraphQL- & Engine-APIs ohne Engine-Boot."),
+            ("\U0001f310 Browser & Inspect", _open_browser_inspect, "Öffnet den eingebauten In-Phone-Browser und Web-Inspektor."),
+        ):
+            _nb = ttk.Button(br, text=_blbl, command=_bcmd)
+            _nb.pack(side="left", padx=2)
+            self._add_tooltip(_nb, _btip)
         _fill(); _refresh_mocks()
         return f
 
@@ -636,60 +651,21 @@ class DebuggerTab(ttk.Frame):
         return f
 
     def _add_tooltip(self, widget, text):
-        """Hover-Tooltip fuer selbsterklaerende Debugger-Elemente."""
-        state = {"win": None, "job": None}
-
-        def _hide(_e=None):
-            if state["job"] is not None:
-                try:
-                    widget.after_cancel(state["job"])
-                except Exception:
-                    pass
-                state["job"] = None
-            w = state["win"]
-            state["win"] = None
-            if w is not None:
-                try:
-                    w.destroy()
-                except Exception:
-                    pass
-
-        def _show():
-            state["job"] = None
-            try:
-                if not widget.winfo_exists():
-                    return
-                tw = tk.Toplevel(widget)
-                tw.wm_overrideredirect(True)
-                tw.attributes("-topmost", True)
-                x = widget.winfo_rootx() + 8
-                y = widget.winfo_rooty() + widget.winfo_height() + 4
-                tw.wm_geometry("+%d+%d" % (x, y))
-                lbl = tk.Label(
-                    tw, text=text, justify="left", wraplength=380,
-                    background="#1e293b", foreground="#f8fafc",
-                    relief="solid", borderwidth=1, padx=8, pady=5,
-                    font=("Segoe UI", 8),
-                )
-                lbl.pack()
-                state["win"] = tw
-            except Exception:
-                pass
-
-        def _enter(_e=None):
-            _hide()
-            try:
-                state["job"] = widget.after(350, _show)
-            except Exception:
-                pass
-
-        widget.bind("<Enter>", _enter, add="+")
-        widget.bind("<Leave>", _hide, add="+")
-        widget.bind("<ButtonPress>", _hide, add="+")
-        widget.bind("<Destroy>", _hide, add="+")
+        """Einheitlicher Hover-Tooltip fuer selbsterklaerende Debugger-Elemente."""
+        try:
+            from ui.widgets.tooltip import add_tooltip
+            add_tooltip(widget, text)
+        except Exception:
+            pass
 
     def _show_debugger_help_dialog(self):
-        """Erklaert Modus, Seams, Schritt-Budget und Optionen uebersichtlich auf Deutsch."""
+        """Delegiert an die uebergreifende TopBar-Studio-Hilfe (mit lokalem Fallback)."""
+        fn = getattr(self.app, "show_studio_help_dialog", None)
+        if callable(fn):
+            try:
+                return fn()
+            except Exception:
+                pass
         win = tk.Toplevel(self.winfo_toplevel())
         win.title("Debugger-Hilfe: Modus, Seams, Budget & Optionen")
         win.geometry("680x540")
@@ -754,15 +730,13 @@ class DebuggerTab(ttk.Frame):
         lbl_mode = ttk.Label(r1, text="Modus:")
         lbl_mode.pack(side="left", padx=(2, 1))
         mode_init = ("Gläsern+ARM64" if getattr(c, "native_fusion", False) else "Gläsern App")
-        mode_v = tk.StringVar(value=mode_init)
-        self._mode_var = mode_v
+        if getattr(self, "_mode_var", None) is None:
+            self._mode_var = tk.StringVar(value=mode_init)
+            self._mode_var.trace_add("write", lambda *_: setattr(c, "native_fusion", self._mode_var.get() == "Gläsern+ARM64"))
+        mode_v = self._mode_var
         cb_mode = ttk.Combobox(r1, textvariable=mode_v, width=14, state="readonly",
                                values=("Einzelmethode", "Gläsern App", "Gläsern+ARM64"))
         cb_mode.pack(side="left", padx=2)
-        def _on_mode(*_):
-            m = mode_v.get()
-            c.native_fusion = (m == "Gläsern+ARM64")
-        mode_v.trace_add("write", _on_mode)
         self._add_tooltip(
             cb_mode,
             "Ausführungsmodus:\n"
@@ -778,13 +752,15 @@ class DebuggerTab(ttk.Frame):
             "noop_native": "noop_native (Nur Java)",
         }
         sc_init = getattr(getattr(c, "seam_config", None), "unpack_mode", "self_cache")
-        seam_v = tk.StringVar(value=_sc_map.get(sc_init, sc_init))
+        if getattr(self, "_seam_var", None) is None:
+            self._seam_var = tk.StringVar(value=_sc_map.get(sc_init, sc_init))
+            self._seam_var.trace_add("write", lambda *_: c.set_seam_profile((self._seam_var.get() or "self_cache").split()[0]))
+        seam_v = self._seam_var
         seam_cb = ttk.Combobox(
             r1, textvariable=seam_v, width=21, state="readonly",
             values=("self_cache (Auto-Cache)", "faithful (100% Echt)", "noop_native (Nur Java)"),
         )
         seam_cb.pack(side="left", padx=2)
-        seam_v.trace_add("write", lambda *_: c.set_seam_profile((seam_v.get() or "self_cache").split()[0]))
         self._add_tooltip(
             seam_cb,
             "Nahtstellen-Profil (Java ↔ Nativ):\n"
@@ -794,7 +770,13 @@ class DebuggerTab(ttk.Frame):
         )
 
         ttk.Label(r1, text="Budget:").pack(side="left", padx=(6, 1))
-        self.v_step_budget = tk.StringVar(value="2M")
+        if getattr(self, "v_step_budget", None) is None:
+            init_b = getattr(c, "_budget_override", None) or "2M"
+            self.v_step_budget = tk.StringVar(value=init_b)
+            self.v_step_budget.trace_add(
+                "write",
+                lambda *_: c.on_budget_changed() if hasattr(c, "on_budget_changed") else None,
+            )
         cb_budget = ttk.Combobox(
             r1, textvariable=self.v_step_budget, width=6, state="readonly",
             values=("50k", "200k", "500k", "2M", "10M", "\u221e"),
@@ -830,10 +812,31 @@ class DebuggerTab(ttk.Frame):
             r1, text="\U0001f504 Neu",
             command=lambda: c.start() if mode_v.get() == "Einzelmethode" else c.start_app())
         btn_restart.pack(side="left", padx=1)
+        btn_reset_appdata = ttk.Button(
+            r1, text="\U0001f9f9 Reset",
+            command=lambda: c.clear_active_appdata(
+                restart=True, single_method=(mode_v.get() == "Einzelmethode")
+            ),
+        )
+        btn_reset_appdata.pack(side="left", padx=1)
+        if getattr(self, "v_persist_session", None) is None:
+            self.v_persist_session = tk.BooleanVar(value=bool(getattr(c, "persist_session", False)))
+        chk_persist = ttk.Checkbutton(
+            r1, text="\U0001f4be Session", variable=self.v_persist_session,
+            command=lambda: c.set_persist_session(bool(self.v_persist_session.get())),
+        )
+        chk_persist.pack(side="left", padx=(3, 2))
         self._add_tooltip(btn_start, "Startet den App-Lauf, setzt ab der Pause fort oder aktualisiert im Event-Loop die UI.")
         self._add_tooltip(btn_pause, "Hält an der nächsten Instruktion an (Call-Stack & Register bleiben sichtbar).")
         self._add_tooltip(btn_stop, "Bricht den aktuellen Lauf ab.")
-        self._add_tooltip(btn_restart, "Startet die App bzw. Einzelmethode komplett neu ab Schritt 0.")
+        self._add_tooltip(btn_restart, "Startet ab Schritt 0 neu (bei '💾 Session' AUS komplett clean; bei '💾 Session' AN bleibt der gespeicherte Login erhalten).")
+        self._add_tooltip(btn_reset_appdata, "Löscht gespeicherte App-Daten (SharedPreferences, SQLite, KeyStore) dieser Instanz und startet frisch ab Login (Logout / Erststart).")
+        self._add_tooltip(
+            chk_persist,
+            "Session dauerhaft speichern (Opt-In):\n"
+            "• AUS (Standard): Temporärer Lauf im RAM — nach ⏹ Stop oder Beenden startet die App wieder komplett clean (frischer Login).\n"
+            "• AN: Speichert Login, SharedPreferences, SQLite & KeyStore über Neustarts hinweg.",
+        )
 
         for label, cb, tip in (
             ("In", c.step, "Step Into: 1 Dalvik-Instruktion (auch in Submethoden)."),
@@ -848,6 +851,12 @@ class DebuggerTab(ttk.Frame):
         opt_mb = ttk.Menubutton(r1, text="\u2699 Optionen \u25be")
         opt_menu = tk.Menu(opt_mb, tearoff=0)
         opt_mb.configure(menu=opt_menu)
+        opt_menu.add_checkbutton(
+            label="\U0001f4be App-Session dauerhaft speichern",
+            variable=self.v_persist_session,
+            command=lambda: c.set_persist_session(bool(self.v_persist_session.get())),
+        )
+        opt_menu.add_separator()
         sv = tk.BooleanVar(value=c.entry_stop)
         tv = tk.BooleanVar(value=getattr(c, "tolerant", True))
         ov_sm = tk.BooleanVar(value=getattr(c, "overlay_smali", True))
@@ -881,37 +890,46 @@ class DebuggerTab(ttk.Frame):
         opt_menu.add_checkbutton(label="Flight-Recorder (JSONL-Mitschnitt)", variable=flv,
                                  command=lambda: c.set_flight_recorder(bool(flv.get())))
         opt_mb.pack(side="left", padx=3)
-        self._add_tooltip(opt_mb, "Ausführungs-, Trace- & Patch-Optionen (siehe ❓ Hilfe für Details).")
+        self._add_tooltip(opt_mb, "Ausführungs-, Trace- & Patch-Optionen (siehe '❓ Hilfe' oben in der TopBar für Details).")
         opt_menu.add_separator()
         opt_menu.add_command(
             label="🔍 Statische Flutter/Engine-APIs extrahieren…",
             command=self.open_flutter_api_extractor,
         )
 
-        btn_help = ttk.Button(r1, text="\u2753 Hilfe", command=self._show_debugger_help_dialog)
-        btn_help.pack(side="left", padx=1)
-        self._add_tooltip(btn_help, "Zeigt ausführliche Erklärungen zu Modus, Seams, Budget & Optionen.")
-
         btn_befund = ttk.Button(r1, text="\U0001f4f8 Befund", command=c.generate_befund_report)
         btn_befund.pack(side="left", padx=2)
         self._add_tooltip(btn_befund, "Erstellt einen Markdown-Befundbericht inkl. Stack, Netz & OS-State.")
 
         # Zeile 2: Schrittzähler-Badge + Einzelmethode / args / Time-Travel Goto
-        self.lbl_budget_info = ttk.Label(r2, text="Schritte: 0 / 200k", foreground="#334155")
+        self.lbl_budget_info = ttk.Label(r2, text=f"Schritte: 0 / {self.v_step_budget.get()}", foreground="#334155")
         self.lbl_budget_info.pack(side="left", padx=(2, 10))
         ttk.Label(r2, text="Methode:").pack(side="left", padx=(2, 1))
-        mv = tk.StringVar(value=c.name)
-        ttk.Entry(r2, textvariable=mv, width=18).pack(side="left")
-        mv.trace_add("write", lambda *_: setattr(c, "name", mv.get()))
-        self._methode_var = mv
+        if getattr(self, "_methode_var", None) is None:
+            self._methode_var = tk.StringVar(value=c.name)
+            self._methode_var.trace_add("write", lambda *_: setattr(c, "name", self._methode_var.get()))
+        mv = self._methode_var
+        e_m = ttk.Entry(r2, textvariable=mv, width=18)
+        e_m.pack(side="left")
+        self._add_tooltip(e_m, "Zielmethodenname für den Modus 'Einzelmethode'.")
         ttk.Label(r2, text="args:").pack(side="left", padx=(8, 1))
-        av = tk.StringVar(value=c.args)
-        ttk.Entry(r2, textvariable=av, width=14).pack(side="left")
-        av.trace_add("write", lambda *_: setattr(c, "args", av.get()))
+        if getattr(self, "_args_var", None) is None:
+            self._args_var = tk.StringVar(value=c.args)
+            self._args_var.trace_add("write", lambda *_: setattr(c, "args", self._args_var.get()))
+        av = self._args_var
+        e_a = ttk.Entry(r2, textvariable=av, width=14)
+        e_a.pack(side="left")
+        self._add_tooltip(e_a, "JSON-Argumentliste für den Modus 'Einzelmethode', z. B. [1, \"abc\"].")
         ttk.Label(r2, text="Timeline-Goto:").pack(side="left", padx=(8, 1))
-        gv = tk.StringVar(value="0")
-        ttk.Entry(r2, textvariable=gv, width=6).pack(side="left")
-        ttk.Button(r2, text="Go", command=lambda: c.goto(gv.get())).pack(side="left", padx=2)
+        if getattr(self, "_goto_var", None) is None:
+            self._goto_var = tk.StringVar(value="0")
+        gv = self._goto_var
+        e_g = ttk.Entry(r2, textvariable=gv, width=6)
+        e_g.pack(side="left")
+        self._add_tooltip(e_g, "Ziel-Schrittnummer für deterministisches Time-Travel-Replay.")
+        b_go = ttk.Button(r2, text="Go", command=lambda: c.goto(gv.get()))
+        b_go.pack(side="left", padx=2)
+        self._add_tooltip(b_go, "Springt per deterministischem Replay zur angegebenen Schrittnummer und pausiert dort.")
         return f
 
     def _v_quelle(self, parent):
@@ -919,18 +937,20 @@ class DebuggerTab(ttk.Frame):
         f = ttk.Frame(parent, padding=2)
         r1 = ttk.Frame(f); r1.pack(side="top", fill="x", pady=1)
         ttk.Label(r1, text="Wurzel:").pack(side="left")
-        rv = tk.StringVar(value=c.zone_root)
+        if getattr(self, "_zone_root_var", None) is None:
+            self._zone_root_var = tk.StringVar(value=c.zone_root)
+            self._zone_root_var.trace_add("write", lambda *_: setattr(c, "zone_root", self._zone_root_var.get()))
+        rv = self._zone_root_var
         ttk.Entry(r1, textvariable=rv, width=14).pack(side="left", fill="x", expand=True, padx=2)
-        rv.trace_add("write", lambda *_: setattr(c, "zone_root", rv.get()))
-        self._zone_root_var = rv
         ttk.Label(r1, text="Zone:").pack(side="left", padx=(4, 1))
-        zv = tk.StringVar(value=c.zone)
+        if getattr(self, "_zone_var", None) is None:
+            self._zone_var = tk.StringVar(value=c.zone)
+            self._zone_var.trace_add("write", lambda *_: c.set_source_zone(self._zone_var.get(), log=False))
+        zv = self._zone_var
         cb_zone = ttk.Combobox(r1, textvariable=zv, width=11, values=("original", "live", "destination"),
                                state="readonly")
         cb_zone.pack(side="left")
-        zv.trace_add("write", lambda *_: c.set_source_zone(zv.get(), log=False))
         cb_zone.bind("<<ComboboxSelected>>", lambda _e=None: c.set_source_zone(zv.get(), log=True))
-        self._zone_var = zv
         self._add_tooltip(
             cb_zone,
             "Code-/Lib-Quelle (synchron mit 'Stand:' oben):\n"
@@ -941,30 +961,42 @@ class DebuggerTab(ttk.Frame):
 
         r2 = ttk.Frame(f); r2.pack(side="top", fill="x", pady=1)
         ttk.Label(r2, text="Klasse/Pfad:").pack(side="left")
-        pv = tk.StringVar(value=c.relpath)
+        if getattr(self, "_relpath_var", None) is None:
+            self._relpath_var = tk.StringVar(value=c.relpath)
+            self._relpath_var.trace_add("write", lambda *_: setattr(c, "relpath", self._relpath_var.get()))
+        pv = self._relpath_var
         ttk.Entry(r2, textvariable=pv, width=18).pack(side="left", fill="x", expand=True, padx=2)
-        pv.trace_add("write", lambda *_: setattr(c, "relpath", pv.get()))
-        self._relpath_var = pv
 
         r3 = ttk.Frame(f); r3.pack(side="top", fill="x", pady=2)
-        ttk.Button(r3, text="\U0001f4e5 Aus Studio laden", command=c.studio_load).pack(side="left", padx=(0, 4))
-        ttk.Button(r3, text="\U0001f50d Index-Suche", command=self._open_index_search).pack(side="left", padx=2)
+        b_sl = ttk.Button(r3, text="\U0001f4e5 Aus Studio laden", command=c.studio_load)
+        b_sl.pack(side="left", padx=(0, 4))
+        self._add_tooltip(b_sl, "Lädt die aktuell im Smali Studio geöffnete Datei in diesen Debugger.")
+        b_is = ttk.Button(r3, text="\U0001f50d Index-Suche", command=self._open_index_search)
+        b_is.pack(side="left", padx=2)
+        self._add_tooltip(b_is, "Durchsucht Klassen & Methoden im App-Index zum direkten Laden oder Breakpoint-Setzen.")
 
         r4 = ttk.Frame(f); r4.pack(side="top", fill="x", pady=1)
         ttk.Label(r4, text="App-Entry:").pack(side="left")
-        ev = tk.StringVar(value=c.app_entry)
+        if getattr(self, "_app_entry_var", None) is None:
+            self._app_entry_var = tk.StringVar(value=c.app_entry)
+            self._app_entry_var.trace_add("write", lambda *_: setattr(c, "app_entry", self._app_entry_var.get()))
+        ev = self._app_entry_var
         ttk.Entry(r4, textvariable=ev, width=16).pack(side="left", fill="x", expand=True, padx=2)
-        ev.trace_add("write", lambda *_: setattr(c, "app_entry", ev.get()))
-        self._app_entry_var = ev
-        ttk.Button(r4, text="App-Lifecycle", command=c.lifecycle).pack(side="left", padx=2)
+        b_lc = ttk.Button(r4, text="App-Lifecycle", command=c.lifecycle)
+        b_lc.pack(side="left", padx=2)
+        self._add_tooltip(b_lc, "Führt den kompletten App-Lifecycle direkt aus (alternativ zu ▶ Start/Weiter).")
         return f
 
     def _v_editor(self, parent):
         c = self.ctrl
         f = ttk.Frame(parent)
         eb = ttk.Frame(f); eb.pack(side="top", fill="x")
-        ttk.Button(eb, text="\U0001f527 Im Smali Studio öffnen", command=c.open_in_smali_studio).pack(side="left", padx=2, pady=1)
-        ttk.Button(eb, text="\U0001f4be Als Smali-Patch speichern", command=c.save_as_smali_patch).pack(side="left", padx=2, pady=1)
+        b_oss = ttk.Button(eb, text="\U0001f527 Im Smali Studio öffnen", command=c.open_in_smali_studio)
+        b_oss.pack(side="left", padx=2, pady=1)
+        self._add_tooltip(b_oss, "Öffnet die aktuelle Klasse zum Bearbeiten direkt im Smali Studio.")
+        b_ssp = ttk.Button(eb, text="\U0001f4be Als Smali-Patch speichern", command=c.save_as_smali_patch)
+        b_ssp.pack(side="left", padx=2, pady=1)
+        self._add_tooltip(b_ssp, "Speichert Änderungen aus diesem Editor als aktiven Zero-Build-Smali-Patch.")
         body = ttk.Frame(f); body.pack(side="top", fill="both", expand=True)
         gutter = tk.Canvas(body, width=48, bg="#f0f0f0", highlightthickness=0, takefocus=0)
         gutter.pack(side="left", fill="y")
@@ -1011,8 +1043,12 @@ class DebuggerTab(ttk.Frame):
         c = self.ctrl
         f = ttk.Frame(parent)
         db = ttk.Frame(f); db.pack(side="top", fill="x")
-        ttk.Button(db, text="\U0001f52a In LibCarve öffnen", command=c.open_in_libcarve).pack(side="left", padx=2, pady=1)
-        ttk.Button(db, text="\U0001f4be Als LibCarve-Patch vorbereiten", command=c.prepare_libcarve_patch).pack(side="left", padx=2, pady=1)
+        b_olc = ttk.Button(db, text="\U0001f52a In LibCarve öffnen", command=c.open_in_libcarve)
+        b_olc.pack(side="left", padx=2, pady=1)
+        self._add_tooltip(b_olc, "Übergibt Bibliothek und Zieladresse direkt an das LibCarve Patch Studio.")
+        b_plc = ttk.Button(db, text="\U0001f4be Als LibCarve-Patch vorbereiten", command=c.prepare_libcarve_patch)
+        b_plc.pack(side="left", padx=2, pady=1)
+        self._add_tooltip(b_plc, "Erstellt aus der aktuellen Instruktion eine vorbereitete Binärpatch-Regel.")
         tr = ttk.Treeview(f, columns=("op", "txt"), show="tree headings", height=12)
         tr.heading("#0", text="pc"); tr.column("#0", width=44, stretch=False)
         tr.heading("op", text="op"); tr.column("op", width=96, stretch=False)
@@ -1265,6 +1301,12 @@ class DebuggerTab(ttk.Frame):
                 pass
 
         ttk.Button(bar, text="Aktualisieren", command=_refresh).pack(side="left", padx=4)
+        btn_clear_ad = ttk.Button(
+            bar, text="\U0001f9f9 AppData leeren",
+            command=lambda: (c.clear_active_appdata(restart=False), _refresh()),
+        )
+        btn_clear_ad.pack(side="left", padx=2)
+        self._add_tooltip(btn_clear_ad, "Löscht persistierte SharedPreferences, SQLite-DBs & KeyStore der aktiven Instanz ohne sofortigen Neustart.")
         # Edit-Zeile: Klasse / Feld / Wert -> set_static (live)
         eb = ttk.Frame(f); eb.pack(fill="x", padx=4, pady=(0, 3))
         cls_v = tk.StringVar(value="")

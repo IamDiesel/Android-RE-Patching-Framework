@@ -231,6 +231,7 @@ class ProjectSnapshotService:
             "net_mode": getattr(src, "net_mode", "mock"),
             "net_condition": net_cond_d,
             "native_fusion": bool(getattr(src, "native_fusion", False)),
+            "persist_session": bool(getattr(src, "persist_session", seam.persist_appdata if hasattr(seam, "persist_appdata") else False)),
             "seam_config": seam.to_dict() if hasattr(seam, "to_dict") else SeamConfig().to_dict(),
         }
 
@@ -575,8 +576,159 @@ class ProjectSnapshotService:
             controller.net_mode = dbg_cfg["net_mode"]
         if "seam_config" in dbg_cfg and hasattr(controller, "seam_config"):
             controller.seam_config = SeamConfig.from_dict(dbg_cfg["seam_config"])
+        if "persist_session" in dbg_cfg and hasattr(controller, "persist_session"):
+            controller.persist_session = bool(dbg_cfg["persist_session"])
+            if getattr(controller, "seam_config", None) is not None:
+                eff_ps = controller._should_persist_session() if hasattr(controller, "_should_persist_session") else bool(controller.persist_session)
+                controller.seam_config.persist_appdata = eff_ps
         if patches and hasattr(controller, "smali_patches") and isinstance(controller.smali_patches, dict):
             controller.smali_patches.update(patches)
+
+
+def apply_virtual_clock_spec(stubs: Any, spec: Optional[Dict[str, Any]], eng: Any = None) -> Dict[str, Any]:
+    """Wendet eine Virtuelle-Uhr-Konfiguration (ISO/Epoch/TZ/Freeze/Shift/Reset) konsistent auf Stubs & OS-8 an."""
+    from core.java.virtual_clock import (
+        attach_virtual_clock_to_native_env,
+        get_virtual_clock_state,
+        reset_virtual_clock_to_host,
+        set_virtual_clock,
+        shift_virtual_clock,
+    )
+
+    if stubs is None:
+        return {"ok": False, "hinweis": "stubs ist None"}
+    if isinstance(spec, dict):
+        if spec.get("reset"):
+            tz_rst = spec.get("tz") if "tz" in spec else spec.get("tz_name")
+            reset_virtual_clock_to_host(stubs, tz_name=tz_rst)
+        iso_val = spec.get("iso")
+        if iso_val is None:
+            iso_val = spec.get("iso_str")
+        if iso_val is None:
+            iso_val = spec.get("datetime")
+        tz_val = spec.get("tz") if "tz" in spec else spec.get("tz_name")
+        epoch_val = spec.get("epoch_ms")
+        frozen_val = spec.get("frozen")
+        step_val = spec.get("step_ms")
+        if any(x is not None for x in (epoch_val, iso_val, tz_val, frozen_val, step_val)):
+            set_virtual_clock(
+                stubs,
+                epoch_ms=int(epoch_val) if epoch_val is not None else None,
+                iso_str=str(iso_val) if iso_val is not None else None,
+                tz_name=str(tz_val) if tz_val is not None else None,
+                frozen=frozen_val,
+                step_ms=step_val,
+            )
+        delta_ms = int(spec.get("delta_ms") or 0)
+        s_days = float(spec.get("shift_days") or 0.0)
+        s_hours = float(spec.get("shift_hours") or 0.0)
+        s_mins = float(spec.get("shift_minutes") or 0.0)
+        s_secs = float(spec.get("shift_seconds") or 0.0)
+        if any(x != 0 for x in (delta_ms, s_days, s_hours, s_mins, s_secs)):
+            shift_virtual_clock(
+                stubs,
+                delta_ms=delta_ms,
+                days=s_days,
+                hours=s_hours,
+                minutes=s_mins,
+                seconds=s_secs,
+            )
+    if eng is not None:
+        try:
+            attach_virtual_clock_to_native_env(stubs, eng)
+        except Exception:
+            pass
+    return get_virtual_clock_state(stubs)
+
+
+def extract_app_state_snapshot(stubs: Any, fusion: Optional[Dict[str, Any]] = None, db_query: str = "") -> Dict[str, Any]:
+    """Liest SharedPreferences, SQLite-Tabellen, VFS-AppData-Dateien, WebEvents und Virtuelle Uhr aus Stubs/OS-8."""
+    out: Dict[str, Any] = {
+        "virtual_clock": None,
+        "shared_prefs": {},
+        "sqlite_dbs": {},
+        "web_events": [],
+        "vfs_files": [],
+    }
+    if stubs is None:
+        return out
+    try:
+        from core.java.virtual_clock import get_virtual_clock_state
+        out["virtual_clock"] = get_virtual_clock_state(stubs)
+    except Exception:
+        pass
+    try:
+        from core.java.sqlite_prefs_bridge import _to_py
+    except Exception:
+        _to_py = lambda x: x
+    prefs_store = getattr(stubs, "_prefs_store", None) or {}
+    if isinstance(prefs_store, dict):
+        sp_out: Dict[str, Any] = {}
+        for pname, store in list(prefs_store.items()):
+            if not isinstance(store, dict):
+                continue
+            sp_out[str(pname)] = {str(k): _to_py(v) for k, v in list(store.items())[:100]}
+        out["shared_prefs"] = sp_out
+
+    conns = getattr(stubs, "_sqlite_conns", None) or {}
+    q_raw = str(db_query or "").strip()
+    q_target_db = ""
+    q_sql = q_raw
+    if ":" in q_raw and not q_raw.lower().startswith(("select", "pragma")):
+        q_target_db, q_sql = [p.strip() for p in q_raw.split(":", 1)]
+    if isinstance(conns, dict):
+        dbs_out: Dict[str, Any] = {}
+        for key, conn in list(conns.items()):
+            db_info: Dict[str, Any] = {"tables": {}}
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                tables = [str(r[0]) for r in cur.fetchall() if r and not str(r[0]).startswith("sqlite_")]
+                for tbl in tables[:40]:
+                    try:
+                        q_tbl = '"' + tbl.replace('"', '""') + '"'
+                        rc = cur.execute(f"SELECT COUNT(*) FROM {q_tbl}").fetchone()
+                        db_info["tables"][tbl] = int(rc[0]) if rc else 0
+                    except Exception:
+                        db_info["tables"][tbl] = None
+                if q_sql and (not q_target_db or q_target_db == str(key)):
+                    low_q = q_sql.lower().lstrip()
+                    if low_q.startswith(("select", "pragma")):
+                        cur.execute(q_sql)
+                        cols = [d[0] for d in (cur.description or ())]
+                        rows = cur.fetchmany(100)
+                        db_info["query_rows"] = [
+                            (dict(zip(cols, r)) if cols else list(r)) for r in rows
+                        ]
+            except Exception as e:
+                db_info["error"] = repr(e)
+            dbs_out[str(key)] = db_info
+        out["sqlite_dbs"] = dbs_out
+
+    vt = getattr(stubs, "view_tree", None)
+    if vt is not None and hasattr(vt, "web_events"):
+        try:
+            out["web_events"] = list(getattr(vt, "web_events", ()) or ())[-40:]
+        except Exception:
+            pass
+
+    eng = (fusion or {}).get("eng") if isinstance(fusion, dict) else getattr(stubs, "_vfs_eng", None)
+    if eng is not None:
+        try:
+            from core.java.fs_bridge import get_shared_fs
+            fs = get_shared_fs(eng)
+            files_map = getattr(fs, "files", None) if fs is not None else None
+            if isinstance(files_map, dict):
+                vfs_list = []
+                for fpath, data in sorted(files_map.items()):
+                    if str(fpath).startswith("/data/"):
+                        vfs_list.append({"path": str(fpath), "size": len(data or b"")})
+                        if len(vfs_list) >= 80:
+                            break
+                out["vfs_files"] = vfs_list
+        except Exception:
+            pass
+    return out
 
 
 class GlassAppRunner:
@@ -631,7 +783,17 @@ class GlassAppRunner:
 
     def build(self, *, native_fusion: bool = True, smali_patches: Optional[Dict[str, str]] = None,
               net_mode: str = "mock", net_responder=None, rules_path: Optional[str] = None,
-              api_db=None, extra_so_overlays: Optional[Dict[str, bytes]] = None) -> Dict[str, Any]:
+              api_db=None, extra_so_overlays: Optional[Dict[str, bytes]] = None,
+              virtual_clock: Optional[Dict[str, Any]] = None,
+              net_log=None, net_condition=None,
+              tolerant: bool = True, step_budget: Optional[int] = None,
+              apply_overlays: Optional[bool] = None, overlay_opts: Optional[Dict[str, Any]] = None,
+              app_ctx=None, cfg_dict: Optional[Dict[str, Any]] = None,
+              force_sync_appdata: bool = False,
+              fallback_java_on_fusion_err: bool = False,
+              jni_aps: Optional[List[Dict[str, Any]]] = None,
+              on_load_library=None, on_load_path=None,
+              cancel_check: Optional[Callable[[], bool]] = None) -> Dict[str, Any]:
         from core.java.dalvik import DalvikVM
         from core.java.class_provider import StudioClassProvider
         from core.java.dex_loader import AndroidStubs
@@ -641,29 +803,57 @@ class GlassAppRunner:
         from core.java.asset_bridge import install_asset_stubs, seed_assets_from_dir
         from core.java.debug import JavaDebugger
 
+        if cancel_check and cancel_check():
+            return {"cancelled": True}
+
         vm = DalvikVM()
-        vm.lenient = True
+        vm.lenient = bool(tolerant)
+        if step_budget is not None:
+            vm.step_budget = int(step_budget)
         provider = StudioClassProvider(self.app_root, zone=self.zone)
         if smali_patches and hasattr(provider, "patches"):
             provider.patches.update(smali_patches)
+
+        _want_overlays = (self.zone == "live") if apply_overlays is None else bool(apply_overlays)
         resolved_overlays = None
-        if self.zone == "live":
+        man = None
+        man_pkg = None
+        man_entry = None
+        if self.app_root:
+            try:
+                from core.java.manifest import parse_manifest
+                man = parse_manifest(self.app_root)
+                man_pkg = getattr(man, "package", None)
+                man_entry = (man.entry() or None) if hasattr(man, "entry") else None
+            except Exception:
+                man = None
+
+        if _want_overlays:
             try:
                 from services.workspace_overlay_service import WorkspaceOverlayResolver
-                _tmp_pkg = self.instance_state.package or "default.app"
-                if self.app_root:
-                    try:
-                        from core.java.manifest import parse_manifest
-                        _tmp_pkg = getattr(parse_manifest(self.app_root), "package", "") or _tmp_pkg
-                    except Exception:
-                        pass
-                resolved_overlays = WorkspaceOverlayResolver.collect(self.base_dir, _tmp_pkg, self.app_root)
-                if resolved_overlays.get("smali_patches") and hasattr(provider, "apply_smali_patches"):
-                    provider.apply_smali_patches(resolved_overlays["smali_patches"])
+                _tmp_pkg = man_pkg or self.instance_state.package or "default.app"
+                _ov_kw = dict(overlay_opts or {})
+                if app_ctx is not None:
+                    _ov_kw.setdefault("app", app_ctx)
+                if cfg_dict is not None:
+                    _ov_kw.setdefault("cfg", cfg_dict)
+                resolved_overlays = WorkspaceOverlayResolver.collect(
+                    self.base_dir, _tmp_pkg, self.app_root, **_ov_kw,
+                )
+                if resolved_overlays.get("smali_patches"):
+                    if hasattr(provider, "apply_smali_patches"):
+                        np = provider.apply_smali_patches(resolved_overlays["smali_patches"])
+                        if np:
+                            self.log_fn(f"> {np} Smali-Patch(es) live im ClassProvider ueberlagert")
             except Exception as _eov:
-                self.log_fn(f"> Live-Overlay Warnung: {_eov!r}")
+                self.log_fn(f"> Workspace-Overlay Warnung: {_eov!r}")
+
+        if cancel_check and cancel_check():
+            return {"cancelled": True}
+
         vm.class_provider = provider
         stubs = AndroidStubs(vm=vm)
+        stubs._seam_config = self.seam_config
         try:
             stubs.seed_framework_statics(vm)
         except Exception:
@@ -674,29 +864,39 @@ class GlassAppRunner:
         except Exception:
             pass
         tree = install_view_stubs(stubs, app_root=self.app_root)
-        net_log = NetLog()
+        net_log = net_log if net_log is not None else NetLog()
         install_net_stubs(stubs, responder=net_responder, net_log=net_log,
-                          api_db=api_db, rules_path=rules_path)
+                          api_db=api_db, rules_path=rules_path,
+                          net_condition=net_condition)
         install_asset_stubs(stubs)
         if self.app_root:
-            seed_assets_from_dir(stubs, self.app_root)
+            _na = seed_assets_from_dir(stubs, self.app_root)
+            if _na:
+                self.log_fn(f"> Assets bereitgestellt (AssetManager): {_na} Dateien")
+
+        if cancel_check and cancel_check():
+            return {"cancelled": True}
+
         vm.runtime = _StubRuntime(stubs)
 
-        man_pkg = None
-        if self.app_root:
+        if man_pkg and hasattr(stubs, "set_profile"):
             try:
-                from core.java.manifest import parse_manifest
                 from core.java.device_profile import DeviceProfile
-                man = parse_manifest(self.app_root)
-                man_pkg = getattr(man, "package", None)
-                if man_pkg and hasattr(stubs, "set_profile"):
-                    stubs.set_profile(DeviceProfile(package=man_pkg), vm=vm)
+                stubs.set_profile(DeviceProfile(package=man_pkg), vm=vm)
             except Exception:
-                man_pkg = None
+                try:
+                    stubs.profile.package = man_pkg
+                except Exception:
+                    pass
         pkg = man_pkg or self.instance_state.package or getattr(getattr(stubs, "profile", None), "package", None) or "com.example.app"
         self.instance_state.package = pkg
+        if virtual_clock is not None:
+            try:
+                apply_virtual_clock_spec(stubs, virtual_clock)
+            except Exception:
+                pass
         if self.seam_config.persist_appdata and (
-            bool(native_fusion) or os.path.abspath(self.base_dir) != os.path.abspath(".")
+            force_sync_appdata or bool(native_fusion) or os.path.abspath(self.base_dir) != os.path.abspath(".")
         ):
             try:
                 from core.java.sqlite_prefs_bridge import sync_java_appdata_from_dir
@@ -707,81 +907,130 @@ class GlassAppRunner:
         hook = None
         fusion = None
         session = None
-        if native_fusion and self.seam_config.unpack_mode != "noop_native":
-            from services.native_emu_service import NativeEmuService
-            from services.native_ffi_service import NativeFfiService
-            from services.native_jni_env_service import NativeJniEnvService
-            from services.native_os_service import NativeOsService
-            from core.java.native_link import install_native_link, NativeMethodTable
-            from core.java.jni_boundary import install_jni_boundary
-            from core.java.runtime import VmBackedJavaRuntime
-            from core.java.fusion_autoload import mirror_tree_to_vfs
-            from core.java.fusion_dlopen import install_native_dlopen
-            from core.java.fusion_loader import NativeFusionLoader
-            from core.java.fs_bridge import install_fs_stubs, get_shared_fs
-            from core.java.debug_unified import DebugSession
+        nld = f"/data/app/{pkg}/lib/arm64"
+        if native_fusion and self.seam_config.unpack_mode != "noop_native" and not (cancel_check and cancel_check()):
+            try:
+                from services.native_emu_service import NativeEmuService
+                from services.native_ffi_service import NativeFfiService
+                from services.native_jni_env_service import NativeJniEnvService
+                from services.native_os_service import NativeOsService
+                from core.java.native_link import install_native_link, NativeMethodTable
+                from core.java.jni_boundary import install_jni_boundary
+                from core.java.runtime import VmBackedJavaRuntime
+                from core.java.fusion_autoload import mirror_tree_to_vfs
+                from core.java.fusion_dlopen import install_native_dlopen
+                from core.java.fusion_loader import NativeFusionLoader
+                from core.java.fs_bridge import install_fs_stubs, get_shared_fs
+                from core.java.debug_unified import DebugSession
 
-            svc = NativeEmuService(publish=False)
-            eng = svc.new_engine()
-            stubs._vfs_eng = eng
-            ffi = NativeFfiService(publish=False)
-            jni = NativeJniEnvService(publish=False, app_base=self.app_root)
-            jni.install(eng, ffi, set_entry_reg=None)
-            jni.java_runtime = VmBackedJavaRuntime(vm, jni)
+                svc = NativeEmuService(publish=False)
+                eng = svc.new_engine()
+                eng.cpu.yield_gil = True
+                stubs._vfs_eng = eng
+                ffi = NativeFfiService(publish=False)
+                jni = NativeJniEnvService(publish=False, app_base=self.app_root)
+                jni.install(eng, ffi, set_entry_reg=None)
+                jni.java_runtime = VmBackedJavaRuntime(vm, jni)
 
-            os_svc = NativeOsService(publish=False)
-            os_svc.attach_env(eng)
-            os_svc.install(eng)
+                os_svc = NativeOsService(publish=False)
+                os_svc.attach_env(eng)
+                os_svc.install(eng)
+                try:
+                    from core.java.virtual_clock import attach_virtual_clock_to_native_env
+                    attach_virtual_clock_to_native_env(stubs, eng)
+                except Exception:
+                    pass
 
-            nld = f"/data/app/{pkg}/lib/arm64"
-            if self.app_root:
-                mirror_tree_to_vfs(os_svc, eng, self.app_root, "assets", "/data/app/assets")
-                mirror_tree_to_vfs(os_svc, eng, self.app_root, "lib/arm64-v8a", nld)
+                if self.app_root:
+                    _nma = mirror_tree_to_vfs(os_svc, eng, self.app_root, "assets", "/data/app/assets")
+                    _nml = mirror_tree_to_vfs(os_svc, eng, self.app_root, "lib/arm64-v8a", nld)
+                    self.log_fn(f"> VFS gespiegelt: {_nma} Assets, {_nml} Libs -> {nld} (App liest selbst)")
 
-            apk_bytes = None
-            if self.app_root:
-                for cand in ("merged_base.apk", "base.apk"):
-                    ap = os.path.join(os.path.dirname(self.app_root), cand)
-                    if os.path.isfile(ap):
-                        with open(ap, "rb") as afh:
-                            apk_bytes = afh.read()
-                        break
-            install_fs_stubs(stubs, eng, pkg=pkg, native_lib_dir=nld, apk_bytes=apk_bytes)
-            fs = get_shared_fs(eng)
-            merged_so_overlays = {}
-            if resolved_overlays and resolved_overlays.get("vfs_so_overlays"):
-                merged_so_overlays.update(resolved_overlays["vfs_so_overlays"])
-            if extra_so_overlays:
-                merged_so_overlays.update(extra_so_overlays)
-            if merged_so_overlays and fs is not None:
-                ov_names = set()
-                for soname, blob in merged_so_overlays.items():
-                    if blob:
-                        bn = os.path.basename(soname)
-                        fs.add_file(f"{nld}/{bn}", bytes(blob))
-                        ov_names.add(bn)
-                eng._vfs_overlay_libs = ov_names
-            if self.seam_config.persist_appdata and fs is not None:
-                sync_appdata_into_vfs(fs, pkg, self.instance_state.pkg_appdata_dir(self.base_dir))
+                apk_bytes = None
+                if self.app_root:
+                    for cand in ("merged_base.apk", "base.apk"):
+                        ap = os.path.join(os.path.dirname(self.app_root), cand)
+                        if os.path.isfile(ap):
+                            with open(ap, "rb") as afh:
+                                apk_bytes = afh.read()
+                            break
+                install_fs_stubs(stubs, eng, pkg=pkg, native_lib_dir=nld, apk_bytes=apk_bytes)
+                fs = get_shared_fs(eng)
+                if net_condition is not None:
+                    stubs._net_os_eng = eng
+                    net_condition.apply_to_os(eng)
+                merged_so_overlays = {}
+                if _want_overlays and resolved_overlays and resolved_overlays.get("vfs_so_overlays"):
+                    merged_so_overlays.update(resolved_overlays["vfs_so_overlays"])
+                if extra_so_overlays:
+                    merged_so_overlays.update(extra_so_overlays)
+                if merged_so_overlays and fs is not None:
+                    ov_names = set()
+                    for soname, blob in merged_so_overlays.items():
+                        if blob:
+                            bn = os.path.basename(soname)
+                            fs.add_file(f"{nld}/{bn}", bytes(blob))
+                            ov_names.add(bn)
+                    eng._vfs_overlay_libs = ov_names
+                    ov_sum = (resolved_overlays or {}).get("summary") or {}
+                    for warn in ov_sum.get("warnings") or ():
+                        self.log_fn(f"> [Overlay-Warnung] {warn}")
+                    if ov_names:
+                        self.log_fn(
+                            "> Native Live-Overlays in VFS 2.0 gemountet: %d Datei(en) "
+                            "(LibForge=%d, LibCarve=%d, Hex=%d, Replace=%d) -> %s"
+                            % (
+                                len(ov_names),
+                                ov_sum.get("libforge", 0),
+                                ov_sum.get("libcarve", 0),
+                                ov_sum.get("hex", 0),
+                                ov_sum.get("lib_replace", 0),
+                                ", ".join(sorted(ov_names)),
+                            )
+                        )
+                if self.seam_config.persist_appdata and fs is not None:
+                    _app_dir = self.instance_state.pkg_appdata_dir(self.base_dir)
+                    _nsync = sync_appdata_into_vfs(fs, pkg, _app_dir)
+                    if _nsync:
+                        self.log_fn(f"> AppData synchronisiert: {_nsync} Dateien aus {_app_dir}")
+                self.log_fn(
+                    f"> VFS geteilt (Java-I/O<->nativ); base.apk gemountet: {'ja' if apk_bytes else 'nein'}; nativeLibraryDir={nld}"
+                )
 
-            tbl = NativeMethodTable()
-            fusion_loader = NativeFusionLoader(
-                svc=svc, eng=eng, jni=jni, table=tbl, ffi=ffi, stubs=stubs,
-                app_root=self.app_root, pkg=pkg, base_dir=self.base_dir,
-                seam_config=self.seam_config, log_fn=self.log_fn,
-            )
+                tbl = NativeMethodTable()
+                fusion_loader = NativeFusionLoader(
+                    svc=svc, eng=eng, jni=jni, table=tbl, ffi=ffi, stubs=stubs,
+                    app_root=self.app_root, pkg=pkg, base_dir=self.base_dir,
+                    seam_config=self.seam_config, log_fn=self.log_fn,
+                )
 
-            install_native_link(vm, eng, jni, table=tbl,
-                                on_load_library=fusion_loader.load_library,
-                                on_load_path=fusion_loader.load_path)
-            dl = install_native_dlopen(eng, ffi, svc, jni, tbl,
-                                       vfs_read=lambda p: fusion_loader.vfs_read(eng, p),
-                                       fusion_loader=fusion_loader)
-            hook = install_jni_boundary(vm.bridge, vm=vm)
-            fusion = {"eng": eng, "jni": jni, "table": tbl, "bridge": vm.bridge,
-                      "hook": hook, "svc": svc, "os": os_svc, "ffi": ffi, "dl": dl,
-                      "loader": fusion_loader}
-            session = DebugSession(eng, jni, vm=vm)
+                if on_load_library is not None or on_load_path is not None:
+                    vm._fusion_load_library = on_load_library or fusion_loader.load_library
+                    vm._fusion_load_path = on_load_path or fusion_loader.load_path
+
+                install_native_link(vm, eng, jni, table=tbl,
+                                    on_load_library=on_load_library or fusion_loader.load_library,
+                                    on_load_path=on_load_path or fusion_loader.load_path)
+                dl = install_native_dlopen(eng, ffi, svc, jni, tbl,
+                                           vfs_read=lambda p: fusion_loader.vfs_read(eng, p),
+                                           fusion_loader=fusion_loader)
+                hook = install_jni_boundary(vm.bridge, vm=vm)
+                for _ap_spec in (jni_aps or ()):
+                    try:
+                        hook.add_action_point(**_ap_spec)
+                    except Exception as _e2:
+                        self.log_fn(f"> Grenz-AP-Fehler: {_e2!r}")
+                fusion = {"eng": eng, "jni": jni, "table": tbl, "bridge": vm.bridge,
+                          "hook": hook, "svc": svc, "os": os_svc, "ffi": ffi, "dl": dl,
+                          "loader": fusion_loader, "stubs": stubs}
+                session = DebugSession(eng, jni, vm=vm)
+            except Exception as _ef:
+                if not fallback_java_on_fusion_err:
+                    raise
+                self.log_fn(f"> Fusion-Setup fehlgeschlagen (Java-only Fallback): {_ef!r}")
+                fusion = None
+                hook = None
+                session = None
 
         self.seam_config.apply_to_vm(vm, native_fusion=bool(fusion), jni_hook=hook)
         jdb = session.jdbg if session is not None else JavaDebugger(vm)
@@ -794,18 +1043,31 @@ class GlassAppRunner:
         self.fusion = fusion
         self.provider = provider
         self.runner = LifecycleRunner(vm, provider=provider, with_stubs=False, stubs=stubs)
+        self.runner.seam_config = self.seam_config
         return {
             "vm": vm, "stubs": stubs, "tree": tree, "net_log": net_log,
             "jdb": jdb, "session": session, "fusion": fusion, "provider": provider,
+            "man_pkg": pkg, "man_entry": man_entry, "nld": nld,
+            "resolved_overlays": resolved_overlays,
         }
 
     def run(self, *, entry: Optional[str] = None, max_steps: int = 200000,
             max_wall_s: float = 30.0, native_fusion: bool = True,
             smali_patches: Optional[Dict[str, str]] = None,
-            extra_so_overlays: Optional[Dict[str, bytes]] = None) -> Dict[str, Any]:
+            extra_so_overlays: Optional[Dict[str, bytes]] = None,
+            virtual_clock: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.vm is None:
             self.build(native_fusion=native_fusion, smali_patches=smali_patches,
-                       extra_so_overlays=extra_so_overlays)
+                       extra_so_overlays=extra_so_overlays, virtual_clock=virtual_clock)
+        elif virtual_clock is not None and self.stubs is not None:
+            try:
+                apply_virtual_clock_spec(
+                    self.stubs,
+                    virtual_clock,
+                    eng=(self.fusion or {}).get("eng") if isinstance(self.fusion, dict) else None,
+                )
+            except Exception:
+                pass
         self.vm.max_steps = int(max_steps)
         self.vm.step_budget = int(max_steps)
         self.vm.wall_deadline = (time.monotonic() + float(max_wall_s)) if max_wall_s else None
@@ -834,6 +1096,11 @@ class GlassAppRunner:
                         self.tree = rn_surf.tree
                 except Exception:
                     pass
+        if self.tree is not None and hasattr(self.tree, "ensure_layout"):
+            try:
+                self.tree.ensure_layout()
+            except Exception:
+                pass
 
         if self.seam_config.persist_appdata and (
             bool(self.fusion) or os.path.abspath(self.base_dir) != os.path.abspath(".")

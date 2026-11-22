@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 from typing import Dict, List, Optional
 
 _M64 = (1 << 64) - 1
@@ -332,6 +333,110 @@ class NativeJniEnvService:
         pending = bool(category and category in self.watchlist)
         return proposed, False, pending
 
+    def _extract_jni_args(self, cpu, ptypes: List[str], arg_reg0: int,
+                          is_va: bool, is_arr: bool) -> list:
+        """Extrahiert JNI-Argumente fuer Call*Method / MethodV / MethodA nach AAPCS64."""
+        x = cpu.x
+        out = []
+        if is_arr:
+            jval_ptr = int(x[arg_reg0]) & _M64
+            for i, pt in enumerate(ptypes):
+                slot = int(cpu.m.r64((jval_ptr + 8 * i) & _M64)) & _M64 if jval_ptr else 0
+                if pt == "F":
+                    out.append(struct.unpack("<f", struct.pack("<I", slot & 0xffffffff))[0])
+                elif pt == "D":
+                    out.append(struct.unpack("<d", struct.pack("<Q", slot & _M64))[0])
+                else:
+                    out.append(slot)
+            return out
+        if is_va:
+            va_ptr = int(x[arg_reg0]) & _M64
+            if not va_ptr:
+                return [0.0 if pt in ("F", "D") else 0 for pt in ptypes]
+            stack = int(cpu.m.r64(va_ptr)) & _M64
+            gr_top = int(cpu.m.r64((va_ptr + 8) & _M64)) & _M64
+            vr_top = int(cpu.m.r64((va_ptr + 16) & _M64)) & _M64
+            gr_raw = int(cpu.m.r32((va_ptr + 24) & _M64))
+            vr_raw = int(cpu.m.r32((va_ptr + 28) & _M64))
+            gr_offs = gr_raw - 0x100000000 if (gr_raw & 0x80000000) else gr_raw
+            vr_offs = vr_raw - 0x100000000 if (vr_raw & 0x80000000) else vr_raw
+            for pt in ptypes:
+                if pt in ("F", "D"):
+                    if vr_offs < 0 and vr_offs + 16 <= 0:
+                        addr = (vr_top + vr_offs) & _M64
+                        vr_offs += 16
+                    else:
+                        vr_offs = 0
+                        addr = stack
+                        stack = (stack + 8) & _M64
+                    if pt == "F":
+                        out.append(struct.unpack("<f", struct.pack("<I", int(cpu.m.r32(addr)) & 0xffffffff))[0])
+                    else:
+                        out.append(struct.unpack("<d", struct.pack("<Q", int(cpu.m.r64(addr)) & _M64))[0])
+                else:
+                    if gr_offs < 0 and gr_offs + 8 <= 0:
+                        addr = (gr_top + gr_offs) & _M64
+                        gr_offs += 8
+                    else:
+                        gr_offs = 0
+                        addr = stack
+                        stack = (stack + 8) & _M64
+                    out.append(int(cpu.m.r64(addr)) & _M64)
+            cpu.m.w64(va_ptr, stack & _M64)
+            cpu.m.w32((va_ptr + 24) & _M64, gr_offs & 0xffffffff)
+            cpu.m.w32((va_ptr + 28) & _M64, vr_offs & 0xffffffff)
+            return out
+        gp_idx = arg_reg0
+        fp_idx = 0
+        stack_off = 0
+        for pt in ptypes:
+            if pt in ("F", "D"):
+                nb = 4 if pt == "F" else 8
+                if fp_idx < 8:
+                    raw_b = cpu.vget(fp_idx, nb) if hasattr(cpu, "vget") else (b"\x00" * nb)
+                    fp_idx += 1
+                    out.append(struct.unpack("<f" if pt == "F" else "<d", raw_b)[0])
+                else:
+                    addr = (int(cpu.sp) + stack_off) & _M64
+                    stack_off += 8
+                    if pt == "F":
+                        out.append(struct.unpack("<f", struct.pack("<I", int(cpu.m.r32(addr)) & 0xffffffff))[0])
+                    else:
+                        out.append(struct.unpack("<d", struct.pack("<Q", int(cpu.m.r64(addr)) & _M64))[0])
+            else:
+                if gp_idx < 8:
+                    out.append(int(x[gp_idx]) & _M64)
+                    gp_idx += 1
+                else:
+                    addr = (int(cpu.sp) + stack_off) & _M64
+                    stack_off += 8
+                    out.append(int(cpu.m.r64(addr)) & _M64)
+        return out
+
+    @staticmethod
+    def _marshal_fp_ret(cpu, val, rchar: str) -> int:
+        if rchar == "F":
+            if isinstance(val, float):
+                raw = struct.pack("<f", val)
+                bits = int.from_bytes(raw, "little")
+            else:
+                bits = int(val or 0) & 0xffffffff
+                raw = struct.pack("<I", bits)
+            if hasattr(cpu, "vset"):
+                cpu.vset(0, raw)
+            return bits
+        if rchar == "D":
+            if isinstance(val, float):
+                raw = struct.pack("<d", val)
+                bits = int.from_bytes(raw, "little")
+            else:
+                bits = int(val or 0) & _M64
+                raw = struct.pack("<Q", bits)
+            if hasattr(cpu, "vset"):
+                cpu.vset(0, raw)
+            return bits
+        return int(val or 0) & _M64
+
     # ================= Dispatcher =================
     def _log(self, entry):
         if len(self.st.calls) < self.st.max_calls:
@@ -422,34 +527,70 @@ class NativeJniEnvService:
             self._log({**info, "class": cls, "count": int(cnt), "registered": recs})
             return 0
         elif name.startswith("Call") and ("Method" in name):
-            # Call[Static|Nonvirtual]<T>Method[V|A]: methodID ist x2 (bei allen Varianten)
-            mid = int(x[2]) & _M64
-            h = self.st.handles.get(mid, {})
-            cls = h.get("cls", "?"); mname = h.get("name", "?"); sig = h.get("sig", "?")
+            is_static = "Static" in name
+            is_nonvirtual = "Nonvirtual" in name
+            is_va = name.endswith("MethodV")
+            is_arr = name.endswith("MethodA")
+            if is_nonvirtual:
+                obj_h = int(x[1]) & _M64
+                clazz_h = int(x[2]) & _M64
+                mid = int(x[3]) & _M64
+                arg_reg0 = 4
+                h = self.st.handles.get(mid, {})
+                cls = (self.st.classes.get(clazz_h)
+                       or (self.st.handles.get(clazz_h, {}) or {}).get("cls")
+                       or h.get("cls", "?"))
+            else:
+                mid = int(x[2]) & _M64
+                arg_reg0 = 3
+                obj_h = (int(x[1]) & _M64) if not is_static else None
+                h = self.st.handles.get(mid, {})
+                cls = h.get("cls", "?")
+            mname = h.get("name", "?"); sig = h.get("sig", "?")
+            rchar = h.get("retchar") or (
+                self._ret_char(sig) if sig and sig != "?"
+                else ("F" if "Float" in name else ("D" if "Double" in name else "I"))
+            )
             # --- J2: native->Java-Rueckruf, falls eine JavaRuntime eine registrierte Dalvik-Methode
             #     bereitstellt. Default-off (keine Runtime -> unveraenderter RASP-Policy-Pfad). ---
             rt = getattr(self, "java_runtime", None)
-            if (rt is not None and cls not in (None, "?") and mname not in (None, "?")
-                    and sig not in (None, "?") and rt.has_method(cls, mname, sig)):
+            target_cls = cls
+            if not is_static and not is_nonvirtual and rt is not None and obj_h:
+                oh = self.st.handles.get(obj_h) or {}
+                ocls = oh.get("cls")
+                if not ocls or ocls == "?":
+                    py_obj = getattr(rt, "_h2py", {}).get(obj_h)
+                    ocls = getattr(py_obj, "cls", None) or ("Ljava/lang/String;" if type(py_obj).__name__ == "JString" else None)
+                if ocls and ocls != "?" and rt.has_method(ocls, mname, sig):
+                    target_cls = ocls
+            if (rt is not None and target_cls not in (None, "?") and mname not in (None, "?")
+                    and sig not in (None, "?") and rt.has_method(target_cls, mname, sig)):
                 try:
-                    from core.java.runtime import sig_argcount
-                    na = sig_argcount(sig)
-                    jstatic = "Static" in name
-                    argwords = [int(x[3 + i]) & _M64 for i in range(na)]
-                    jret = rt.call_from_native(cls, mname, sig, argwords, jstatic)
-                    self._log({**info, "class": cls, "method": mname, "sig": sig,
-                               "j2": True, "ret": int(jret) & _M64})
-                    return int(jret) & _M64
+                    from core.java.runtime import sig_param_types
+                    ptypes = sig_param_types(sig)
+                    extracted = self._extract_jni_args(cpu, ptypes, arg_reg0, is_va, is_arr)
+                    call_args = ([obj_h] + extracted) if not is_static else extracted
+                    co = getattr(rt.call_from_native, "__code__", None)
+                    if co is not None and "param_types" in getattr(co, "co_varnames", ()):
+                        jret = rt.call_from_native(target_cls, mname, sig, call_args, is_static,
+                                                   param_types=ptypes, ret_type=rchar,
+                                                   nonvirtual=is_nonvirtual)
+                    else:
+                        jret = rt.call_from_native(target_cls, mname, sig, call_args, is_static)
+                    jret_i = self._marshal_fp_ret(cpu, jret, rchar)
+                    self._log({**info, "class": target_cls, "method": mname, "sig": sig,
+                               "j2": True, "ret": jret_i})
+                    return jret_i
                 except Exception as e:
-                    self._log({**info, "class": cls, "method": mname, "sig": sig,
+                    self._log({**info, "class": target_cls, "method": mname, "sig": sig,
                                "j2_error": repr(e)})   # Fallthrough auf die RASP-Policy
             proposed = h.get("proposed", 0); cat = h.get("category")
             final, overridden, pending = self._apply_policy(cls, mname, sig, proposed, cat)
-            ret = final
+            ret_i = self._marshal_fp_ret(cpu, final, rchar)
             self._log({**info, "class": cls, "method": mname, "sig": sig, "category": cat,
                        "proposed": proposed, "final": final, "overridden": overridden,
                        "pending": pending})
-            return ret & _M64
+            return ret_i & _M64
         elif name == "ExceptionCheck":
             ret = 1 if self.st.pending_exc else 0
         elif name == "ExceptionOccurred":

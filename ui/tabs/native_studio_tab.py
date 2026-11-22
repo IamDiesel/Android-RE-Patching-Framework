@@ -17,26 +17,12 @@ from ui.controllers.native_studio_controller import NativeStudioController
 
 
 def _add_tooltip(widget, text):
-    """Kleiner Hover-Tooltip (erklaert, was ein Button tut)."""
-    state = {"win": None}
-    def _enter(_e):
-        if state["win"] is not None:
-            return
-        try:
-            x = widget.winfo_rootx() + 14
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            w = tk.Toplevel(widget); w.wm_overrideredirect(True); w.wm_geometry(f"+{x}+{y}")
-            tk.Label(w, text=text, background="#FFFFE0", relief="solid", borderwidth=1,
-                     justify="left", font=("Segoe UI", 8), wraplength=380).pack()
-            state["win"] = w
-        except Exception:
-            state["win"] = None
-    def _leave(_e):
-        w = state["win"]; state["win"] = None
-        if w is not None:
-            try: w.destroy()
-            except Exception: pass
-    widget.bind("<Enter>", _enter); widget.bind("<Leave>", _leave)
+    """Einheitlicher Hover-Tooltip (erklaert, was ein Button tut)."""
+    try:
+        from ui.widgets.tooltip import add_tooltip
+        add_tooltip(widget, text)
+    except Exception:
+        pass
 
 
 class NativeStudioTab(ttk.Frame):

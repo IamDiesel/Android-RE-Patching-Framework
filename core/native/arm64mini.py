@@ -27,7 +27,19 @@ PAGE=0x1000; M64=(1<<64)-1
 class Mem:
     _U32_OK=(memoryview(bytearray(4)).cast('I').itemsize==4)
     _U64_OK=(memoryview(bytearray(8)).cast('Q').itemsize==8)
-    def __init__(self): self.pages={}; self.u32={}; self.u64={}
+    def __init__(self): self.pages={}; self.u32={}; self.u64={}; self._code_pages=set(); self._cpus=[]
+    def _inv(self,a,sz):
+        cp=getattr(self,"_code_pages",None)
+        if not cp: return
+        p0=a>>12; p1=(a+max(sz,1)-1)>>12
+        hit=None
+        for pg in range(p0,p1+1):
+            if pg in cp:
+                if hit is None: hit=[]
+                hit.append(pg)
+        if hit is not None:
+            for pg in hit: cp.discard(pg)
+            for c in getattr(self,"_cpus",()): c.invalidate_code(a,sz)
     def _pg(self,a):
         p=a&~(PAGE-1); b=self.pages.get(p)
         if b is None: b=bytearray(PAGE); self.pages[p]=b
@@ -40,7 +52,7 @@ class Mem:
         if o+n<=PAGE:
             b=self.pages.get(p)
             if b is None: b=bytearray(PAGE); self.pages[p]=b
-            b[o:o+n]=data; return
+            b[o:o+n]=data; self._inv(a,n); return
         mv=memoryview(data); i=0
         while i<n:
             chunk=min(PAGE-o,n-i)
@@ -48,6 +60,7 @@ class Mem:
             if b is None: b=bytearray(PAGE); self.pages[p]=b
             b[o:o+chunk]=mv[i:i+chunk]
             i+=chunk; p+=PAGE; o=0
+        self._inv(a,n)
     def rb(self,a,n):
         if n<=0: return b""
         p=a&~(PAGE-1); o=a-p
@@ -68,18 +81,19 @@ class Mem:
             return 0 if b is None else int.from_bytes(b[o:o+sz],"little")
         return int.from_bytes(self.rb(a,sz),"little")
     def w(self,a,v,sz):
+        if sz<=0: return
         p=a&~(PAGE-1); o=a-p
         if o+sz<=PAGE:
             b=self.pages.get(p)
             if b is None: b=bytearray(PAGE); self.pages[p]=b
-            b[o:o+sz]=(v&((1<<(8*sz))-1)).to_bytes(sz,"little"); return
+            b[o:o+sz]=(v&((1<<(8*sz))-1)).to_bytes(sz,"little"); self._inv(a,sz); return
         self.wb(a,(v&((1<<(8*sz))-1)).to_bytes(sz,"little"))
     def r8(self,a):
         b=self.pages.get(a&~(PAGE-1)); return 0 if b is None else b[a&(PAGE-1)]
     def w8(self,a,v):
         p=a&~(PAGE-1); b=self.pages.get(p)
         if b is None: b=bytearray(PAGE); self.pages[p]=b
-        b[a&(PAGE-1)]=v&0xff
+        b[a&(PAGE-1)]=v&0xff; self._inv(a,1)
     def r32(self,a):
         o=a&(PAGE-1)
         if o<=PAGE-4:
@@ -99,8 +113,10 @@ class Mem:
             if Mem._U32_OK and (o&3)==0:
                 u=self.u32.get(p)
                 if u is None: u=self.u32[p]=memoryview(b).cast('I')
-                u[o>>2]=v&0xffffffff; return
-            b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff; return
+                u[o>>2]=v&0xffffffff
+            else:
+                b[o]=v&0xff; b[o+1]=(v>>8)&0xff; b[o+2]=(v>>16)&0xff; b[o+3]=(v>>24)&0xff
+            self._inv(a,4); return
         self.w(a,v,4)
     def r64(self,a):
         o=a&(PAGE-1)
@@ -121,8 +137,10 @@ class Mem:
             if Mem._U64_OK and (o&7)==0:
                 u=self.u64.get(p)
                 if u is None: u=self.u64[p]=memoryview(b).cast('Q')
-                u[o>>3]=v&0xffffffffffffffff; return
-            b[o:o+8]=(v&0xffffffffffffffff).to_bytes(8,'little'); return
+                u[o>>3]=v&0xffffffffffffffff
+            else:
+                b[o:o+8]=(v&0xffffffffffffffff).to_bytes(8,'little')
+            self._inv(a,8); return
         self.w(a,v,8)
 
 def _sx(v,bits):
@@ -184,6 +202,7 @@ def _aes_inv_mixcolumns(s):
 class CPU:
     def __init__(self, mem, stub=None):
         self.m=mem; self.x=[0]*31; self.sp=0; self.lr=0
+        if hasattr(mem,"_cpus") and self not in mem._cpus: mem._cpus.append(self)
         self.n=self.z=self.c=self.vf=0
         self.v=[bytearray(16) for _ in range(32)]   # SIMD/FP register file (128-bit each)
         self.md=None   # lazy: capstone erst bei cache-miss
@@ -512,6 +531,8 @@ class CPU:
                 import capstone; self.md=capstone.Cs(capstone.CS_ARCH_ARM64,capstone.CS_MODE_LITTLE_ENDIAN)
             d=next(self.md.disasm_lite(bytes(self.m.rb(pc,4)),pc))   # (addr,size,mnemonic,op_str) -> picklable Tupel
             ins=(d[0],d[2],d[3]); self.cache[pc]=ins
+            cp=getattr(self.m,"_code_pages",None)
+            if cp is not None: cp.add(pc>>12)
         return ins
     def invalidate_code(self, start=0, size=None):
         if size is None:
@@ -534,14 +555,15 @@ class CPU:
         self.stopped=False; self.stop_reason=None
         deadline=(_t.monotonic()+float(max_wall_s)) if (max_wall_s is not None and float(max_wall_s)>0) else 0.0
         bb=self.bb; stub=self.stub; probes=self.probes
-        has_probes=bool(probes)            # P2: Hoist statt Per-Block-Truthiness
         gcwas=gc.isenabled()
         if gcwas: gc.disable()             # P2: kein zyklischer GC-Scan waehrend des Laufs
         try:
             while True:
                 pc=self.pc
                 if pc==SENT or self.stopped: return self.x[0]
-                if has_probes and pc in probes: probes[pc](self)
+                if probes and pc in probes:
+                    probes[pc](self)
+                    if self.stopped: return self.x[0]
                 fn=stub.get(pc)
                 if fn is not None:
                     nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr)
@@ -552,7 +574,8 @@ class CPU:
                     blk=self._compile_block(pc); bb[pc]=blk
                 self.pc=blk(self); c+=1
                 if self.stopped: return self.x[0]
-                if deadline and (c&0x3ff)==0 and _t.monotonic()>deadline:
+                if (c&0x7ff)==0 and getattr(self,"yield_gil",False): _t.sleep(0.001)
+                if deadline and ((c&0x3f)==0 or self.pc==pc) and _t.monotonic()>deadline:
                     raise Exception("timeout@0x%x"%self.pc)
                 if c>maxins: raise Exception("maxins@0x%x"%self.pc)
         finally:
@@ -568,14 +591,15 @@ class CPU:
         self.stopped=False; self.stop_reason=None
         deadline=(_t.monotonic()+float(max_wall_s)) if (max_wall_s is not None and float(max_wall_s)>0) else 0.0
         bb=self.bb; stub=self.stub; probes=self.probes
-        has_probes=bool(probes)
         gcwas=gc.isenabled()
         if gcwas: gc.disable()
         try:
             while True:
                 pc=self.pc
                 if pc==SENT or self.stopped: return self.x[0]
-                if has_probes and pc in probes: probes[pc](self)
+                if probes and pc in probes:
+                    probes[pc](self)
+                    if self.stopped: return self.x[0]
                 fn=stub.get(pc)
                 if fn is not None:
                     nxt=fn(self); self.pc=(nxt if type(nxt) is int else self.lr)
@@ -586,7 +610,8 @@ class CPU:
                     blk=self._compile_block(pc); bb[pc]=blk
                 self.pc=blk(self); c+=1
                 if self.stopped: return self.x[0]
-                if deadline and (c&0x3ff)==0 and _t.monotonic()>deadline:
+                if (c&0x7ff)==0 and getattr(self,"yield_gil",False): _t.sleep(0.001)
+                if deadline and ((c&0x3f)==0 or self.pc==pc) and _t.monotonic()>deadline:
                     raise Exception("timeout@0x%x"%self.pc)
                 if c>maxins: raise Exception("maxins@0x%x"%self.pc)
         finally:
@@ -605,6 +630,8 @@ class CPU:
         blk=self.bb.get(pc)
         if blk is None:
             blk=self._compile_block(pc); self.bb[pc]=blk
+        elif hasattr(self.m,"_code_pages"):
+            self.m._code_pages.add(pc>>12)
         self.pc=blk(self); return self.pc
     # ===== Basic-Block-JIT: heisse GP-Instruktionen -> direktes Python; Rest -> step() =====
     _JTERM=("b","bl","blr","br","ret","cbz","cbnz","tbz","tbnz","brk","svc","hlt")
@@ -763,14 +790,16 @@ class CPU:
             if a is None or b is None: return None
             e=("(%s)*(%s)"%(a,b)) if m=="mul" else ("-((%s)*(%s))"%(a,b))
             s=self._dv(T[0],e); return None if s is None else [s]
-        if m in ("and","orr","eor","bic"):
+        if m in ("and","orr","eor","bic","eon","orn"):
             if "." in T[0]: return None
             a=self._ev(T[1]); b=self._ev(T[2])
             if a is None or b is None: return None
             if m=="and": e="(%s)&(%s)"%(a,b)
             elif m=="orr": e="(%s)|(%s)"%(a,b)
             elif m=="eor": e="(%s)^(%s)"%(a,b)
-            else: e="(%s)&~(%s)"%(a,b)
+            elif m=="bic": e="(%s)&~(%s)"%(a,b)
+            elif m=="eon": e="(%s)^~(%s)"%(a,b)
+            else: e="(%s)|~(%s)"%(a,b)
             s=self._dv(T[0],e); return None if s is None else [s]
         if m in ("lsl","lsr","asr"):
             a=self._ev(T[1])
@@ -823,6 +852,13 @@ class CPU:
             if v is None: return None
             e=("-(%s)"%v) if m=="neg" else ("~(%s)"%v)
             s=self._dv(T[0],e); return None if s is None else [s]
+        if m=="negs":
+            if "." in T[0]: return None
+            v=self._ev(T[1])
+            if v is None: return None
+            call="cpu._setflags_sub(0,%s,%s)"%(v,"True" if w32(T[0]) else "False")
+            if T[0].strip().lower() in ("xzr","wzr"): return [call]
+            s=self._dv(T[0],call); return None if s is None else [s]
         if m=="cmp":
             a=self._ev(T[0]); b=self._ev(T[1])
             if a is None or b is None: return None
@@ -923,10 +959,14 @@ class CPU:
             sub="True" if m in ("sbc","sbcs") else "False"; setf="True" if m.endswith("s") else "False"
             s=self._dv(T[0],"cpu._adc(%s,%s,%s,%s,%s)"%(a,b,sub,setf,"True" if w32(T[0]) else "False"))
             return None if s is None else [s]
-        if m=="ands":
+        if m in ("ands","bics"):
+            if "." in T[0]: return None
             a=self._ev(T[1]); b=self._ev(T[2])
             if a is None or b is None: return None
-            s=self._dv(T[0],"cpu._andflags(%s,%s,%s)"%(a,b,"True" if w32(T[0]) else "False"))
+            bx=b if m=="ands" else ("(~(%s))&M64"%b)
+            call="cpu._andflags(%s,%s,%s)"%(a,bx,"True" if w32(T[0]) else "False")
+            if T[0].strip().lower() in ("xzr","wzr"): return [call]
+            s=self._dv(T[0],call)
             return None if s is None else [s]
         if m=="tst":
             a=self._ev(T[0]); b=self._ev(T[1])
@@ -1009,10 +1049,16 @@ class CPU:
                 stmts.append(" return %d"%pc); term=True; break
         if loop_cont is not None:
             inner="".join("  "+st[1:]+"\n" for st in stmts)
-            src=("def _blk(cpu):\n x=cpu.x; m=cpu.m\n while True:\n"+inner
-                 +"  if %s: continue\n  return %d\n"%(loop_cont,loop_next))
+            src=(f"def _blk(cpu):\n x=cpu.x; m=cpu.m; _lc=0\n while True:\n"
+                 f"  if cpu.stopped: return {pc0}\n"
+                 +inner
+                 +f"  if {loop_cont}:\n   _lc+=1\n   if _lc>=4096: return {pc0}\n   continue\n"
+                 f"  return {loop_next}\n")
         else:
             src="def _blk(cpu):\n x=cpu.x; m=cpu.m\n"+"\n".join(stmts)+("\n" if term else "\n return %d\n"%pc)
+        cp=getattr(self.m,"_code_pages",None)
+        if cp is not None and insns:
+            for pg in range(pc0>>12,(insns[-1][0]>>12)+1): cp.add(pg)
         if getattr(self,"bbsrc",None) is not None: self.bbsrc[pc0]=src   # bit-neutraler Code-Dump-Hook
         g={"M64":M64,"_sx":_sx,"INS":insns}
         exec(src,g)
@@ -1121,6 +1167,8 @@ class CPU:
                 if merged and w0 in _SH: merged[-1]=merged[-1]+", "+t
                 else: merged.append(t)
             T=merged; self.tcache[pc]=T
+            cp=getattr(self.m,"_code_pages",None)
+            if cp is not None: cp.add(pc>>12)
         def imm(t):
             t=t.strip()
             if "," in t:  # '#0x90, lsl #12'
@@ -1210,15 +1258,17 @@ class CPU:
             else:
                 self.n=(nz>>3)&1; self.z=(nz>>2)&1; self.c=(nz>>1)&1; self.vf=nz&1
             return nxt
-        if m in ("and","orr","eor","ands","bic"):
+        if m in ("and","orr","eor","ands","bic","eon","orn","bics"):
             a=self.rd(T[1])
             b=imm(T[2]) if T[2].startswith("#") else self._regexpr(T[2])
             if m=="and" or m=="ands": r=a&b
             elif m=="orr": r=a|b
             elif m=="eor": r=a^b
-            elif m=="bic": r=a&~b
+            elif m=="bic" or m=="bics": r=a&~b
+            elif m=="eon": r=a^~b
+            elif m=="orn": r=a|~b
             r&=M64; self.wr(T[0],r)
-            if m=="ands":
+            if m in ("ands","bics"):
                 bits=32 if self.is32(T[0]) else 64; rr=r&((1<<bits)-1)
                 self.z=1 if rr==0 else 0; self.n=(rr>>(bits-1))&1
             return nxt
@@ -1421,20 +1471,20 @@ class CPU:
         if m=="smulh":
             self.wr(T[0], ((_sx(self.rd(T[1]),64)*_sx(self.rd(T[2]),64))>>64)&M64); return nxt
         if m=="mneg":
-            self.wr(T[0], (-self.rd(T[1]))&M64); return nxt
+            self.wr(T[0], (-(self.rd(T[1])*self.rd(T[2])))&M64); return nxt
         if m=="tst":
             a=self.rd(T[0]); b=imm(T[1]) if T[1].startswith("#") else self._regexpr(T[1])
             r=a&b; bits=32 if self.is32(T[0]) else 64; r&=(1<<bits)-1
             self.z=1 if r==0 else 0; self.n=(r>>(bits-1))&1; return nxt
         if m=="mvn":
             self.wr(T[0], (~self._regexpr(T[1]))&M64); return nxt
-        if m in ("neg","negs"):
+        if m=="negs":
+            b=self._regexpr(T[1])
+            res=self._setflags_sub(0,b,self.is32(T[0]))
+            self.wr(T[0],res); return nxt
+        if m=="neg":
             b=self._regexpr(T[1]); bits=32 if self.is32(T[0]) else 64; mask=(1<<bits)-1
-            res=(-b)&mask; self.wr(T[0],res&M64)
-            if m=="negs":
-                self.z=1 if (res&mask)==0 else 0; self.n=(res>>(bits-1))&1
-                self.c=1 if (0>=(b&mask)) and (b&mask)==0 else (1 if (b&mask)==0 else 0)
-            return nxt
+            self.wr(T[0],(-b)&mask); return nxt
         if m in("rev","rev16","rev32","rev64"):
             v=self.rd(T[1]); w=self.is32(T[0]); nb=4 if w else 8
             by=v.to_bytes(8,"little")[:nb]

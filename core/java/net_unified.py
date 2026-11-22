@@ -34,13 +34,15 @@ def normalize_java(net_log):
         # req/resp koennen Objekte (NetRequest/NetResponse) oder dicts (to_dict) sein
         method = req_d.get("method", "")
         url = req_d.get("url", "")
-        if not resp_d:
-            code, rb = "", 0
+        code = resp_d.get("code", "") if resp_d else ""
+        rb = resp_d.get("body_len", _b(resp_d.get("body", b""))) if resp_d else 0
+        g_info = _extract_graphql_info(url, req_d.get("body") or req_d.get("body_preview") or "")
+        if g_info and g_info.get("op_name"):
+            lbl = "%s %s [GQL: %s]  ->  %s (%sB)" % (method, url, g_info["op_name"], code, rb)
         else:
-            code = resp_d.get("code", "")
-            rb = resp_d.get("body_len", _b(resp_d.get("body", b"")))
+            lbl = "%s %s  ->  %s (%sB)" % (method, url, code, rb)
         rows.append({"source": "java", "kind": "http",
-                     "label": "%s %s  ->  %s (%sB)" % (method, url, code, rb),
+                     "label": lbl,
                      "method": method, "url": url, "code": code, "resp_bytes": rb,
                      "req": req_d, "resp": resp_d})
     return rows
@@ -136,6 +138,58 @@ def _try_decode_protobuf(body_raw_or_txt, hdrs):
     return ""
 
 
+def _extract_graphql_info(url, body_text):
+    """Erkennt GraphQL-Requests und extrahiert Operation, Query & Variablen lesbar."""
+    import json as _json
+    import re as _re
+
+    u_low = str(url or "").lower()
+    raw = str(body_text or "").strip()
+    if not raw and "/graphql" not in u_low:
+        return None
+    obj = None
+    if raw.startswith("{"):
+        try:
+            obj = _json.loads(raw)
+        except Exception:
+            obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("query"), str):
+        q_raw = obj["query"].strip()
+    elif "/graphql" in u_low and raw and any(k in raw for k in ("query ", "mutation ", "subscription ", "{")):
+        q_raw = raw
+        obj = {}
+    else:
+        return None
+    if not q_raw:
+        return None
+    if "/graphql" not in u_low and not _re.search(r"^\s*(?:query|mutation|subscription|\{)", q_raw):
+        return None
+
+    m_head = _re.search(r"\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)", q_raw)
+    op_type = m_head.group(1) if m_head else "query"
+    op_name = str((obj or {}).get("operationName") or (m_head.group(2) if m_head else "") or "").strip()
+    if not op_name:
+        m_f = _re.search(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)", q_raw)
+        if m_f:
+            op_name = m_f.group(1)
+
+    try:
+        from services.flutter_api_extractor_service import format_graphql_query
+        q_pretty = format_graphql_query(q_raw)
+    except Exception:
+        q_pretty = q_raw
+
+    variables = (obj or {}).get("variables")
+    if not isinstance(variables, dict):
+        variables = {}
+    return {
+        "op_type": op_type,
+        "op_name": op_name,
+        "query_pretty": q_pretty or q_raw,
+        "variables": variables,
+    }
+
+
 def _format_body_pretty(body_text, body_len=0):
     """Formatiert JSON lesbar mit Einrueckung oder liefert Klartext."""
     import json as _json
@@ -221,6 +275,39 @@ def format_net_entry_details(entry, net_mode=""):
             "mit einem leeren 200-OK-Dummy (0 Bytes) beantwortet. Stelle unten 'Modus: Live-HTTP' ein, "
             "um echte Server-Antworten abzurufen!",
         ])
+
+    g_info = _extract_graphql_info(url, req_body)
+    if g_info:
+        import json as _json
+        op_hdr = ("%s %s" % (g_info["op_type"], g_info["op_name"])).strip()
+        lines.extend([
+            "",
+            "=== GRAPHQL ===",
+            "Operation: %s" % (op_hdr or "query"),
+            "GraphQL-Query:",
+        ])
+        for qline in str(g_info["query_pretty"]).splitlines():
+            lines.append("  " + qline)
+        if g_info.get("variables"):
+            lines.append("Variablen:")
+            for vline in _json.dumps(g_info["variables"], indent=2, ensure_ascii=False).splitlines():
+                lines.append("  " + vline)
+        res_s = str(res_body or "").strip()
+        if res_s.startswith("{"):
+            try:
+                res_obj = _json.loads(res_s)
+                if isinstance(res_obj, dict):
+                    if res_obj.get("errors"):
+                        errs = res_obj["errors"]
+                        e0 = errs[0] if isinstance(errs, list) and errs else errs
+                        emsg = e0.get("message") or e0.get("errorType") or e0 if isinstance(e0, dict) else str(e0)
+                        lines.append("GraphQL-Antwort: FEHLER — %s" % emsg)
+                    elif "data" in res_obj:
+                        d = res_obj["data"]
+                        keys = ", ".join(str(k) for k in d.keys()) if isinstance(d, dict) else type(d).__name__
+                        lines.append("GraphQL-Antwort: data (%s)" % (keys or "ok"))
+            except Exception:
+                pass
 
     lines.extend(["", "=== REQUEST ===", "%s %s" % (method, url)])
     try:

@@ -140,6 +140,20 @@
    "order": 39,
    "popped": false
   },
+  "seams_ipc": {
+   "zone": "panel",
+   "group": 0,
+   "visible": true,
+   "order": 21,
+   "popped": false
+  },
+  "ui_tree": {
+   "zone": "right",
+   "group": 0,
+   "visible": true,
+   "order": 22,
+   "popped": false
+  },
   "status": {
    "zone": "status",
    "group": 0,

@@ -61,6 +61,12 @@ class NativeFusionLoader:
         self.log_fn = log_fn or (lambda _m: None)
         self.max_total_init_wall_s = float(max_total_init_wall_s)
         self._native_init_spent_s: float = 0.0
+        if self.eng is not None and self.stubs is not None:
+            try:
+                from core.java.virtual_clock import attach_virtual_clock_to_native_env
+                attach_virtual_clock_to_native_env(self.stubs, self.eng)
+            except Exception:
+                pass
         if self.eng is not None and self.ffi is not None:
             try:
                 from core.native.boringssl_seam import install_boringssl_seam

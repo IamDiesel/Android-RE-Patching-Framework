@@ -2,6 +2,7 @@
 """G13: GUI-Panels fuer Seams/IPC-Trigger & interaktiven UI-Tree-Inspector + Missing-Classifier."""
 from __future__ import annotations
 
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk
 from typing import Any, List, Optional, Tuple
@@ -104,6 +105,27 @@ class SeamsInspectorPanel(ttk.Frame):
         ttk.Entry(wsf, textvariable=self.ws_payload_var, width=42).pack(side="left", padx=4)
         ttk.Button(wsf, text="⚡ WS-Frame senden", command=self.send_ws_frame).pack(side="left", padx=4)
 
+        # 5) Uhrzeit & Datumsvorgabe (Virtual Clock)
+        cf = ttk.LabelFrame(self, text="Uhrzeit & Datumsvorgabe (Virtual Clock)")
+        cf.pack(fill="x", **pad)
+        self.clock_iso_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.clock_tz_var = tk.StringVar(value="Europe/Berlin")
+        self.clock_freeze_var = tk.BooleanVar(value=False)
+        ttk.Entry(cf, textvariable=self.clock_iso_var, width=19).pack(side="left", padx=(4, 2))
+        tz_cb = ttk.Combobox(
+            cf,
+            textvariable=self.clock_tz_var,
+            width=14,
+            values=("Europe/Berlin", "UTC", "America/New_York", "Asia/Tokyo"),
+        )
+        tz_cb.pack(side="left", padx=2)
+        ttk.Checkbutton(cf, text="Einfrieren", variable=self.clock_freeze_var, command=self.apply_clock).pack(side="left", padx=4)
+        ttk.Button(cf, text="🕒 Setzen", command=self.apply_clock).pack(side="left", padx=2)
+        ttk.Button(cf, text="+1 Std", command=lambda: self.shift_clock(hours=1)).pack(side="left", padx=2)
+        ttk.Button(cf, text="+1 Tag", command=lambda: self.shift_clock(days=1)).pack(side="left", padx=2)
+        ttk.Button(cf, text="-1 Tag", command=lambda: self.shift_clock(days=-1)).pack(side="left", padx=2)
+        ttk.Button(cf, text="Jetzt", command=self.reset_clock_now).pack(side="left", padx=2)
+
         self.status_lbl = ttk.Label(self, text="Bereit", anchor="w")
         self.status_lbl.pack(fill="x", padx=6, pady=(2, 4))
 
@@ -189,6 +211,71 @@ class SeamsInspectorPanel(ttk.Frame):
         self._refresh_screens()
         self.status_lbl.config(text=f"WS-Frame -> {'injiziert' if ok else 'kein WebSocket offen'}")
         return ok
+
+    def apply_clock(self) -> dict:
+        from core.java.virtual_clock import parse_datetime_spec, set_virtual_clock
+        iso_str = self.clock_iso_var.get().strip()
+        tz_name = self.clock_tz_var.get().strip() or None
+        frozen = bool(self.clock_freeze_var.get())
+        try:
+            parse_datetime_spec(iso_str, tz_name)
+        except Exception as exc:
+            self.status_lbl.config(text=f"Uhrzeit-Fehler: {exc}")
+            return {}
+        preset = {"iso_str": iso_str, "tz_name": tz_name, "frozen": frozen}
+        self.ctrl._clock_preset = preset
+        stubs, _ = self._get_stubs_runner()
+        if stubs is None:
+            self.status_lbl.config(text=f"Uhrzeit vorgemerkt: {iso_str} ({tz_name or 'System'})")
+            return dict(preset)
+        st = set_virtual_clock(stubs, **preset)
+        self.clock_iso_var.set(st["iso"])
+        self._refresh_screens()
+        fr_txt = " [eingefroren]" if st.get("frozen") else ""
+        self.status_lbl.config(text=f"Virtuelle Uhr: {st['iso']} ({st['tz']}){fr_txt}")
+        return st
+
+    def shift_clock(self, hours: float = 0.0, days: float = 0.0, minutes: float = 0.0) -> dict:
+        from core.java.virtual_clock import parse_datetime_spec, resolve_tzinfo, shift_virtual_clock
+        stubs, _ = self._get_stubs_runner()
+        tz_name = self.clock_tz_var.get().strip() or None
+        if stubs is None:
+            try:
+                base_ms = parse_datetime_spec(self.clock_iso_var.get().strip(), tz_name)
+            except Exception as exc:
+                self.status_lbl.config(text=f"Uhrzeit-Fehler: {exc}")
+                return {}
+            delta_ms = int(round(((days * 86400.0) + (hours * 3600.0) + (minutes * 60.0)) * 1000.0))
+            new_dt = datetime.fromtimestamp((base_ms + delta_ms) / 1000.0, tz=resolve_tzinfo(tz_name))
+            self.clock_iso_var.set(new_dt.strftime("%Y-%m-%d %H:%M:%S"))
+            return self.apply_clock()
+        st = shift_virtual_clock(stubs, days=days, hours=hours, minutes=minutes)
+        self.clock_iso_var.set(st["iso"])
+        self.ctrl._clock_preset = {
+            "iso_str": st["iso"],
+            "tz_name": tz_name,
+            "frozen": bool(self.clock_freeze_var.get()),
+        }
+        self._refresh_screens()
+        fr_txt = " [eingefroren]" if st.get("frozen") else ""
+        self.status_lbl.config(text=f"Virtuelle Uhr: {st['iso']} ({st['tz']}){fr_txt}")
+        return st
+
+    def reset_clock_now(self) -> dict:
+        from core.java.virtual_clock import reset_virtual_clock_to_host
+        self.ctrl._clock_preset = None
+        self.clock_freeze_var.set(False)
+        stubs, _ = self._get_stubs_runner()
+        if stubs is None:
+            now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.clock_iso_var.set(now_s)
+            self.status_lbl.config(text=f"Uhrzeit auf Systemzeit: {now_s}")
+            return {"iso": now_s, "frozen": False, "custom": False}
+        st = reset_virtual_clock_to_host(stubs)
+        self.clock_iso_var.set(st["iso"])
+        self._refresh_screens()
+        self.status_lbl.config(text=f"Uhrzeit auf Systemzeit: {st['iso']}")
+        return st
 
 
 class UiTreeInspectorPanel(ttk.Frame):

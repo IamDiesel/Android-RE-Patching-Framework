@@ -9,8 +9,11 @@ import os
 import re
 import glob
 import json
+import time
 import shutil
 import threading
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional
 
 from core.infrastructure.command_runner import CommandRunner
 from services.patch_service import PatchService
@@ -24,6 +27,22 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _adb(ctx) -> str:
     return ctx.cfg.paths.get("ADB", "adb")
+
+
+def _base_dir(ctx) -> str:
+    if ctx is not None and getattr(ctx, "cfg", None) is not None:
+        b = (getattr(ctx.cfg, "config", None) or {}).get("BASE_DIR")
+        if b:
+            return b
+    return _REPO
+
+
+def _source_dir(ctx) -> str:
+    if ctx is not None and getattr(ctx, "cfg", None) is not None:
+        sd = (getattr(ctx.cfg, "paths", None) or {}).get("SOURCE_DIR")
+        if sd:
+            return sd
+    return os.path.join(_base_dir(ctx), "source")
 
 
 # ============================================================ A: Workspace
@@ -45,6 +64,7 @@ def workspace_status(ctx):
 
 
 def workspace_set_config(ctx, key, value):
+    global _RAM_CACHE
     if isinstance(value, str):
         low = value.strip().lower()
         if low in ("true", "false"):
@@ -53,6 +73,8 @@ def workspace_set_config(ctx, key, value):
             value = int(value)
     ctx.cfg.config[key] = value
     ctx.cfg.save()
+    if key in ("APP_PACKAGE", "MANIFEST_STRATEGY", "BASE_DIR"):
+        _RAM_CACHE = None
     return f"gesetzt: {key} = {value!r} (in config.json gespeichert)"
 
 
@@ -61,6 +83,186 @@ def workspace_prepare_hint(ctx):
             "GUI: 'App Manager' -> App importieren, dann 'Workspace' -> Pipeline "
             "PREPARE_WORKSPACE (Merge Split APKs + Decompile).\n"
             "Danach liegt der Smali-Baum unter source/<APP_PACKAGE>/<unpacked>/smali*/.")
+
+
+def workspace_renew_id(ctx):
+    """Generiert eine neue Patch-Session-ID (PID-YYYYmmdd-HHMMSS) inkl. Archiv-Ordner."""
+    import datetime as _dt
+    pid = f"PID-{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    arch_base = (getattr(ctx.cfg, "paths", None) or {}).get("ARCHIVE_DIR") or os.path.join(_base_dir(ctx), "archives")
+    arch_path = os.path.join(arch_base, pid)
+    os.makedirs(arch_path, exist_ok=True)
+    ctx.cfg.config["CURRENT_PATCH_ID"] = pid
+    ctx.cfg.save()
+    return {"ok": True, "patch_id": pid, "archive_dir": arch_path}
+
+
+def app_list_local(ctx):
+    """Listet lokal importierte Apps unter source/ samt APKs, Entpack-Status und UI-Toolkit."""
+    from core.java.runtime_detect import detect_runtime
+    sdir = _source_dir(ctx)
+    active_pkg = (getattr(ctx.cfg, "config", None) or {}).get("APP_PACKAGE", "")
+    apps = []
+    if os.path.isdir(sdir):
+        for entry in sorted(os.listdir(sdir)):
+            ad = os.path.join(sdir, entry)
+            if not os.path.isdir(ad):
+                continue
+            apks = sorted(f for f in os.listdir(ad) if f.lower().endswith(".apk"))
+            unpacked = sorted(d for d in os.listdir(ad)
+                              if d.startswith("base_unpacked_") and os.path.isdir(os.path.join(ad, d)))
+            rt = None
+            if unpacked:
+                try:
+                    rt = detect_runtime(app_dir=os.path.join(ad, unpacked[0]), max_files=4000)
+                except Exception:
+                    rt = None
+            apps.append({
+                "package": entry,
+                "active": (entry == active_pkg),
+                "path": ad,
+                "apks": apks,
+                "unpacked_dirs": unpacked,
+                "runtime": rt,
+            })
+    return {"ok": True, "source_dir": sdir, "active_package": active_pkg, "count": len(apps), "apps": apps}
+
+
+def app_import(ctx, path, package_name="", switch_active=True):
+    """Importiert einen lokalen APK-/Unpacked-Ordner oder eine einzelne .apk nach source/<pkg>/ + Auto-Config."""
+    raw = os.path.abspath(str(path or "").strip())
+    if not raw or not os.path.exists(raw):
+        return {"ok": False, "hinweis": f"Pfad nicht gefunden: {path!r}"}
+
+    src_is_file = os.path.isfile(raw)
+    folder = os.path.dirname(raw) if src_is_file else raw
+    if not src_is_file and os.path.basename(folder) in ("base_unpacked_apktool", "base_unpacked_apkeditor"):
+        folder = os.path.dirname(folder)
+
+    if src_is_file:
+        if not raw.lower().endswith(".apk"):
+            return {"ok": False, "hinweis": "Datei muss auf .apk enden"}
+        apks = [os.path.basename(raw)]
+        unpacked = []
+    else:
+        apks = sorted(f for f in os.listdir(folder) if f.lower().endswith(".apk"))
+        unpacked = sorted(d for d in ("base_unpacked_apktool", "base_unpacked_apkeditor")
+                          if os.path.isdir(os.path.join(folder, d)))
+        if not apks and not unpacked:
+            return {"ok": False, "hinweis": "Ordner enthaelt weder .apk noch base_unpacked_apktool / base_unpacked_apkeditor"}
+
+    pkg = str(package_name or "").strip().replace(" ", "_")
+    if not pkg and unpacked:
+        try:
+            from core.java.manifest import parse_manifest
+            pkg = getattr(parse_manifest(os.path.join(folder, unpacked[0])), "package", "") or ""
+        except Exception:
+            pkg = ""
+    if not pkg:
+        pkg = (os.path.splitext(os.path.basename(raw))[0] if src_is_file else os.path.basename(folder)).replace(" ", "_")
+    pkg = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in pkg).strip("._") or "imported.app"
+
+    sdir = _source_dir(ctx)
+    target = os.path.join(sdir, pkg)
+    os.makedirs(target, exist_ok=True)
+    copied = []
+    if src_is_file:
+        dst_file = os.path.join(target, os.path.basename(raw))
+        if os.path.abspath(raw) != os.path.abspath(dst_file):
+            shutil.copy2(raw, dst_file)
+        copied.append(os.path.basename(raw))
+        base_dst = os.path.join(target, "base.apk")
+        if not os.path.exists(base_dst):
+            shutil.copy2(dst_file, base_dst)
+            copied.append("base.apk")
+    else:
+        for f in apks:
+            sf = os.path.join(folder, f)
+            df = os.path.join(target, f)
+            if os.path.abspath(sf) != os.path.abspath(df):
+                shutil.copy2(sf, df)
+            copied.append(f)
+        for d in unpacked:
+            sd = os.path.join(folder, d)
+            dd = os.path.join(target, d)
+            if os.path.abspath(sd) != os.path.abspath(dd):
+                shutil.copytree(sd, dd, dirs_exist_ok=True)
+            copied.append(d + "/")
+
+    if switch_active:
+        global _RAM_CACHE
+        _RAM_CACHE = None
+        ctx.cfg.config["APP_PACKAGE"] = pkg
+        if "split_config.arm64_v8a.apk" in copied:
+            ctx.cfg.config["SPLIT_NAME"] = "split_config.arm64_v8a"
+        elif "split_config.x86_64.apk" in copied:
+            ctx.cfg.config["SPLIT_NAME"] = "split_config.x86_64"
+        else:
+            ctx.cfg.config["SPLIT_NAME"] = pkg
+        ctx.cfg.save()
+
+    return {
+        "ok": True,
+        "package": pkg,
+        "target_folder": target,
+        "copied": copied,
+        "switched_active": bool(switch_active),
+    }
+
+
+def app_pull_apk(ctx, package="", switch_active=True):
+    """Zieht Base + Split-APKs der gewaehlten oder aktiven App per ADB nach source/<pkg>/."""
+    pkg = str(package or "").strip() or (ctx.cfg.config.get("APP_PACKAGE", "") or "").strip()
+    if not pkg:
+        return {"ok": False, "hinweis": "Kein Package-Name angegeben und APP_PACKAGE ist leer."}
+    sdir = _source_dir(ctx)
+    target = os.path.join(sdir, pkg)
+    os.makedirs(target, exist_ok=True)
+
+    res = CommandRunner.run_blocking(f'"{_adb(ctx)}" shell pm path {pkg}', target, timeout=20)
+    if res.returncode != 0:
+        return {"ok": False, "package": pkg, "hinweis": (res.stderr or res.stdout).strip() or "adb pm path fehlgeschlagen"}
+    paths = [ln.replace("package:", "").strip() for ln in (res.stdout or "").splitlines() if ln.strip().startswith("package:")]
+    if not paths:
+        return {"ok": False, "package": pkg, "hinweis": f"Keine APK-Pfade fuer {pkg} gefunden."}
+
+    pulled = []
+    errors = []
+    for rp in paths:
+        pr = CommandRunner.run_blocking(f'"{_adb(ctx)}" pull "{rp}" "{target}"', target, timeout=180)
+        if pr.returncode == 0:
+            pulled.append(os.path.basename(rp))
+        else:
+            errors.append(f"{rp}: {(pr.stderr or pr.stdout).strip()}")
+
+    arch = "ARM32"
+    for rp in paths:
+        if "arm64_v8a" in rp or "arm64" in rp:
+            arch = "ARM64"
+            break
+        if "x86_64" in rp:
+            arch = "x86_64"
+            break
+
+    if switch_active and pulled:
+        global _RAM_CACHE
+        _RAM_CACHE = None
+        ctx.cfg.config["APP_PACKAGE"] = pkg
+        if arch == "ARM64":
+            ctx.cfg.config["SPLIT_NAME"] = "split_config.arm64_v8a"
+        elif arch == "x86_64":
+            ctx.cfg.config["SPLIT_NAME"] = "split_config.x86_64"
+        ctx.cfg.save()
+
+    return {
+        "ok": bool(pulled) and not errors,
+        "package": pkg,
+        "target_folder": target,
+        "architecture": arch,
+        "pulled_files": pulled,
+        "errors": errors,
+        "switched_active": bool(switch_active and pulled),
+    }
 
 
 # ============================================================ B: Smali
@@ -348,6 +550,204 @@ def _xref_fmt(symbol, res, scanned, truncated, timed_out):
     return head + ("\n" + "\n".join(res) if res else "")
 
 
+def smali_callgraph(ctx, symbol, depth=1, max_nodes=200):
+    """Erstellt ausgehende Callees (bis depth=1..3) und eingehende Caller einer Smali-Methode."""
+    from services.callgraph_service import is_system_api
+    base, roots = _smali_roots(ctx)
+    if not roots:
+        return {"ok": False, "hinweis": "Kein Smali-Baum vorhanden."}
+    sym = str(symbol or "").strip()
+    if not sym:
+        return {"ok": False, "hinweis": "symbol fehlt (z. B. Lpkg/Cls;->methode oder Methodenname)."}
+
+    max_d = max(1, min(3, int(depth or 1)))
+    cap = max(10, int(max_nodes or 200))
+    invoke_re = re.compile(r'invoke-\w+(?:/range)?\s+\{[^}]*\},\s*(L[^;\s]+;->[^\s(]+\([^\n]*)')
+    cls_hdr_re = re.compile(r'^\s*\.class\s+.*?(L[^;\s]+;)')
+
+    methods_by_id = {}
+    ids_by_name = {}
+    scanned = 0
+    for rdir in roots:
+        for dirpath, _dirs, files in os.walk(rdir):
+            for fn in files:
+                if not fn.endswith(".smali"):
+                    continue
+                scanned += 1
+                fp = os.path.join(dirpath, fn)
+                rel = os.path.relpath(fp, base).replace("\\", "/")
+                try:
+                    lines = open(fp, "r", encoding="utf-8", errors="replace").read().splitlines()
+                except Exception:
+                    continue
+                cls_desc = None
+                cur_id = None
+                cur_callees = []
+                for ln in lines:
+                    s = ln.strip()
+                    if cls_desc is None and s.startswith(".class "):
+                        cm = cls_hdr_re.match(s)
+                        if cm:
+                            cls_desc = cm.group(1)
+                    elif s.startswith(".method "):
+                        sig_tok = s.split()[-1] if s.split() else ""
+                        if cls_desc and "(" in sig_tok:
+                            cur_id = f"{cls_desc}->{sig_tok}"
+                            cur_callees = []
+                    elif s.startswith(".end method") and cur_id:
+                        methods_by_id[cur_id] = {"id": cur_id, "file": rel, "callees": cur_callees}
+                        mname = cur_id.split("->", 1)[1].split("(", 1)[0]
+                        ids_by_name.setdefault(mname, []).append(cur_id)
+                        cur_id = None
+                        cur_callees = []
+                    elif cur_id:
+                        im = invoke_re.search(s)
+                        if im:
+                            tgt = im.group(1).strip()
+                            if tgt not in cur_callees:
+                                cur_callees.append(tgt)
+
+    root_ids = []
+    if sym in methods_by_id:
+        root_ids = [sym]
+    elif "->" in sym:
+        root_ids = [mid for mid in methods_by_id if mid.startswith(sym)]
+    else:
+        for mid in methods_by_id:
+            if mid.split("->", 1)[1].split("(", 1)[0] == sym:
+                root_ids.append(mid)
+        if not root_ids:
+            root_ids = [mid for mid in methods_by_id if sym in mid]
+    root_ids = root_ids[:20]
+
+    edges = []
+    visited = set()
+    frontier = list(root_ids)
+    for _lvl in range(max_d):
+        nxt = []
+        for mid in frontier:
+            if mid in visited:
+                continue
+            visited.add(mid)
+            info = methods_by_id.get(mid)
+            if not info:
+                continue
+            for cal in info["callees"]:
+                edges.append({"from": mid, "to": cal, "system_api": is_system_api(cal)})
+                if len(edges) >= cap:
+                    break
+                if cal in methods_by_id and cal not in visited:
+                    nxt.append(cal)
+            if len(edges) >= cap:
+                break
+        frontier = nxt
+        if not frontier or len(edges) >= cap:
+            break
+
+    root_set = set(root_ids)
+    callers = []
+    for mid, info in methods_by_id.items():
+        if any((c in root_set) or (sym in c) for c in info["callees"]):
+            callers.append({"id": mid, "file": info["file"]})
+            if len(callers) >= cap:
+                break
+
+    return {
+        "ok": True,
+        "symbol": sym,
+        "depth": max_d,
+        "scanned_files": scanned,
+        "indexed_methods": len(methods_by_id),
+        "roots": root_ids,
+        "edges": edges,
+        "callers": callers,
+    }
+
+
+def app_manifest_info(ctx, app_root=None):
+    """Liest AndroidManifest.xml (Activities, Launcher, Permissions, Exported, Deep-Links) & APK-Signatur-Certs."""
+    import hashlib as _hl
+    import zipfile as _zf
+    from xml.etree import ElementTree as _ET
+    from core.java.manifest import ANDROID_NS, parse_manifest
+
+    root = _resolve_app_root_for_extract(ctx, app_root)
+    if not root:
+        return {"ok": False, "hinweis": "Kein entpackter App-Root gefunden (app_root angeben oder APK entpacken)."}
+
+    m_path = os.path.join(root, "AndroidManifest.xml") if os.path.isdir(root) else root
+    if not os.path.isfile(m_path):
+        return {"ok": False, "hinweis": f"Keine AndroidManifest.xml unter {root} gefunden."}
+
+    parsed = parse_manifest(root).to_dict()
+    ans = "{%s}" % ANDROID_NS
+    xml_root = _ET.parse(m_path).getroot()
+    app_el = xml_root.find("application")
+    uses_sdk = xml_root.find("uses-sdk")
+
+    permissions = []
+    for pe in xml_root.findall("uses-permission") + xml_root.findall("uses-permission-sdk-23"):
+        pn = pe.get(ans + "name") or pe.get("name")
+        if pn and pn not in permissions:
+            permissions.append(pn)
+
+    exported = []
+    if app_el is not None:
+        for tag in ("activity", "activity-alias", "service", "receiver", "provider"):
+            for comp in app_el.findall(tag):
+                cname = comp.get(ans + "name") or comp.get("name") or ""
+                exp = comp.get(ans + "exported")
+                has_filter = bool(comp.findall("intent-filter"))
+                if exp == "true" or (exp is None and has_filter):
+                    exported.append({"kind": tag, "name": cname, "explicit": (exp == "true"), "intent_filter": has_filter})
+
+    apk_certs = []
+    search_dirs = [os.path.dirname(os.path.abspath(m_path)), os.path.dirname(os.path.dirname(os.path.abspath(m_path)))]
+    seen_apks = set()
+    for sd in search_dirs:
+        if not sd or not os.path.isdir(sd):
+            continue
+        for fn in sorted(os.listdir(sd)):
+            if not fn.lower().endswith(".apk"):
+                continue
+            ap = os.path.join(sd, fn)
+            if ap in seen_apks or not os.path.isfile(ap):
+                continue
+            seen_apks.add(ap)
+            try:
+                with _zf.ZipFile(ap, "r") as zf:
+                    for zn in zf.namelist():
+                        up = zn.upper()
+                        if up.startswith("META-INF/") and up.endswith((".RSA", ".DSA", ".EC")):
+                            raw_cert = zf.read(zn)
+                            apk_certs.append({
+                                "apk": fn,
+                                "entry": zn,
+                                "bytes": len(raw_cert),
+                                "sha256": _hl.sha256(raw_cert).hexdigest(),
+                            })
+            except Exception:
+                pass
+            if apk_certs:
+                break
+
+    return {
+        "ok": True,
+        "manifest_path": m_path,
+        "version_code": xml_root.get(ans + "versionCode") or xml_root.get("versionCode"),
+        "version_name": xml_root.get(ans + "versionName") or xml_root.get("versionName"),
+        "min_sdk": (uses_sdk.get(ans + "minSdkVersion") if uses_sdk is not None else None),
+        "target_sdk": (uses_sdk.get(ans + "targetSdkVersion") if uses_sdk is not None else None),
+        "debuggable": (app_el.get(ans + "debuggable") == "true") if app_el is not None else False,
+        "allow_backup": (app_el.get(ans + "allowBackup") if app_el is not None else None),
+        "network_security_config": (app_el.get(ans + "networkSecurityConfig") if app_el is not None else None),
+        "permissions": permissions,
+        "exported_components": exported,
+        "apk_certs": apk_certs,
+        **parsed,
+    }
+
+
 # ============================================================ C: LibForge
 def _strip_ver(text):
     import re as _re
@@ -453,6 +853,47 @@ def lib_update(ctx, lib_id, source_code=None, abi=None, api_level=None,
             _auto = mgr.set_active(lib.id, bool(active))
     _tail = f" (auto-deaktiviert: {len(_auto)})" if _auto else ""
     return f"aktualisiert: {lib.name} v{getattr(lib,'version','?')} (id={lib.id}) — {lib.description}{warn}{_tail}"
+
+
+def lib_import_so(ctx, name, so_path, version="1.0", description="", abi="arm64-v8a"):
+    """Importiert eine fertige .so ohne Quellcode/NDK-Build direkt in LibForge."""
+    src = os.path.abspath(str(so_path or "").strip())
+    if not src or not os.path.isfile(src):
+        return {"ok": False, "hinweis": f".so-Datei nicht gefunden: {so_path!r}"}
+    mgr = ctx.libs()
+    desc = _compose_desc(version, description or f"Importiert aus {os.path.basename(src)}")
+    lib = mgr.import_so(name=str(name or "").strip(), src_path=src, description=desc, abi=abi or "arm64-v8a")
+    lib.version = str(version or "1.0")
+    mgr.save()
+    return {
+        "ok": True,
+        "id": lib.id,
+        "name": lib.name,
+        "version": lib.version,
+        "abi": lib.abi,
+        "active": bool(lib.active),
+        "so": lib.so_relpath,
+        "description": lib.description,
+    }
+
+
+def lib_set_active(ctx, ref, active=True):
+    """Schaltet eine LibForge-Lib (Name oder ID) aktiv oder inaktiv."""
+    mgr, lib = _find_lib(ctx, ref)
+    if not lib:
+        return {"ok": False, "hinweis": f"Lib nicht gefunden: {ref!r}"}
+    want = bool(active)
+    if want and not (lib.so_relpath and os.path.exists(mgr.abspath(lib.so_relpath))):
+        return {"ok": False, "id": lib.id, "name": lib.name,
+                "hinweis": "Keine kompilierte/importierte .so vorhanden — Aktivierung nicht moeglich."}
+    deact = mgr.set_active(lib.id, want) or []
+    return {
+        "ok": True,
+        "id": lib.id,
+        "name": lib.name,
+        "active": bool(lib.active),
+        "auto_deactivated": [getattr(x, "id", x) for x in deact],
+    }
 
 
 # ============================================================ D: Patches/Favoriten
@@ -936,6 +1377,73 @@ def patch_clear_active(ctx):
     return {"cleared": n, "active_count": 0, "persisted": persisted}
 
 
+def patch_fuzzy_match(ctx, orig="", file="", favorite_ref="", deep_search=False,
+                      threshold=0.80, max_results=20):
+    """Findet verschobene Smali-Methoden/Patches nach App-Update per FuzzingEngine wieder."""
+    import difflib
+    from core.fuzzing_engine import FuzzingEngine
+
+    target_file = str(file or "").replace("\\", "/")
+    orig_code = str(orig or "")
+    if favorite_ref and (not orig_code or not target_file):
+        fs = ctx.favorites()
+        fi = _fav_index(fs, favorite_ref)
+        if fi < 0:
+            return {"ok": False, "hinweis": f"Favorit '{favorite_ref}' nicht gefunden."}
+        fav = fs.favs[fi]
+        for p in (fav.get("patches") or [fav]):
+            if (p.get("type") or "smali") == "smali" and p.get("orig"):
+                orig_code = orig_code or p.get("orig", "")
+                target_file = target_file or str(p.get("file", "")).replace("\\", "/")
+                break
+    if not orig_code.strip():
+        return {"ok": False, "hinweis": "orig (Smali-Code) oder favorite_ref mit smali-Patch erforderlich."}
+
+    base, roots = _smali_roots(ctx)
+    if not roots:
+        return {"ok": False, "hinweis": "Kein Smali-Baum vorhanden."}
+    ram_cache = []
+    for rdir in roots:
+        for dirpath, _dirs, files in os.walk(rdir):
+            for fn in files:
+                if not fn.endswith(".smali"):
+                    continue
+                fp = os.path.join(dirpath, fn)
+                rel = os.path.relpath(fp, base).replace("\\", "/")
+                try:
+                    ram_cache.append((rel, open(fp, "r", encoding="utf-8", errors="replace").read()))
+                except Exception:
+                    pass
+    m = re.search(r'\.method.*? ([<a-zA-Z0-9_$\-]+)\(', orig_code)
+    if m and not deep_search:
+        cands = FuzzingEngine.fuzz_by_method_name(m.group(1), ram_cache)
+    else:
+        cands = FuzzingEngine.fuzz_by_content_snippet(
+            orig_code, target_file, ram_cache, threshold=float(threshold), deep_search=bool(deep_search)
+        )
+
+    norm_orig = FuzzingEngine._normalize_smali(orig_code)
+    scored = []
+    for c in cands:
+        nc = FuzzingEngine._normalize_smali(c.get("code", ""))
+        sim = round(difflib.SequenceMatcher(None, norm_orig, nc).ratio(), 4) if norm_orig else 0.0
+        scored.append({
+            "file": str(c.get("file", "")).replace("\\", "/"),
+            "sig": c.get("sig", ""),
+            "similarity": sim,
+            "code": c.get("code", "")[:4000],
+        })
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    lim = max(1, int(max_results or 20))
+    return {
+        "ok": True,
+        "deep_search": bool(deep_search),
+        "target_file": target_file,
+        "count": len(scored),
+        "candidates": scored[:lim],
+    }
+
+
 # ============================================================ F: Device (info=O)
 def device_info(ctx):
     from services.adb_devices import list_devices, resolve_serial, apply_android_serial
@@ -960,6 +1468,84 @@ def ghostlog_capture(ctx, lines=200):
     if r.returncode != 0:
         return f"[kein ghost.log lesbar] {(r.stderr or r.stdout).strip()}"
     return r.stdout.strip() or "(ghost.log leer)"
+
+
+def logcat_capture(ctx, lines=300, filter_str="", package_only=True, seconds=0.0):
+    """Liest gefilterten Logcat-Puffer vom verbundenen ADB-Geraet (optional mit kurzer Wartezeit)."""
+    import time as _t
+    wait_s = min(max(0.0, float(seconds or 0.0)), 10.0)
+    if wait_s > 0.0:
+        _t.sleep(wait_s)
+    want = max(10, int(lines or 300))
+    dump_n = max(want * 4, 500)
+    r = CommandRunner.run_blocking(f'"{_adb(ctx)}" logcat -d -t {dump_n}', ".", timeout=15)
+    if r.returncode != 0:
+        return {"ok": False, "hinweis": (r.stderr or r.stdout).strip() or "adb logcat fehlgeschlagen"}
+    raw_lines = (r.stdout or "").splitlines()
+    pkg = (ctx.cfg.config.get("APP_PACKAGE", "") or "").strip()
+    pid = ""
+    if package_only and pkg:
+        pr = CommandRunner.run_blocking(f'"{_adb(ctx)}" shell pidof -s {pkg}', ".", timeout=5)
+        if pr.returncode == 0:
+            pid = (pr.stdout or "").strip().split()[0] if (pr.stdout or "").strip() else ""
+        filtered = []
+        for ln in raw_lines:
+            if (pid and f" {pid} " in f" {ln} ") or (pkg in ln):
+                filtered.append(ln)
+    else:
+        filtered = raw_lines
+
+    flt = str(filter_str or "").strip()
+    if flt:
+        try:
+            rx = re.compile(flt, re.IGNORECASE)
+            filtered = [ln for ln in filtered if rx.search(ln)]
+        except re.error:
+            low = flt.lower()
+            filtered = [ln for ln in filtered if low in ln.lower()]
+    tail = filtered[-want:]
+    return {"ok": True, "package": pkg, "pid": pid, "count": len(tail), "lines": tail}
+
+
+def app_start(ctx, package="", intent_cmd="", stop_first=False):
+    """Startet die App / einen Intent per ADB auf dem verbundenen Geraet (gated: app_start)."""
+    pkg = str(package or "").strip() or (ctx.cfg.config.get("APP_PACKAGE", "") or "").strip()
+    if not pkg:
+        return {"ok": False, "hinweis": "Kein Package angegeben und APP_PACKAGE ist leer."}
+    adb = _adb(ctx)
+    if stop_first:
+        CommandRunner.run_blocking(f'"{adb}" shell am force-stop {pkg}', ".", timeout=8)
+    ic = str(intent_cmd or "").strip()
+    if ic:
+        app_name = pkg.split(".")[-1] if "." in pkg else pkg
+        fmt = ic.replace("{APP_PACKAGE}", pkg).replace("{APP_NAME}", app_name)
+        if not fmt.startswith("shell "):
+            fmt = "shell " + fmt
+        cmd = f'"{adb}" {fmt}'
+    else:
+        cmd = f'"{adb}" shell monkey -p {pkg} -c android.intent.category.LAUNCHER 1'
+    r = CommandRunner.run_blocking(cmd, ".", timeout=15)
+    return {
+        "ok": r.returncode == 0,
+        "package": pkg,
+        "command": cmd,
+        "stdout": (r.stdout or "").strip(),
+        "stderr": (r.stderr or "").strip(),
+    }
+
+
+def app_stop(ctx, package=""):
+    """Stoppt die App per `adb shell am force-stop` (gated: app_start)."""
+    pkg = str(package or "").strip() or (ctx.cfg.config.get("APP_PACKAGE", "") or "").strip()
+    if not pkg:
+        return {"ok": False, "hinweis": "Kein Package angegeben und APP_PACKAGE ist leer."}
+    r = CommandRunner.run_blocking(f'"{_adb(ctx)}" shell am force-stop {pkg}', ".", timeout=10)
+    return {
+        "ok": r.returncode == 0,
+        "package": pkg,
+        "stdout": (r.stdout or "").strip(),
+        "stderr": (r.stderr or "").strip(),
+    }
 
 
 def log_export(ctx):
@@ -1090,6 +1676,129 @@ def api_rules_set(ctx, rules_json, append=False):
     with open(p, "w", encoding="utf-8") as fh:
         json.dump(final, fh, ensure_ascii=False, indent=2)
     return {"ok": True, "count": len(final), "rules": final, "path": p}
+
+
+def api_update(ctx, req_id, comment=None, req_body=None, res_body=None):
+    """Aktualisiert Kommentar, Request- oder Response-Body eines Eintrags in api_traffic.db."""
+    from services.api_db_service import ApiDbService
+    dbp = ctx.cfg.paths.get("API_DB") or os.path.join(_base_dir(ctx), "data", "api_traffic.db")
+    if not os.path.exists(dbp):
+        return {"ok": False, "hinweis": "Keine Traffic-DB vorhanden."}
+    svc = ApiDbService(dbp)
+    row = svc.get_request_by_id(int(req_id))
+    if not row:
+        return {"ok": False, "hinweis": f"Request-ID {req_id} nicht gefunden."}
+    _rqh, old_rqb, _rsh, old_rsb, old_cmt = row
+    upd = svc.update_request(
+        int(req_id),
+        old_cmt if comment is None else str(comment),
+        old_rqb if req_body is None else str(req_body),
+        old_rsb if res_body is None else str(res_body),
+    )
+    keys = ["id", "timestamp", "method", "url", "status",
+            "req_headers", "req_body", "res_headers", "res_body", "comment"]
+    return {"ok": True, "record": dict(zip(keys, upd)) if upd else None}
+
+
+def api_replay(ctx, req_id=0, method="", url="", headers_json="", body="", record=True, timeout_s=12.0):
+    """Sendet einen Request aus api_traffic.db (req_id) oder frei per HTTP erneut (optional mit DB-Protokoll)."""
+    import time as _t
+    import urllib.error as _ue
+    import urllib.request as _ur
+    from services.api_db_service import ApiDbService
+
+    dbp = ctx.cfg.paths.get("API_DB") or os.path.join(_base_dir(ctx), "data", "api_traffic.db")
+    base_method, base_url, base_hdrs, base_body = "GET", "", {}, ""
+    if int(req_id or 0) > 0 and os.path.exists(dbp):
+        rows = ApiDbService(dbp).get_full_requests_by_ids([int(req_id)])
+        if not rows:
+            return {"ok": False, "hinweis": f"Request-ID {req_id} nicht gefunden."}
+        _r = rows[0]
+        base_method = _r[2] or "GET"
+        base_url = _r[3] or ""
+        try:
+            hd = json.loads(_r[5] or "{}") if isinstance(_r[5], str) else (_r[5] or {})
+            if isinstance(hd, dict):
+                base_hdrs = {str(k): str(v) for k, v in hd.items()}
+        except Exception:
+            pass
+        base_body = _r[6] or ""
+
+    eff_method = (str(method or "").strip() or base_method or "GET").upper()
+    eff_url = str(url or "").strip() or base_url
+    if not eff_url:
+        return {"ok": False, "hinweis": "url oder gueltige req_id erforderlich."}
+    eff_hdrs = dict(base_hdrs)
+    if headers_json:
+        try:
+            parsed_h = json.loads(headers_json) if isinstance(headers_json, str) else dict(headers_json)
+            if isinstance(parsed_h, dict):
+                eff_hdrs.update({str(k): str(v) for k, v in parsed_h.items()})
+        except Exception as e:
+            return {"ok": False, "hinweis": f"headers_json ungueltig: {e!r}"}
+    eff_body = base_body if body == "" else str(body)
+    body_bytes = eff_body.encode("utf-8", "replace") if (eff_body and eff_method not in ("GET", "HEAD")) else None
+
+    req_obj = _ur.Request(eff_url, data=body_bytes, method=eff_method)
+    for k, v in eff_hdrs.items():
+        try:
+            req_obj.add_header(k, v)
+        except Exception:
+            pass
+
+    status_code = 0
+    res_hdrs = {}
+    res_text = ""
+    err_msg = ""
+    to = min(max(1.0, float(timeout_s or 12.0)), 30.0)
+    try:
+        with _ur.urlopen(req_obj, timeout=to) as resp:
+            status_code = int(getattr(resp, "status", 200) or 200)
+            res_hdrs = {str(k): str(v) for k, v in resp.headers.items()}
+            res_text = resp.read().decode("utf-8", "replace")
+    except _ue.HTTPError as he:
+        status_code = int(getattr(he, "code", 500) or 500)
+        res_hdrs = {str(k): str(v) for k, v in (getattr(he, "headers", None) or {}).items()}
+        try:
+            res_text = he.read().decode("utf-8", "replace")
+        except Exception:
+            res_text = str(he)
+    except Exception as e:
+        return {"ok": False, "method": eff_method, "url": eff_url, "hinweis": repr(e)}
+
+    if record:
+        try:
+            ApiDbService(dbp).insert_packet({
+                "timestamp": _t.time(),
+                "method": eff_method,
+                "url": eff_url,
+                "status": status_code,
+                "req_headers": json.dumps(eff_hdrs, ensure_ascii=False),
+                "req_body": eff_body,
+                "res_headers": json.dumps(res_hdrs, ensure_ascii=False),
+                "res_body": res_text,
+                "comment": f"MCP Replay{f' (#{req_id})' if req_id else ''}",
+            })
+        except Exception as rec_e:
+            err_msg = repr(rec_e)
+    return {
+        "ok": True,
+        "status": status_code,
+        "method": eff_method,
+        "url": eff_url,
+        "res_headers": res_hdrs,
+        "res_body": res_text[:8000],
+        "recorded": bool(record and not err_msg),
+        "record_error": err_msg or None,
+    }
+
+
+def api_clear(ctx):
+    """Leert alle Eintraege der API-Inspector-DB (api_traffic.db). Gated: delete_ops."""
+    from services.api_db_service import ApiDbService
+    dbp = ctx.cfg.paths.get("API_DB") or os.path.join(_base_dir(ctx), "data", "api_traffic.db")
+    ApiDbService(dbp).clear_db()
+    return {"ok": True, "cleared": True, "api_db": dbp}
 
 
 def history_list(ctx, limit=20):
@@ -4452,23 +5161,342 @@ def native_app_lifecycle_run(ctx, studio_root=None, zone="original", entry=None,
 _GLASS_SESSION_FOLDER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                      "secrets", "probe", "out", "glass")
 
-# In-memory Zustand der letzten gläsernen UI: erlaubt MCP-Interaktion (render/tap/key) ohne
-# erneuten Lauf. Reine Prozess-Lebensdauer; persistente Momentaufnahme bleibt last_ui.json.
-_LAST_UI = {"surface": None}
+# In-memory Zustand der letzten gläsernen UI + Session: erlaubt MCP-Interaktion
+# (render/tap/key/clock/step/reverse_step/goto/inspect) ohne erneuten Lauf.
+_LAST_UI = {"surface": None, "_surf_id": None, "updated_epoch_ms": 0}
+_DEFAULT_VIRTUAL_CLOCK = None
+_LAST_GLASS = {}
+
+_FILE_LOCKS_GUARD = threading.Lock()
+_FILE_LOCKS: Dict[str, threading.Lock] = {}
+_GUI_CMD_SEQ_LOCK = threading.Lock()
+_GUI_CMD_SEQ = 0
+
+
+def _clean_surrogates(obj: Any) -> Any:
+    """Ersetzt einsame UTF-16-Surrogates rekursiv, damit UTF-8-JSON-Dump nie scheitert."""
+    if isinstance(obj, str):
+        try:
+            obj.encode("utf-8")
+            return obj
+        except UnicodeEncodeError:
+            return obj.encode("utf-16", "surrogatepass").decode("utf-16", "replace")
+    if isinstance(obj, dict):
+        return {_clean_surrogates(k): _clean_surrogates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean_surrogates(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_clean_surrogates(x) for x in obj)
+    return obj
+
+
+def _atomic_write_json(path: str, payload: Any, indent: int = 2) -> str:
+    """Schreibt JSON atomar ueber `<path>.<pid>.<tid>.tmp` + `os.replace`."""
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = f"{abs_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    cleaned = _clean_surrogates(payload)
+    raw = json.dumps(cleaned, ensure_ascii=False, indent=indent, default=str)
+    raw = _clean_surrogates(raw)
+    try:
+        with open(tmp, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(raw)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        for attempt in range(8):
+            try:
+                os.replace(tmp, abs_path)
+                return path
+            except PermissionError:
+                if attempt >= 7:
+                    raise
+                time.sleep(0.005 * (attempt + 1))
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return path
+
+
+@contextmanager
+def _file_lock(lock_path: str, timeout: float = 2.5):
+    """Exklusives Prozess- & Thread-Lock per `O_CREAT | O_EXCL` mit Stale-Cleanup (>10s)."""
+    norm = os.path.normcase(os.path.abspath(lock_path))
+    parent = os.path.dirname(norm)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with _FILE_LOCKS_GUARD:
+        tlock = _FILE_LOCKS.get(norm)
+        if tlock is None:
+            tlock = threading.Lock()
+            _FILE_LOCKS[norm] = tlock
+
+    deadline = time.monotonic() + max(0.05, float(timeout or 2.5))
+    if not tlock.acquire(timeout=max(0.01, deadline - time.monotonic())):
+        raise TimeoutError(f"Thread-Lock-Timeout: {lock_path}")
+    try:
+        acquired_fd = None
+        while True:
+            try:
+                acquired_fd = os.open(norm, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    st = os.stat(norm)
+                    if (time.time() - st.st_mtime) > 10.0:
+                        try:
+                            os.remove(norm)
+                            continue
+                        except OSError:
+                            pass
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Datei-Lock-Timeout: {lock_path}")
+                time.sleep(0.01)
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Datei-Lock-Timeout (Permission): {lock_path}")
+                time.sleep(0.01)
+        try:
+            try:
+                os.write(acquired_fd, f"{os.getpid()}:{threading.get_ident()}\n".encode("ascii"))
+            finally:
+                os.close(acquired_fd)
+            yield
+        finally:
+            try:
+                os.remove(norm)
+            except OSError:
+                pass
+    finally:
+        tlock.release()
+
+
+def _merge_missing(*sources) -> List[Any]:
+    """Kombiniert Missing-Eintraege mehrerer Quellen dedupliziert nach `(cls, name, sig)`."""
+    merged: List[Any] = []
+    seen = set()
+    for src in sources:
+        if not src:
+            continue
+        for item in src:
+            if isinstance(item, dict):
+                key = (
+                    str(item.get("cls") or ""),
+                    str(item.get("name") or ""),
+                    str(item.get("sig") or ""),
+                )
+            elif isinstance(item, (tuple, list)) and len(item) >= 3:
+                key = (str(item[0] or ""), str(item[1] or ""), str(item[2] or ""))
+            else:
+                key = ("", str(item), "")
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def _collect_glass_missing(disk_state: Optional[dict] = None) -> List[Any]:
+    dbg = _LAST_GLASS.get("jdb")
+    stubs = _LAST_GLASS.get("stubs")
+    vm_miss = getattr(getattr(dbg, "vm", None), "missing", None) if dbg is not None else None
+    stubs_miss = getattr(stubs, "missing", None) if stubs is not None else None
+    if _LAST_GLASS:
+        return _merge_missing(_LAST_GLASS.get("missing"), vm_miss, stubs_miss)
+    return _merge_missing((disk_state or {}).get("missing"))
+
+
+def _queue_gui_cmd(ctx, entry: dict) -> int:
+    global _GUI_CMD_SEQ
+    data_dir = os.path.join(_base_dir(ctx), "data")
+    qpath = os.path.join(data_dir, "gui_cmd_queue.json")
+    ack_path = os.path.join(data_dir, "gui_cmd_ack.json")
+    os.makedirs(data_dir, exist_ok=True)
+    with _file_lock(qpath + ".lock"):
+        cur: List[dict] = []
+        if os.path.isfile(qpath):
+            try:
+                with open(qpath, "r", encoding="utf-8") as fh:
+                    old = json.load(fh)
+                if isinstance(old, list):
+                    cur = [it for it in old if isinstance(it, dict)]
+            except Exception:
+                cur = []
+        max_q = 0
+        for it in cur:
+            try:
+                max_q = max(max_q, int(it.get("seq", 0) or 0))
+            except Exception:
+                pass
+        ack_seq = 0
+        if os.path.isfile(ack_path):
+            try:
+                with open(ack_path, "r", encoding="utf-8") as afh:
+                    ack_d = json.load(afh)
+                if isinstance(ack_d, dict):
+                    ack_seq = int(ack_d.get("last_seq", 0) or 0)
+            except Exception:
+                ack_seq = 0
+        with _GUI_CMD_SEQ_LOCK:
+            _GUI_CMD_SEQ = max(_GUI_CMD_SEQ, max_q, ack_seq) + 1
+            next_seq = _GUI_CMD_SEQ
+        if isinstance(entry, dict):
+            entry.setdefault("ts_ms", int(time.time() * 1000))
+            entry.setdefault("seq", next_seq)
+        cur.append(entry)
+        _atomic_write_json(qpath, cur)
+        return len(cur)
+
+
+def _sync_headless_glass_outputs(ctx=None):
+    """Aktualisiert _LAST_UI, last_ui.json, last_net_log.json und live_state.json aus _LAST_GLASS."""
+    g = _LAST_GLASS
+    if not g:
+        return None
+    tree = g.get("tree")
+    stubs = g.get("stubs")
+    dbg = g.get("jdb")
+    net_log = g.get("net_log")
+    fusion = g.get("fusion")
+    inst = g.get("instance")
+    nc_obj = g.get("net_condition")
+    vm_obj = getattr(dbg, "vm", None) if dbg is not None else None
+    vm_miss = list(getattr(vm_obj, "missing", []) or []) if vm_obj is not None else []
+    stubs_miss = list(getattr(stubs, "missing", []) or []) if stubs is not None else []
+    missing = _merge_missing(g.get("missing"), vm_miss, stubs_miss)
+    out_dir = _GLASS_SESSION_FOLDER
+
+    ui_snap = None
+    if tree is not None:
+        try:
+            from core.java.surface import SceneGraphSurface
+            from core.java.ui_mcp_bridge import build_ui_snapshot_dict, persist_live_ui_snapshot
+            _live = SceneGraphSurface(tree, vm=vm_obj, activity=getattr(stubs, "_current_activity", None))
+            pkg = (getattr(inst, "package", None) or g.get("package") or "")
+            ui_snap = build_ui_snapshot_dict(_live, package=pkg, source="headless_glass_run")
+            _LAST_UI["surface"] = _live
+            _LAST_UI["_surf_id"] = id(_live)
+            _LAST_UI["updated_epoch_ms"] = ui_snap["updated_epoch_ms"]
+            os.makedirs(out_dir, exist_ok=True)
+            persist_live_ui_snapshot(ui_snap, out_dir=out_dir)
+        except Exception:
+            ui_snap = None
+
+    st = dbg.state() if dbg is not None else {"mode": "idle", "step": 0}
+    app_state = None
+    vclock = None
+    try:
+        from core.java.glass_runner import extract_app_state_snapshot
+        app_state = extract_app_state_snapshot(stubs, fusion=fusion)
+        vclock = app_state.get("virtual_clock")
+    except Exception:
+        pass
+    nodes = tree.nodes() if tree else []
+    tl_raw = (getattr(dbg, "timeline", None) or []) if dbg is not None else []
+    payload = {
+        "writer": "mcp_headless",
+        "mode": st.get("mode"),
+        "step": st.get("step"),
+        "reason": st.get("reason"),
+        "cls": st.get("cls"),
+        "name": st.get("name"),
+        "sig": st.get("sig"),
+        "pc": st.get("pc"),
+        "op": st.get("op"),
+        "zone": g.get("zone", "original"),
+        "entry": g.get("entry"),
+        "package": getattr(inst, "package", None) or g.get("package"),
+        "instance_id": getattr(inst, "instance_id", None) or g.get("instance_id") or "main",
+        "seam_profile": g.get("seam_profile", "self_cache"),
+        "persist_session": bool(g.get("persist_session", False)),
+        "net_mode": g.get("net_mode", "mock"),
+        "net_condition": (nc_obj.to_dict() if nc_obj else None),
+        "virtual_clock": vclock,
+        "app_state": app_state,
+        "callstack": (dbg.callstack() if dbg and hasattr(dbg, "callstack") else []),
+        "net_count": len(net_log) if net_log is not None else 0,
+        "net_entries": net_log.to_list()[-30:] if net_log is not None and hasattr(net_log, "to_list") else [],
+        "views": len(nodes),
+        "views_count": len(nodes),
+        "missing": missing[:100],
+        "missing_count": len(missing),
+        "timeline_count": len(tl_raw),
+        "timeline_tail": [
+            {"step": r.get("step"), "cls": r.get("cls"), "name": r.get("name"), "pc": r.get("pc"), "op": r.get("op")}
+            for r in tl_raw[-30:] if isinstance(r, dict)
+        ],
+    }
+    devs_obj = getattr(vm_obj, "deviations", None) if vm_obj is not None else None
+    if devs_obj is not None:
+        if hasattr(devs_obj, "to_list"):
+            payload["deviations"] = devs_obj.to_list()
+        elif isinstance(devs_obj, (list, tuple)):
+            payload["deviations"] = list(devs_obj)
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        if net_log is not None:
+            _atomic_write_json(
+                os.path.join(out_dir, "last_net_log.json"),
+                net_log.to_list(),
+                indent=1,
+            )
+        _atomic_write_json(
+            os.path.join(out_dir, "live_state.json"),
+            payload,
+            indent=1,
+        )
+    except Exception:
+        pass
+    return payload
+
+
+def _parse_virtual_clock_arg(raw):
+    if raw is None:
+        return None, None
+    if isinstance(raw, dict):
+        return dict(raw), None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None, None
+        if s.startswith("{"):
+            try:
+                d = json.loads(s)
+                if isinstance(d, dict):
+                    return d, None
+            except Exception as e:
+                return None, f"virtual_clock ist kein gueltiges JSON: {e!r}"
+        return {"iso": s, "frozen": True}, None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return {"epoch_ms": int(raw), "frozen": True}, None
+    return None, "virtual_clock Format nicht unterstuetzt"
 
 
 def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
                      action_points=None, net_replay=None, max_steps=400000,
                      seam_profile="self_cache", java_cutoffs=None, jni_cutoffs=None,
-                     net_condition=None, instance_id=None, native_fusion=False):
-    """Gläserner App-Lauf über MCP via GlassAppRunner: Lifecycle durch JavaDebugger + View-/Netz-Recorder
-    + konfigurierbare 2-Ebenen-Seams + NetCondition (online/throttled/offline/timeout) + Instanz/Fork."""
+                     net_condition=None, instance_id=None, native_fusion=False,
+                     virtual_clock=None, net_mode="mock", record_timeline=False,
+                     persist_session=None, max_wall_s=30.0):
+    """Gläserner App-Lauf über MCP via GlassAppRunner: Lifecycle durch JavaDebugger + View-/Netz-/Clock-Recorder
+    + konfigurierbare 2-Ebenen-Seams + NetCondition (online/throttled/offline/timeout) + Instanz/Fork + explizitem persist_session Opt-In."""
     import json
     try:
         from core.java.dalvik import DalvikException, DalvikUnknownOpcode
-        from core.java.net_recorder import ReplayResponder, NetResponse, NetCondition
+        from core.java.net_recorder import ReplayResponder, DbReplayResponder, NetResponse, NetCondition
         from core.java.seam_config import SeamConfig
-        from core.java.glass_runner import GlassAppRunner, InstanceState, ProjectSnapshotService
+        from core.java.glass_runner import GlassAppRunner, InstanceState, ProjectSnapshotService, apply_virtual_clock_spec, extract_app_state_snapshot
     except Exception as e:
         return {"ok": False, "hinweis": f"Java-Kern nicht ladbar: {e!r}"}
     if not studio_root and ctx is not None:
@@ -4504,6 +5532,13 @@ def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
         elif nm == "jni_cutoffs": jni_cutoffs = parsed
         elif nm == "net_condition": net_condition = parsed
 
+    vclock_spec, vclock_err = _parse_virtual_clock_arg(virtual_clock)
+    if vclock_err:
+        return {"ok": False, "hinweis": vclock_err}
+    if vclock_spec is None and isinstance(_DEFAULT_VIRTUAL_CLOCK, dict):
+        vclock_spec = dict(_DEFAULT_VIRTUAL_CLOCK)
+
+    bdir = _base_dir(ctx)
     action_points = list(action_points or [])
     scfg = SeamConfig.from_profile(seam_profile or "self_cache")
     if isinstance(java_cutoffs, list):
@@ -4511,8 +5546,10 @@ def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
     if isinstance(jni_cutoffs, list):
         scfg.jni_cutoffs = jni_cutoffs
 
-    svc = ProjectSnapshotService(base_dir=_REPO)
+    svc = ProjectSnapshotService(base_dir=bdir)
     inst = svc.load_fork(instance_id) if instance_id else InstanceState(app_root=studio_root, zone=zone, seam_profile=scfg.unpack_mode)
+    eff_persist = bool(persist_session) if persist_session is not None else bool(instance_id and inst.is_fork())
+    scfg.persist_appdata = eff_persist
 
     responder = None
     if net_replay:
@@ -4524,10 +5561,69 @@ def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
                 mapping[str(k)] = NetResponse(200, {}, v if isinstance(v, (str, bytes)) else str(v))
         responder = ReplayResponder(mapping)
 
-    runner = GlassAppRunner(studio_root, zone=zone, seam_config=scfg, instance_state=inst, base_dir=_REPO)
+    eff_net_mode = str(net_mode or "mock").strip().lower()
+    api_db_svc = None
+    if "db" in eff_net_mode:
+        eff_net_mode = "db_replay"
+        try:
+            from services.api_db_service import ApiDbService
+            dbp = (ctx.cfg.paths.get("API_DB") if (ctx and getattr(ctx, "cfg", None)) else None) or os.path.join(bdir, "data", "api_traffic.db")
+            if os.path.isfile(dbp):
+                api_db_svc = ApiDbService(dbp)
+                responder = DbReplayResponder(api_db_svc, fallback=responder)
+        except Exception:
+            pass
+    elif "live" in eff_net_mode:
+        eff_net_mode = "live"
+        if responder is None:
+            def _live_http_resp(req):
+                import urllib.error as _ue
+                import urllib.request as _ur
+                try:
+                    rq = _ur.Request(req.url, data=(req.body or None), method=(req.method or "GET"))
+                    for hk, hv in (req.headers or {}).items():
+                        try:
+                            rq.add_header(str(hk), str(hv))
+                        except Exception:
+                            pass
+                    with _ur.urlopen(rq, timeout=12) as resp:
+                        return NetResponse(int(getattr(resp, "status", 200) or 200),
+                                           dict(resp.headers.items()), resp.read(), getattr(resp, "reason", "OK"))
+                except _ue.HTTPError as he:
+                    try:
+                        hb = he.read()
+                    except Exception:
+                        hb = b""
+                    return NetResponse(int(he.code), dict((he.headers or {}).items()), hb, str(he.reason))
+                except Exception as exc:
+                    return NetResponse(502, {"X-Glass-Source": "live-http-error"}, str(exc).encode("utf-8", "replace"), "Bad Gateway")
+            responder = _live_http_resp
+    else:
+        eff_net_mode = "mock"
+
+    prev_dbg = _LAST_GLASS.get("jdb")
+    if prev_dbg is not None:
+        try:
+            prev_thr = getattr(prev_dbg, "_thread", None)
+            if getattr(prev_dbg, "mode", None) in ("run", "step", "over", "out", "paused") or (
+                prev_thr is not None and prev_thr.is_alive()
+            ):
+                prev_dbg.stop(wait_timeout=1.0)
+                if prev_thr is not None and prev_thr.is_alive():
+                    prev_thr.join(timeout=0.5)
+        except Exception:
+            pass
+
+    runner = GlassAppRunner(studio_root, zone=zone, seam_config=scfg, instance_state=inst, base_dir=bdir)
     try:
-        built = runner.build(native_fusion=bool(native_fusion), net_responder=responder,
-                             rules_path=_api_rules_path(ctx))
+        built = runner.build(
+            native_fusion=bool(native_fusion),
+            net_mode=eff_net_mode,
+            net_responder=responder,
+            rules_path=_api_rules_path(ctx),
+            api_db=api_db_svc,
+            virtual_clock=vclock_spec,
+        )
     except Exception as e:
         return {"ok": False, "hinweis": f"GlassAppRunner.build fehlgeschlagen: {e!r}"}
 
@@ -4536,6 +5632,7 @@ def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
     net_log = built["net_log"]
     dbg = built["jdb"]
     dbg.max_steps = int(max_steps)
+    dbg.record_timeline = bool(record_timeline)
 
     nc_obj = None
     if net_condition is not None and hasattr(stubs, "set_net_condition"):
@@ -4554,59 +5651,133 @@ def native_glass_run(ctx, studio_root=None, zone="original", entry=None,
             ap_errors.append(repr(e))
 
     ent = (str(entry).strip() or None) if entry else None
-    run_fn = (lambda: runner.runner.run_app(studio_root=studio_root, launcher=ent))
+    run_report = {}
+
+    def run_fn():
+        rep = runner.runner.run_app(studio_root=studio_root, launcher=ent)
+        if isinstance(rep, dict):
+            run_report.update(rep)
+        return rep
+
+    wall_limit = max(0.2, float(max_wall_s or 30.0))
+    deadline = time.monotonic() + wall_limit
+    timed_out = False
     observations = []
     try:
-        st = dbg.start_app(run_fn, stop_at_entry=False)
+        st = dbg.start_app(
+            run_fn,
+            stop_at_entry=False,
+            wait_timeout=min(5.0, max(0.1, deadline - time.monotonic())),
+        )
         guard = 0
-        while st.get("mode") == "paused" and guard < 100000:
+        while st.get("mode") in ("paused", "run") and time.monotonic() < deadline and guard < 100000:
             guard += 1
-            observations.append({"step": st.get("step"), "pc": st.get("pc"),
-                                 "cls": st.get("cls"), "name": st.get("name"),
-                                 "registers": dbg.registers()})
-            st = dbg.cont()
+            if st.get("mode") == "paused":
+                observations.append({"step": st.get("step"), "pc": st.get("pc"),
+                                     "cls": st.get("cls"), "name": st.get("name"),
+                                     "registers": dbg.registers()})
+                st = dbg.cont(wait_timeout=min(5.0, max(0.1, deadline - time.monotonic())))
+            else:
+                thr = getattr(dbg, "_thread", None)
+                rem = max(0.05, deadline - time.monotonic())
+                if thr is not None and thr.is_alive():
+                    thr.join(timeout=min(1.0, rem))
+                else:
+                    time.sleep(min(0.1, rem))
+                st = dbg.state()
+
+        thr = getattr(dbg, "_thread", None)
+        if getattr(dbg, "mode", None) not in ("run", "step", "over", "out", "paused") and thr is not None and thr.is_alive():
+            thr.join(timeout=0.5)
+        if getattr(dbg, "mode", None) in ("run", "step", "over", "out", "paused") or (
+            thr is not None and thr.is_alive()
+        ):
+            eng = (built.get("fusion") or {}).get("eng") if isinstance(built.get("fusion"), dict) else None
+            if eng is not None and getattr(eng, "cpu", None) is not None:
+                try:
+                    eng.cpu.stopped = True
+                except Exception:
+                    pass
+            dbg.stop(wait_timeout=2.0)
+            if thr is not None and thr.is_alive():
+                thr.join(timeout=0.5)
+            st = dbg.state()
+            timed_out = True
     except (DalvikUnknownOpcode, DalvikException) as e:
         return {"ok": False, "hinweis": f"Laufzeitfehler: {e!r}", "net_log": net_log.to_list()}
     except Exception as e:
         try:
-            dbg.stop()
+            dbg.stop(wait_timeout=1.0)
         except Exception:
             pass
         return {"ok": False, "hinweis": f"Gläsern-Fehler: {e!r}", "net_log": net_log.to_list()}
 
+    if tree is not None and getattr(tree, "root", None) is None:
+        rec = getattr(stubs, "rn_mount_recorder", None)
+        if rec is not None and getattr(rec, "nodes", None):
+            try:
+                rn_surf = rec.surface(relayout=not getattr(rec, "_has_layout", False))
+                if getattr(rn_surf, "tree", None) is not None and rn_surf.tree.root is not None:
+                    tree = rn_surf.tree
+                    runner.tree = tree
+            except Exception:
+                pass
+
+    missing = _merge_missing(
+        dict(run_report).get("missing") if run_report else None,
+        getattr(getattr(dbg, "vm", None), "missing", []),
+        getattr(stubs, "missing", []),
+    )
+    _LAST_GLASS.clear()
+    _LAST_GLASS.update({
+        "runner": runner,
+        "jdb": dbg,
+        "stubs": stubs,
+        "tree": tree,
+        "net_log": net_log,
+        "fusion": built.get("fusion"),
+        "instance": inst,
+        "package": inst.package,
+        "instance_id": inst.instance_id,
+        "studio_root": studio_root,
+        "zone": zone,
+        "entry": ent,
+        "seam_profile": scfg.unpack_mode,
+        "persist_session": eff_persist,
+        "net_mode": eff_net_mode,
+        "net_condition": nc_obj,
+        "missing": missing,
+    })
+
+    if scfg.persist_appdata and (bool(built.get("fusion")) or os.path.abspath(bdir) != os.path.abspath(".")):
+        try:
+            from core.java.sqlite_prefs_bridge import persist_java_appdata_to_dir
+            persist_java_appdata_to_dir(stubs, inst.pkg_appdata_dir(bdir))
+        except Exception:
+            pass
+
+    payload = _sync_headless_glass_outputs(ctx) or {}
     nodes = tree.nodes() if tree else []
     view_summary = {"views": len(nodes),
                     "texts": [n.text for n in nodes if getattr(n, "text", "")][:20]}
-    ui_snap = None
-    try:
-        from core.java.surface import SceneGraphSurface, snapshot as _ui_snapshot
-        _live = SceneGraphSurface(tree)
-        ui_snap = _ui_snapshot(_live)
-        _LAST_UI["surface"] = _live
-    except Exception:
-        ui_snap = None
-    try:
-        os.makedirs(_GLASS_SESSION_FOLDER, exist_ok=True)
-        with open(os.path.join(_GLASS_SESSION_FOLDER, "last_net_log.json"), "w", encoding="utf-8") as f:
-            json.dump(net_log.to_list(), f, ensure_ascii=False, indent=1)
-        if ui_snap is not None:
-            with open(os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json"), "w", encoding="utf-8") as f:
-                json.dump(ui_snap, f, ensure_ascii=False, indent=1)
-        with open(os.path.join(_GLASS_SESSION_FOLDER, "live_state.json"), "w", encoding="utf-8") as f:
-            json.dump({"mode": st.get("mode"), "step": st.get("step"), "zone": zone, "entry": ent,
-                       "package": inst.package, "instance_id": inst.instance_id,
-                       "seam_profile": scfg.unpack_mode,
-                       "net_condition": (nc_obj.to_dict() if nc_obj else None),
-                       "net_count": len(net_log), "views": len(nodes)}, f, ensure_ascii=False, indent=1)
-    except Exception:
-        pass
-    return {"ok": True, "studio_root": studio_root, "zone": zone, "entry": ent,
-            "mode": st.get("mode"), "view": view_summary,
-            "seam_profile": scfg.unpack_mode, "instance_id": inst.instance_id,
-            "net_condition": (nc_obj.to_dict() if nc_obj else None),
-            "net_log": net_log.to_list(), "net_count": len(net_log),
-            "action_points": len(action_points), "ap_errors": ap_errors,
-            "observations": observations[:50], "observation_count": len(observations)}
+    vclock_state = payload.get("virtual_clock")
+    app_state = payload.get("app_state")
+    ret = {"ok": True, "studio_root": studio_root, "zone": zone, "entry": ent,
+           "mode": st.get("mode"), "step": st.get("step"), "view": view_summary,
+           "seam_profile": scfg.unpack_mode, "instance_id": inst.instance_id,
+           "persist_session": eff_persist,
+           "net_mode": eff_net_mode,
+           "net_condition": (nc_obj.to_dict() if nc_obj else None),
+           "virtual_clock": vclock_state,
+           "app_state": app_state,
+           "missing_count": len(missing),
+           "timeline_count": len(getattr(dbg, "timeline", []) or []),
+           "net_log": net_log.to_list(), "net_count": len(net_log),
+           "action_points": len(action_points), "ap_errors": ap_errors,
+           "observations": observations[:50], "observation_count": len(observations)}
+    if timed_out:
+        ret["timed_out"] = True
+    return ret
 
 
 def native_glass_state(ctx):
@@ -4621,8 +5792,284 @@ def native_glass_state(ctx):
         return {"ok": False, "hinweis": repr(e)}
 
 
-def native_glass_control(ctx, cmd, params_json=None):
-    """Schreibt ein Steuerkommando fuer die GUI in `data/gui_cmd_queue.json`."""
+def native_glass_clock(ctx, op="get", iso=None, epoch_ms=None, tz=None, frozen=None,
+                       shift_days=0.0, shift_hours=0.0, shift_minutes=0.0, shift_seconds=0.0,
+                       step_ms=None, forward_to_gui=True):
+    """Liest, setzt, verschiebt oder resettet die Virtuelle Uhr (Headless + Live-GUI)."""
+    global _DEFAULT_VIRTUAL_CLOCK
+    from core.java.glass_runner import apply_virtual_clock_spec
+    from core.java.virtual_clock import get_virtual_clock_state, parse_datetime_spec
+
+    act = str(op or "get").strip().lower()
+    stubs = _LAST_GLASS.get("stubs")
+    eng = ((_LAST_GLASS.get("fusion") or {}).get("eng")
+           if isinstance(_LAST_GLASS.get("fusion"), dict) else None)
+
+    if act == "get":
+        if stubs is not None:
+            st = get_virtual_clock_state(stubs)
+            return {"ok": True, "source": "headless", "clock": st}
+        p = os.path.join(_GLASS_SESSION_FOLDER, "live_state.json")
+        if os.path.isfile(p):
+            try:
+                ls = json.load(open(p, "r", encoding="utf-8"))
+                if ls.get("virtual_clock"):
+                    return {"ok": True, "source": "live_state", "clock": ls["virtual_clock"]}
+            except Exception:
+                pass
+        if isinstance(_DEFAULT_VIRTUAL_CLOCK, dict):
+            return {"ok": True, "source": "preset", "clock": dict(_DEFAULT_VIRTUAL_CLOCK)}
+        import time as _t
+        import datetime as _dt
+        ms = int(_t.time() * 1000)
+        return {"ok": True, "source": "host", "clock": {
+            "epoch_ms": ms, "iso": _dt.datetime.fromtimestamp(ms / 1000.0).strftime("%Y-%m-%d %H:%M:%S"),
+            "tz": "System", "frozen": False, "custom": False,
+        }}
+
+    if act == "reset":
+        spec = {"reset": True}
+        if tz is not None:
+            spec["tz"] = tz
+        _DEFAULT_VIRTUAL_CLOCK = None
+        res_clock = apply_virtual_clock_spec(stubs, spec, eng=eng) if stubs is not None else {"reset": True, "tz": tz or "System"}
+        if stubs is not None:
+            _persist_ui_snapshot()
+            _sync_headless_glass_outputs(ctx)
+        if forward_to_gui:
+            _queue_gui_cmd(ctx, {"cmd": "set_virtual_clock", **spec})
+        return {"ok": True, "op": "reset", "clock": res_clock, "queued_to_gui": bool(forward_to_gui)}
+
+    if act == "shift":
+        spec = {
+            "shift_days": float(shift_days or 0.0),
+            "shift_hours": float(shift_hours or 0.0),
+            "shift_minutes": float(shift_minutes or 0.0),
+            "shift_seconds": float(shift_seconds or 0.0),
+        }
+        if stubs is not None:
+            res_clock = apply_virtual_clock_spec(stubs, spec, eng=eng)
+            _DEFAULT_VIRTUAL_CLOCK = {
+                "epoch_ms": res_clock["epoch_ms"],
+                "frozen": res_clock["frozen"],
+                **({"tz_name": res_clock["tz"]} if res_clock.get("tz") and res_clock["tz"] != "System" else {}),
+            }
+            _persist_ui_snapshot()
+            _sync_headless_glass_outputs(ctx)
+        else:
+            delta_ms = int(round(((spec["shift_days"] * 86400.0) + (spec["shift_hours"] * 3600.0)
+                                  + (spec["shift_minutes"] * 60.0) + spec["shift_seconds"]) * 1000.0))
+            cur = dict(_DEFAULT_VIRTUAL_CLOCK or {})
+            import time as _t
+            base_ms = cur.get("epoch_ms") or (parse_datetime_spec(cur["iso_str"], cur.get("tz_name")) if cur.get("iso_str") else int(_t.time() * 1000))
+            cur["epoch_ms"] = int(base_ms) + delta_ms
+            cur.pop("iso_str", None)
+            _DEFAULT_VIRTUAL_CLOCK = cur
+            res_clock = cur
+        if forward_to_gui:
+            _queue_gui_cmd(ctx, {"cmd": "set_virtual_clock", **spec})
+        return {"ok": True, "op": "shift", "clock": res_clock, "queued_to_gui": bool(forward_to_gui)}
+
+    if act == "set":
+        spec = {}
+        if iso is not None:
+            try:
+                parse_datetime_spec(iso, tz)
+            except Exception as e:
+                return {"ok": False, "hinweis": f"Ungueltiges Datums-/Zeitformat: {e}"}
+            spec["iso"] = str(iso)
+        if epoch_ms is not None:
+            spec["epoch_ms"] = int(epoch_ms)
+        if tz is not None:
+            spec["tz"] = str(tz)
+        if frozen is not None:
+            spec["frozen"] = bool(frozen)
+        if step_ms is not None:
+            spec["step_ms"] = int(step_ms)
+        if not spec:
+            return {"ok": False, "hinweis": "Mindestens iso, epoch_ms, tz, frozen oder step_ms angeben."}
+
+        preset = dict(_DEFAULT_VIRTUAL_CLOCK or {})
+        if "iso" in spec:
+            preset["iso_str"] = spec["iso"]
+            preset.pop("epoch_ms", None)
+        if "epoch_ms" in spec:
+            preset["epoch_ms"] = spec["epoch_ms"]
+            preset.pop("iso_str", None)
+        if "tz" in spec:
+            preset["tz_name"] = spec["tz"]
+        if "frozen" in spec:
+            preset["frozen"] = spec["frozen"]
+        if "step_ms" in spec:
+            preset["step_ms"] = spec["step_ms"]
+        _DEFAULT_VIRTUAL_CLOCK = preset
+
+        if stubs is not None:
+            res_clock = apply_virtual_clock_spec(stubs, spec, eng=eng)
+            _persist_ui_snapshot()
+            _sync_headless_glass_outputs(ctx)
+        else:
+            res_clock = preset
+        if forward_to_gui:
+            _queue_gui_cmd(ctx, {"cmd": "set_virtual_clock", **spec})
+        return {"ok": True, "op": "set", "clock": res_clock, "queued_to_gui": bool(forward_to_gui)}
+
+    return {"ok": False, "hinweis": f"Unbekannte Operation op={op!r} (erlaubt: get|set|shift|reset)"}
+
+
+def native_glass_inspect(ctx, section="all", query="", limit=100):
+    """Tiefen-Inspektion des letzten Glass-Laufs (App-State, SharedPrefs, SQLite, Missing, Seams, Timeline, Heap, Befund)."""
+    from core.java.glass_runner import extract_app_state_snapshot
+    sec = str(section or "all").strip().lower()
+    lim = max(1, int(limit or 100))
+    q = str(query or "").strip()
+
+    stubs = _LAST_GLASS.get("stubs")
+    dbg = _LAST_GLASS.get("jdb")
+    fusion = _LAST_GLASS.get("fusion")
+    net_log = _LAST_GLASS.get("net_log")
+
+    disk_state = None
+    p = os.path.join(_GLASS_SESSION_FOLDER, "live_state.json")
+    if os.path.isfile(p):
+        try:
+            disk_state = json.load(open(p, "r", encoding="utf-8"))
+        except Exception:
+            disk_state = None
+
+    if sec in ("app_state", "prefs", "sqlite"):
+        if stubs is not None:
+            app_st = extract_app_state_snapshot(stubs, fusion=fusion, db_query=q)
+            if sec == "prefs":
+                return {"ok": True, "section": "prefs", "shared_prefs": app_st.get("shared_prefs", {})}
+            if sec == "sqlite":
+                return {"ok": True, "section": "sqlite", "sqlite_dbs": app_st.get("sqlite_dbs", {})}
+            return {"ok": True, "section": "app_state", **app_st}
+        if disk_state and disk_state.get("app_state"):
+            app_st = disk_state["app_state"]
+            if sec == "prefs":
+                return {"ok": True, "section": "prefs", "shared_prefs": app_st.get("shared_prefs", {})}
+            if sec == "sqlite":
+                return {"ok": True, "section": "sqlite", "sqlite_dbs": app_st.get("sqlite_dbs", {})}
+            return {"ok": True, "section": "app_state", **app_st}
+        return {"ok": True, "section": sec, "hinweis": "Kein aktiver App-State vorhanden."}
+
+    if sec == "missing":
+        miss = _collect_glass_missing(disk_state)
+        if q:
+            miss = [m for m in miss if q.lower() in str(m).lower()]
+        return {"ok": True, "section": "missing", "count": len(miss), "missing": miss[:lim]}
+
+    if sec == "seams":
+        jni_entries = []
+        hook = (fusion or {}).get("hook") if isinstance(fusion, dict) else None
+        if hook is not None and getattr(hook, "log", None) is not None and hasattr(hook.log, "to_list"):
+            jni_entries = hook.log.to_list()[-lim:]
+        elif disk_state and disk_state.get("jni_entries"):
+            jni_entries = list(disk_state["jni_entries"])[-lim:]
+        return {
+            "ok": True,
+            "section": "seams",
+            "seam_profile": _LAST_GLASS.get("seam_profile") or (disk_state or {}).get("seam_profile"),
+            "jni_count": len(jni_entries),
+            "jni_entries": jni_entries,
+        }
+
+    if sec == "timeline":
+        if dbg is not None:
+            tl = list(getattr(dbg, "timeline", []) or [])
+            out_tl = [
+                {"step": r.get("step"), "cls": r.get("cls"), "name": r.get("name"), "pc": r.get("pc"), "op": r.get("op")}
+                for r in tl[-lim:] if isinstance(r, dict)
+            ]
+            return {"ok": True, "section": "timeline", "step_count": int(getattr(dbg, "step_count", 0) or 0),
+                    "recorded_len": len(tl), "timeline": out_tl}
+        return {"ok": True, "section": "timeline",
+                "step_count": (disk_state or {}).get("step", 0),
+                "recorded_len": (disk_state or {}).get("timeline_count", 0),
+                "timeline": list((disk_state or {}).get("timeline_tail") or [])[-lim:]}
+
+    if sec == "heap":
+        vm = getattr(dbg, "vm", None) if dbg is not None else None
+        statics_out = {}
+        if vm is not None:
+            for c, flds in (getattr(vm, "statics", None) or {}).items():
+                if q and q.lower() not in str(c).lower():
+                    continue
+                if isinstance(flds, dict):
+                    statics_out[str(c)] = {str(fk): str(fv)[:200] for fk, fv in list(flds.items())[:40]}
+                if len(statics_out) >= lim:
+                    break
+        regs_out = []
+        if dbg is not None and hasattr(dbg, "registers"):
+            try:
+                for idx_r, rval in enumerate(dbg.registers()[:40]):
+                    item = {"reg": f"v{idx_r}", "val": str(rval)[:200]}
+                    if hasattr(rval, "fields") and isinstance(rval.fields, dict):
+                        item["cls"] = getattr(rval, "cls", None)
+                        item["fields"] = {str(fk): str(fv)[:120] for fk, fv in list(rval.fields.items())[:20]}
+                    regs_out.append(item)
+            except Exception:
+                pass
+        return {"ok": True, "section": "heap", "statics": statics_out,
+                "registers": regs_out or (disk_state or {}).get("registers", [])}
+
+    if sec == "befund":
+        import datetime as _dt
+        os.makedirs(_GLASS_SESSION_FOLDER, exist_ok=True)
+        bpath = os.path.join(_GLASS_SESSION_FOLDER, "befund.md")
+        st = dbg.state() if dbg is not None else (disk_state or {"mode": "idle"})
+        pkg = _LAST_GLASS.get("package") or (disk_state or {}).get("package") or "-"
+        nl_entries = (net_log.to_list() if net_log is not None and hasattr(net_log, "to_list")
+                      else (disk_state or {}).get("net_entries", []))
+        miss = _collect_glass_missing(disk_state)
+        lines = [
+            f"# Glass-Debugger Befund ({_dt.datetime.now().isoformat(timespec='seconds')})",
+            "",
+            f"- **App / Paket:** `{pkg}`",
+            f"- **Zone / Instanz:** `{_LAST_GLASS.get('zone') or (disk_state or {}).get('zone') or '-'}` / `{_LAST_GLASS.get('instance_id') or (disk_state or {}).get('instance_id') or 'main'}`",
+            f"- **Seam-Profil:** `{_LAST_GLASS.get('seam_profile') or (disk_state or {}).get('seam_profile') or 'self_cache'}`",
+            f"- **Status:** `{st.get('mode')}` @ Step `{st.get('step')}`",
+            f"- **Position:** `{st.get('cls')}->{st.get('name')}{st.get('sig') or ''} pc={st.get('pc')}`",
+            "",
+            "## Netz-Aufzeichnung",
+            f"- Modus: `{_LAST_GLASS.get('net_mode') or (disk_state or {}).get('net_mode') or 'mock'}`",
+            f"- Requests: `{len(nl_entries)}`",
+        ]
+        for e in nl_entries[-20:]:
+            rq = e.get("req", {}) if isinstance(e, dict) else {}
+            rp = e.get("resp", {}) if isinstance(e, dict) else {}
+            lines.append(f"  - `{rq.get('method', 'GET')} {rq.get('url', '')}` -> `{rp.get('code', '-')}`")
+        lines += ["", "## Missing Stubs", f"- Anzahl: `{len(miss)}`"]
+        for m in miss[:20]:
+            lines.append(f"  - `{m}`")
+        md = "\n".join(lines) + "\n"
+        with open(bpath, "w", encoding="utf-8") as fh:
+            fh.write(md)
+        return {"ok": True, "section": "befund", "path": bpath, "markdown": md}
+
+    if sec == "all":
+        app_st = (extract_app_state_snapshot(stubs, fusion=fusion, db_query=q)
+                  if stubs is not None else (disk_state or {}).get("app_state"))
+        miss = _collect_glass_missing(disk_state)
+        tl = list(getattr(dbg, "timeline", []) or []) if dbg is not None else list((disk_state or {}).get("timeline_tail") or [])
+        return {
+            "ok": True,
+            "section": "all",
+            "state": (dbg.state() if dbg is not None else disk_state),
+            "app_state": app_st,
+            "missing_count": len(miss),
+            "missing": miss[:30],
+            "timeline_count": len(tl),
+            "net_count": len(net_log) if net_log is not None else (disk_state or {}).get("net_count", 0),
+        }
+
+    return {"ok": False, "hinweis": f"Unbekannte Sektion {section!r} (all|app_state|prefs|sqlite|missing|seams|timeline|heap|befund)"}
+
+
+def native_glass_control(ctx, cmd, params_json=None, target="gui"):
+    """Sendet ein Steuerkommando an Live-GUI (`target='gui'`), Headless-Session (`'headless'`) oder beide (`'both'`)."""
+    global _DEFAULT_VIRTUAL_CLOCK
     params = {}
     if params_json:
         try:
@@ -4630,21 +6077,159 @@ def native_glass_control(ctx, cmd, params_json=None):
         except Exception as e:
             return {"ok": False, "hinweis": f"params_json ungueltig: {e!r}"}
     entry = {"cmd": str(cmd), **(params if isinstance(params, dict) else {})}
-    qpath = os.path.join(_REPO, "data", "gui_cmd_queue.json")
-    cur = []
-    if os.path.isfile(qpath):
-        try:
-            with open(qpath, "r", encoding="utf-8") as fh:
-                old = json.load(fh)
-            if isinstance(old, list):
-                cur = old
-        except Exception:
-            cur = []
-    cur.append(entry)
-    os.makedirs(os.path.dirname(qpath), exist_ok=True)
-    with open(qpath, "w", encoding="utf-8") as fh:
-        json.dump(cur, fh, ensure_ascii=False, indent=2)
-    return {"ok": True, "queued": entry, "queue_len": len(cur)}
+    tgt = str(target or "gui").strip().lower()
+    out = {"ok": True, "cmd": entry["cmd"], "target": tgt}
+
+    if tgt in ("headless", "both"):
+        op = entry["cmd"]
+        dbg = _LAST_GLASS.get("jdb")
+        stubs = _LAST_GLASS.get("stubs")
+        if op == "set_virtual_clock":
+            clk = native_glass_clock(
+                ctx,
+                op=("reset" if entry.get("reset") else "set"),
+                iso=entry.get("iso") or entry.get("iso_str") or entry.get("datetime"),
+                epoch_ms=entry.get("epoch_ms"),
+                tz=entry.get("tz") if "tz" in entry else entry.get("tz_name"),
+                frozen=entry.get("frozen"),
+                step_ms=entry.get("step_ms"),
+                forward_to_gui=False,
+            )
+            out["headless"] = clk
+        elif op == "generate_befund":
+            out["headless"] = native_glass_inspect(ctx, section="befund")
+        elif op == "set_persist_session":
+            en = bool(entry.get("enabled", entry.get("persist_session", False)))
+            _LAST_GLASS["persist_session"] = en
+            r_obj = _LAST_GLASS.get("runner")
+            if r_obj is not None and getattr(r_obj, "seam_config", None) is not None:
+                r_obj.seam_config.persist_appdata = en
+            inst = _LAST_GLASS.get("instance")
+            if en and stubs is not None and inst is not None:
+                try:
+                    from core.java.sqlite_prefs_bridge import persist_java_appdata_to_dir
+                    persist_java_appdata_to_dir(stubs, inst.pkg_appdata_dir(_base_dir(ctx)))
+                except Exception:
+                    pass
+            if dbg is not None:
+                _persist_ui_snapshot()
+                _sync_headless_glass_outputs(ctx)
+            out["headless"] = {"ok": True, "persist_session": en}
+        elif op in ("reset_appdata", "clear_appdata"):
+            from core.java.glass_runner import InstanceState
+            from core.java.sqlite_prefs_bridge import clear_java_appdata_state
+            bdir = _base_dir(ctx)
+            inst = _LAST_GLASS.get("instance")
+            pkg = str(entry.get("package") or _LAST_GLASS.get("package") or (getattr(inst, "package", None) if inst else "") or "")
+            iid = str(entry.get("instance_id") or _LAST_GLASS.get("instance_id") or (getattr(inst, "instance_id", None) if inst else "main") or "main")
+            if not pkg:
+                disk_st = _read_live_gui_state()
+                if isinstance(disk_st, dict):
+                    pkg = str(disk_st.get("package") or "")
+            if entry.get("appdata_dir"):
+                app_dir = os.path.abspath(str(entry["appdata_dir"]))
+            elif inst is not None and not entry.get("package") and not entry.get("instance_id"):
+                app_dir = inst.pkg_appdata_dir(bdir)
+            elif pkg:
+                app_dir = InstanceState(instance_id=iid, package=pkg).pkg_appdata_dir(bdir)
+            else:
+                app_dir = None
+            res = clear_java_appdata_state(
+                stubs=stubs,
+                app_dir=app_dir,
+                fusion=_LAST_GLASS.get("fusion"),
+                package=(pkg or None),
+            )
+            if dbg is not None:
+                _persist_ui_snapshot()
+                _sync_headless_glass_outputs(ctx)
+            out["headless"] = {**res, "package": pkg or None, "instance_id": iid}
+        elif dbg is None:
+            out["headless"] = {"ok": False, "hinweis": "Keine aktive Headless-Glass-Session (_LAST_GLASS leer)."}
+        else:
+            st_res = None
+            if op == "step":
+                st_res = dbg.step()
+            elif op == "step_over":
+                st_res = dbg.step_over()
+            elif op == "step_out":
+                st_res = dbg.step_out()
+            elif op == "reverse_step":
+                cur_step = int(getattr(dbg, "step_count", 0) or 0)
+                if cur_step <= 0:
+                    st_res = dbg.state()
+                else:
+                    st_res = dbg.goto(max(0, cur_step - 1))
+            elif op == "goto":
+                st_res = dbg.goto(max(0, int(entry.get("step", entry.get("n", 0)))))
+            elif op == "pause":
+                dbg.pause()
+                st_res = dbg.state()
+            elif op == "stop":
+                dbg.stop()
+                st_res = dbg.state()
+            elif op == "cont":
+                st_res = dbg.cont()
+            elif op == "set_bp":
+                dbg.add_breakpoint(entry.get("cls"), entry.get("name"), entry.get("sig", ""), entry.get("pc", 0))
+                st_res = {"bp_added": entry.get("pc", 0)}
+            elif op == "clear_bps":
+                dbg.clear_breakpoints()
+                st_res = {"bps_cleared": True}
+            elif op == "add_action_point":
+                dbg.add_action_point(
+                    entry.get("cls"), entry.get("name"), entry.get("sig", ""), entry.get("pc", 0),
+                    entry.get("assigns") or [], cond=entry.get("cond"),
+                    when_continue=bool(entry.get("when_continue")),
+                    one_shot=bool(entry.get("one_shot")), hit=entry.get("hit"),
+                )
+                st_res = {"ap_added": True}
+            elif op == "clear_action_points":
+                dbg.clear_action_points()
+                st_res = {"aps_cleared": True}
+            elif op == "set_net_condition" and stubs is not None and hasattr(stubs, "set_net_condition"):
+                nc = stubs.set_net_condition({"mode": entry.get("mode", "online"),
+                                              "latency_ms": entry.get("latency_ms", 0),
+                                              "kbps": entry.get("kbps", 0)})
+                _LAST_GLASS["net_condition"] = nc
+                st_res = nc.to_dict() if nc else {}
+            elif op == "add_net_mock" and stubs is not None:
+                from core.java.net_recorder import ReplayResponder, NetResponse
+                rr = getattr(stubs, "net_responder", None)
+                if not isinstance(rr, ReplayResponder):
+                    rr = ReplayResponder()
+                    stubs.net_responder = rr
+                key = str(entry.get("url") or "")
+                if entry.get("method"):
+                    key = f"{str(entry['method']).upper()} {key}"
+                body_b = str(entry.get("body") or "").encode("utf-8", "replace")
+                rr.mapping[key] = NetResponse(int(entry.get("code") or 200), {}, body_b, "OK")
+                st_res = {"mock_added": key}
+            elif op == "clear_net_mocks" and stubs is not None:
+                stubs.net_responder = None
+                st_res = {"mocks_cleared": True}
+            elif op == "set_options":
+                if "record_timeline" in entry and entry["record_timeline"] is not None:
+                    dbg.record_timeline = bool(entry["record_timeline"])
+                if "record_regs" in entry and entry["record_regs"] is not None:
+                    dbg.record_regs = bool(entry["record_regs"])
+                if "stop_on_exception" in entry and entry["stop_on_exception"] is not None:
+                    dbg.stop_on_exception = bool(entry["stop_on_exception"])
+                if "persist_session" in entry and entry["persist_session"] is not None:
+                    _LAST_GLASS["persist_session"] = bool(entry["persist_session"])
+                st_res = {"options_updated": True}
+            else:
+                st_res = {"hinweis": f"Headless-Kommando {op!r} nicht direkt ausfuehrbar."}
+            _persist_ui_snapshot()
+            _sync_headless_glass_outputs(ctx)
+            out["headless"] = st_res
+
+    if tgt in ("gui", "both"):
+        qlen = _queue_gui_cmd(ctx, entry)
+        out["queued"] = entry
+        out["queue_len"] = qlen
+
+    return out
 
 
 def native_glass_fork(ctx, op="list", package=None, fork_id=None, label="", project_name=None):
@@ -4673,21 +6258,72 @@ def native_glass_fork(ctx, op="list", package=None, fork_id=None, label="", proj
     return {"ok": False, "hinweis": f"Unbekannte/unvollstaendige Operation op={op!r}"}
 
 
-def native_ui_snapshot(ctx):
-    """Read-only (gläsern): UI-Momentaufnahme des letzten native.glass_run — Paint-Liste, Masse,
-    sichtbare Texte, Szenegraph-Knoten (cls/text/bounds/clickable). MCP-Paritaet zur Anzeige."""
+def _load_disk_ui_snapshot():
     import json
     p = os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json")
     if not os.path.isfile(p):
-        return {"ok": True, "ui": None, "hinweis": "noch kein native.glass_run gelaufen"}
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _select_active_ui_snapshot(source="auto"):
+    """Waehlt den aktuellsten UI-Snapshot (laufende Desktop-GUI `last_ui.json` vs. In-Memory Surface)."""
+    from core.java.ui_mcp_bridge import build_ui_snapshot_dict
+    src_mode = str(source or "auto").strip().lower()
+    surf = _LAST_UI.get("surface")
+    disk_snap = None
     try:
-        with open(p, encoding="utf-8") as f:
-            data = json.load(f)
-        return {"ok": True, "width": data.get("width"), "height": data.get("height"),
-                "text": data.get("text", []), "nodes": data.get("nodes", []),
-                "paint_count": len(data.get("paint", []))}
+        disk_snap = _load_disk_ui_snapshot()
+    except Exception:
+        disk_snap = None
+
+    if src_mode == "gui":
+        return disk_snap
+    if src_mode == "headless":
+        if surf is not None:
+            snap = build_ui_snapshot_dict(surf, source="headless_live")
+            _LAST_UI["_surf_id"] = id(surf)
+            _LAST_UI["updated_epoch_ms"] = snap["updated_epoch_ms"]
+            return snap
+        return disk_snap
+
+    if surf is not None:
+        surf_changed_ext = id(surf) != _LAST_UI.get("_surf_id")
+        if disk_snap is None or surf_changed_ext or int(_LAST_UI.get("updated_epoch_ms", 0) or 0) >= int(disk_snap.get("updated_epoch_ms", 0) or 0):
+            snap = build_ui_snapshot_dict(surf, source="headless_live")
+            _LAST_UI["_surf_id"] = id(surf)
+            _LAST_UI["updated_epoch_ms"] = snap["updated_epoch_ms"]
+            return snap
+    return disk_snap
+
+
+def native_ui_snapshot(ctx):
+    """Read-only (gläsern): UI-Momentaufnahme des letzten GUI-/Glass-Stands — Paint-Liste, Masse,
+    sichtbare Texte, Szenegraph-Knoten und interaktive Tap-Koordinaten."""
+    try:
+        data = _select_active_ui_snapshot(source="auto")
     except Exception as e:
         return {"ok": False, "hinweis": repr(e)}
+    if data is None:
+        return {"ok": True, "ui": None, "hinweis": "noch kein native.glass_run oder GUI-Screen aktiv"}
+    return {
+        "ok": True,
+        "source": data.get("source"),
+        "package": data.get("package"),
+        "updated_at": data.get("updated_at"),
+        "width": data.get("width"),
+        "height": data.get("height"),
+        "scroll_y": data.get("scroll_y", 0),
+        "max_scroll": data.get("max_scroll", 0),
+        "dark_mode": bool(data.get("dark_mode", False)),
+        "status_clock": data.get("status_clock", "12:00"),
+        "toast_text": data.get("toast_text"),
+        "text": data.get("text", []),
+        "nodes": data.get("nodes", []),
+        "interactive_elements": data.get("interactive_elements", []),
+        "paint_count": len(data.get("paint", [])),
+    }
 
 
 def _persist_ui_snapshot():
@@ -4696,25 +6332,90 @@ def _persist_ui_snapshot():
     if surf is None:
         return None
     try:
-        from core.java.surface import snapshot as _ui_snapshot
-        snap = _ui_snapshot(surf)
-        os.makedirs(_GLASS_SESSION_FOLDER, exist_ok=True)
-        with open(os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json"), "w", encoding="utf-8") as f:
-            json.dump(snap, f, ensure_ascii=False, indent=1)
+        from core.java.ui_mcp_bridge import build_ui_snapshot_dict, persist_live_ui_snapshot
+        snap = build_ui_snapshot_dict(surf, source="headless_live")
+        _LAST_UI["_surf_id"] = id(surf)
+        _LAST_UI["updated_epoch_ms"] = snap["updated_epoch_ms"]
+        persist_live_ui_snapshot(snap, out_dir=_GLASS_SESSION_FOLDER)
         return snap
     except Exception:
         return None
 
 
+def native_ui_view(ctx, annotate=False, scroll_y=None, source="auto"):
+    """Gläsern/multimodal: rendert die aktuelle simulierte App-GUI als echtes PNG (`png_bytes`)
+    fuer MCP-ImageContent samt sichtbaren Texten und nummerierten Tap-Koordinaten."""
+    try:
+        from tools.surface_raster import render_snapshot_to_png_bytes
+    except Exception as e:
+        return {"ok": False, "png_bytes": None, "meta": {"ok": False, "hinweis": f"Rasterizer nicht verfuegbar: {e!r}"}}
+
+    try:
+        snap = _select_active_ui_snapshot(source=source)
+    except Exception as e:
+        return {"ok": False, "png_bytes": None, "meta": {"ok": False, "hinweis": repr(e)}}
+
+    if snap is None:
+        return {
+            "ok": True,
+            "png_bytes": None,
+            "meta": {
+                "ok": True,
+                "ui": None,
+                "hinweis": "Noch keine simulierte App-GUI aktiv (weder in der Desktop-GUI noch per native_glass_run).",
+            },
+        }
+
+    out_png = os.path.join(_GLASS_SESSION_FOLDER, "last_ui.png")
+    try:
+        png_bytes, img_w, img_h = render_snapshot_to_png_bytes(
+            snap,
+            scroll_y=scroll_y,
+            annotate=bool(annotate),
+            save_path=out_png,
+        )
+    except Exception as e:
+        return {"ok": False, "png_bytes": None, "meta": {"ok": False, "hinweis": repr(e)}}
+
+    eff_sy = int(snap.get("scroll_y", 0) or 0) if scroll_y is None else max(0, int(scroll_y))
+    meta = {
+        "ok": True,
+        "source": snap.get("source"),
+        "package": snap.get("package"),
+        "updated_at": snap.get("updated_at"),
+        "screen_width": snap.get("width"),
+        "screen_height": snap.get("height"),
+        "image_width": img_w,
+        "image_height": img_h,
+        "scroll_y": eff_sy,
+        "max_scroll": snap.get("max_scroll", 0),
+        "dark_mode": bool(snap.get("dark_mode", False)),
+        "status_clock": snap.get("status_clock", "12:00"),
+        "toast_text": snap.get("toast_text"),
+        "annotate": bool(annotate),
+        "png_path": out_png,
+        "bytes": len(png_bytes),
+        "visible_texts": snap.get("text", [])[:60],
+        "interactive_elements": snap.get("interactive_elements", []),
+        "node_count": len(snap.get("nodes", [])),
+        "paint_count": len(snap.get("paint", [])),
+    }
+    return {"ok": True, "png_bytes": png_bytes, "path": out_png, "meta": meta}
+
+
 def native_ui_detect(ctx, studio_root=None):
-    """Gläsern/read-only: erkennt das UI-Toolkit einer entpackten App (klassisch/Compose/RN/Flutter)
+    """Gläsern/read-only: erkennt das UI-Toolkit einer entpackten App (klassisch/Compose/RN/Hybrid Web/NativeScript/Flutter)
     und nennt den passenden Render-Produzenten. Rueckgabe: {ok, runtime, producer, has_producer}."""
     try:
-        import core.java.canvas_recorder, core.java.rn_producer, core.java.skia_recorder, core.java.rn_js_bridge, core.java.rn_hermes_bridge  # noqa
+        from core.java.producer_wiring import ensure_default_producers
+        from core.java.surface import producers
+        ensure_default_producers(producers)
         from core.java.runtime_detect import producer_for_app
     except Exception as e:
         return {"ok": False, "hinweis": f"Erkennung nicht verfuegbar: {e!r}"}
     root = studio_root or (ctx.get("studio_root") if isinstance(ctx, dict) else None)
+    if not root:
+        root = _resolve_app_root_for_extract(ctx, None)
     try:
         key, prod = producer_for_app(app_dir=root)
         return {"ok": True, "runtime": key, "producer": key if prod is not None else None,
@@ -4724,48 +6425,103 @@ def native_ui_detect(ctx, studio_root=None):
         return {"ok": False, "hinweis": repr(e)}
 
 
+def native_webview_inspect(ctx, url="", app_root=None, forward_to_gui=False):
+    """In-Phone-Browser / WebView-DOM-Inspektor: entdeckt App-URLs (url='') oder ruft eine URL/HTML-Asset-Datei ab und parst DOM, Links, Formulare & Skripte."""
+    from services.webview_inspector_service import WebViewInspectorService, discover_app_urls
+    root = _resolve_app_root_for_extract(ctx, app_root)
+    web_events = getattr(_LAST_GLASS.get("tree"), "web_events", None)
+    u = str(url or "").strip()
+    if not u:
+        discovered = discover_app_urls(root, web_events=web_events) if root else []
+        if root:
+            try:
+                from core.java.hybrid_web_producer import analyze_hybrid_web_app
+                hw = analyze_hybrid_web_app(root)
+                seen_u = {it["url"] for it in discovered if isinstance(it, dict)}
+                for pg in (hw.get("pages") or ()):
+                    ap = pg.get("abs_path") or ""
+                    if ap and ap not in seen_u:
+                        discovered.append({"url": ap, "source": f"HybridPage ({pg.get('rel_path', '')})", "kind": "hybrid_page", "label": pg.get("title") or pg.get("rel_path") or ""})
+                        seen_u.add(ap)
+            except Exception:
+                pass
+        return {"ok": True, "app_root": root, "count": len(discovered), "discovered_urls": discovered}
+
+    target = u
+    if root and not target.startswith(("http://", "https://", "file:///")) and not os.path.isfile(target):
+        cand = os.path.join(root, target.lstrip("/\\"))
+        if os.path.isfile(cand):
+            target = cand
+
+    svc = WebViewInspectorService(base_dir=_base_dir(ctx))
+    res = svc.fetch_and_inspect(target)
+    if forward_to_gui:
+        _queue_gui_cmd(ctx, {"cmd": "open_browser", "url": target})
+    if not res.get("ok"):
+        return res
+    return {
+        "ok": True,
+        "url": res.get("url"),
+        "final_url": res.get("final_url"),
+        "method": res.get("method"),
+        "status": res.get("status"),
+        "reason": res.get("reason"),
+        "elapsed_ms": res.get("elapsed_ms"),
+        "title": res.get("title"),
+        "links": (res.get("links") or [])[:40],
+        "forms": (res.get("forms") or [])[:20],
+        "scripts": (res.get("scripts") or [])[:30],
+        "text_blocks": (res.get("text_blocks") or [])[:50],
+        "discovered_apis": res.get("api_urls") or [],
+        "resp_headers": res.get("resp_headers") or {},
+        "queued_to_gui": bool(forward_to_gui),
+    }
+
+
 def native_ui_render(ctx, path=None, title=None):
     """Gläsern: rendert die zuletzt gläserne UI zu PNG (am Ende kommt echte Grafik raus). Nutzt die
-    lebende In-memory-Surface (reflektiert tap/key), sonst die gespeicherte paint-Liste aus
+    lebende In-memory-Surface (reflektiert tap/key), sonst den gespeicherten Snapshot in
     last_ui.json. Rueckgabe: {ok, path, bytes, width, height}."""
     try:
-        from tools.surface_raster import render_surface_to_png, render_paint_to_png
+        from tools.surface_raster import render_surface_to_png, render_snapshot_to_png_bytes
     except Exception as e:
         return {"ok": False, "hinweis": f"Rasterizer nicht verfuegbar: {e!r}"}
     out = path or os.path.join(_GLASS_SESSION_FOLDER, "last_ui.png")
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     surf = _LAST_UI.get("surface")
+    w = h = None
     try:
         if surf is not None:
             render_surface_to_png(surf, out, title=title or "glass UI")
+            from core.java.surface import snapshot as _ui_snapshot
+            sn = _ui_snapshot(surf)
+            w, h = sn.get("width"), sn.get("height")
         else:
             p2 = os.path.join(_GLASS_SESSION_FOLDER, "last_ui.json")
             if not os.path.isfile(p2):
                 return {"ok": True, "path": None, "hinweis": "noch kein native.glass_run gelaufen"}
             with open(p2, encoding="utf-8") as f:
                 data = json.load(f)
-            render_paint_to_png(data.get("paint", []), out, title=title or "glass UI")
+            _, w_img, h_img = render_snapshot_to_png_bytes(data, title=title, save_path=out)
+            w = data.get("width") or w_img
+            h = data.get("height") or h_img
     except Exception as e:
         return {"ok": False, "hinweis": repr(e)}
     try:
         sz = os.path.getsize(out)
     except Exception:
         sz = None
-    w = h = None
-    if surf is not None:
-        try:
-            from core.java.surface import snapshot as _ui_snapshot
-            sn = _ui_snapshot(surf); w, h = sn.get("width"), sn.get("height")
-        except Exception:
-            pass
     return {"ok": True, "path": out, "bytes": sz, "width": w, "height": h}
 
 
-def native_ui_tap(ctx, x, y):
-    """Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen. Persistiert
-    die neue Momentaufnahme. Rueckgabe: {ok, handled}."""
+def native_ui_tap(ctx, x, y, forward_to_gui=False):
+    """Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen oder
+    (mit forward_to_gui=True) in die laufende Desktop-GUI einreihen. Rueckgabe: {ok, handled}."""
     surf = _LAST_UI.get("surface")
     if surf is None:
+        if forward_to_gui:
+            qres = native_glass_control(ctx, "ui_tap", json.dumps({"x": x, "y": y}))
+            return {"ok": bool(qres.get("ok")), "handled": bool(qres.get("ok")), "queued_to_gui": True, "x": x, "y": y}
         return {"ok": True, "handled": False, "hinweis": "noch kein native.glass_run gelaufen"}
     try:
         client = getattr(surf, "_hermes_client", None)
@@ -4787,11 +6543,19 @@ def native_ui_tap(ctx, x, y):
         return {"ok": False, "hinweis": repr(e)}
 
 
-def native_ui_key(ctx, text, x=None, y=None):
-    """Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben. Im echten Hermes-Pfad mit
-    (x,y) -> onChangeText am Eingabefeld (sonst erstes Eingabefeld). Rueckgabe: {ok, handled}."""
+def native_ui_key(ctx, text, x=None, y=None, forward_to_gui=False):
+    """Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben oder
+    (mit forward_to_gui=True) in die laufende Desktop-GUI einreihen. Rueckgabe: {ok, handled}."""
     surf = _LAST_UI.get("surface")
     if surf is None:
+        if forward_to_gui:
+            payload = {"text": text}
+            if x is not None:
+                payload["x"] = x
+            if y is not None:
+                payload["y"] = y
+            qres = native_glass_control(ctx, "ui_key", json.dumps(payload))
+            return {"ok": bool(qres.get("ok")), "handled": bool(qres.get("ok")), "queued_to_gui": True}
         return {"ok": True, "handled": False, "hinweis": "noch kein native.glass_run gelaufen"}
     try:
         client = getattr(surf, "_hermes_client", None)
@@ -4866,6 +6630,91 @@ def api_extract_flutter_static(ctx, app_root=None):
     return FlutterApiExtractorService.extract_from_app_root(root, extra_lib_dirs=extra)
 
 
+def api_extract_engine_static(ctx, app_root=None, engine="auto"):
+    """Extrahiert rein statisch API-/Web-Endpunkte fuer Hybrid-Web, React Native/Hermes, Flutter & Web-Assets."""
+    from core.java.runtime_detect import detect_runtime
+    from services.flutter_api_extractor_service import FlutterApiExtractorService
+    from services.webview_inspector_service import discover_app_urls
+
+    root = _resolve_app_root_for_extract(ctx, app_root)
+    if not root:
+        return {"ok": False, "error": "Kein entpackter App-Root gefunden (app_root angeben oder APK entpacken)."}
+
+    det_rt = detect_runtime(app_dir=root)
+    req_eng = str(engine or "auto").strip().lower()
+    templates = []
+    seen = set()
+
+    def _add_tpl(method, url, category, name="", source="", headers=None, body=""):
+        u = str(url or "").strip()
+        if not u:
+            return
+        m = str(method or "GET").upper()
+        key = (m, u)
+        if key in seen:
+            return
+        seen.add(key)
+        templates.append({
+            "id": f"tpl_{len(templates) + 1}",
+            "name": name or f"{m} {u[:60]}",
+            "category": category,
+            "method": m,
+            "url": u,
+            "headers": dict(headers or {}),
+            "body": body or "",
+            "source": source or category,
+        })
+
+    if req_eng in ("auto", "flutter") or det_rt == "flutter":
+        fl_res = api_extract_flutter_static(ctx, app_root=root)
+        for t in (fl_res.get("templates") or ()):
+            if isinstance(t, dict) and t.get("url"):
+                _add_tpl(t.get("method", "GET"), t["url"], t.get("category", "flutter"),
+                         name=t.get("name", ""), source=t.get("source", "flutter"),
+                         headers=t.get("headers"), body=t.get("body", ""))
+
+    if req_eng in ("auto", "hybrid web", "hybrid_web") or det_rt == "hybrid web":
+        try:
+            from core.java.hybrid_web_producer import analyze_hybrid_web_app
+            hw = analyze_hybrid_web_app(root)
+            for ep in (hw.get("api_endpoints") or ()):
+                if isinstance(ep, dict) and ep.get("url"):
+                    _add_tpl(ep.get("method", "GET"), ep["url"], ep.get("kind", "hybrid_web"),
+                             name=ep.get("label") or ep["url"], source="hybrid_web")
+            for u in (hw.get("urls") or ()):
+                _add_tpl("GET", u, "hybrid_url", name=u, source="hybrid_web")
+        except Exception:
+            pass
+
+    if req_eng in ("auto", "react native (js)", "react_native", "rn") or det_rt == "react native (js)":
+        try:
+            from core.java.rn_app_producer import extract_rn_app_spec
+            rn = extract_rn_app_spec(root)
+            for u in (rn.get("endpoints") or ()):
+                _add_tpl("GET", u, "react_native", name=u, source=f"rn:{rn.get('bundle_kind', 'js')}")
+        except Exception:
+            pass
+
+    try:
+        for it in discover_app_urls(root):
+            u = str((it or {}).get("url") or "").strip()
+            if u.startswith(("http://", "https://")):
+                _add_tpl("GET", u, it.get("kind", "web_asset"),
+                         name=it.get("label") or it.get("source") or u,
+                         source=it.get("source", "discover_app_urls"))
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "app_root": root,
+        "runtime": det_rt,
+        "engine": req_eng,
+        "count": len(templates),
+        "templates": templates,
+    }
+
+
 def api_import_templates(ctx, templates_json, app_root=None):
     """Uebernimmt ausgewaehlte statische API-Vorlagen in die API-Inspector-SQLite-DB (api_traffic.db)."""
     from services.flutter_api_extractor_service import FlutterApiExtractorService
@@ -4875,9 +6724,14 @@ def api_import_templates(ctx, templates_json, app_root=None):
         return {"ok": False, "error": f"Ungueltiges JSON: {e}"}
     # Erlaubt Liste kompletter Vorlage-Dicts ODER Liste von Vorlage-IDs (z.B. ["tpl_1","tpl_2"])
     if isinstance(items, list) and items and all(isinstance(x, str) for x in items):
-        scan = api_extract_flutter_static(ctx, app_root=app_root)
+        scan = api_extract_engine_static(ctx, app_root=app_root)
         by_id = {t["id"]: t for t in (scan.get("templates") or ()) if isinstance(t, dict)}
         resolved = [by_id[tid] for tid in items if tid in by_id]
+        if len(resolved) < len(items):
+            fl_scan = api_extract_flutter_static(ctx, app_root=app_root)
+            for t in (fl_scan.get("templates") or ()):
+                if isinstance(t, dict) and t.get("id") in items and t.get("id") not in by_id:
+                    resolved.append(t)
     elif isinstance(items, list):
         resolved = [x for x in items if isinstance(x, dict)]
     elif isinstance(items, dict):
@@ -4889,7 +6743,7 @@ def api_import_templates(ctx, templates_json, app_root=None):
     if ctx is not None and getattr(ctx, "cfg", None) is not None:
         db_path = ctx.cfg.paths.get("API_DB", "")
     if not db_path:
-        db_path = os.path.join(_REPO, "api_traffic.db")
+        db_path = os.path.join(_base_dir(ctx), "api_traffic.db")
     n = FlutterApiExtractorService.import_templates_to_db(db_path, resolved)
     return {"ok": True, "imported": n, "api_db": db_path}
 

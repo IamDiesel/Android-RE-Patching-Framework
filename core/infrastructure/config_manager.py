@@ -28,13 +28,18 @@ DEFAULT_CONFIG = {
     "INJECT_LSPATCH": False,
     "INJECT_NSC": True,
     "INJECT_DEBUGGABLE": False,
+    "DEBUGGER_PERSIST_SESSION": False,
     "MCP_SETTINGS": {
         "server": {"enabled": False, "autostart": False, "host": "127.0.0.1", "port": 8765, "transport": "http"},
         "require_confirm_each_call": True,
         "log_export_dir": os.path.join("Claude outputs", "logs"),
         "audit": {"enabled": True, "file": os.path.join("data", "mcp_audit.jsonl"), "log_args": True},
         "tools": {},
-        "caps": {"build": False, "flash": False, "app_start": False, "exec_run": False, "file_manager": False, "delete_ops": False},
+        "caps": {
+            "build": False, "flash": False, "app_start": False,
+            "exec_run": False, "file_manager": False, "delete_ops": False,
+            "dbg_write": False, "session_write": False, "os_write": False,
+        },
         "console": {"max_bytes": 20971520, "clear_on_app_start": True},
     },
     "FRIDA_SETTINGS": FridaConfig().to_dict(),  # NEU: Integration der Frida-Modi
@@ -194,7 +199,7 @@ class ConfigManager:
                 merged = dict(disk[k]); merged.update(v); disk[k] = merged
             else:
                 disk[k] = v
-        disk["BASE_DIR"] = CURRENT_DIR
+        disk["BASE_DIR"] = self.config.get("BASE_DIR") or CURRENT_DIR
         json_store.atomic_write_text(self.config_file, json.dumps(disk, indent=4))
         self.config = disk
         if "FRIDA_SETTINGS" in disk:

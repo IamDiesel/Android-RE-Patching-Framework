@@ -24,6 +24,10 @@ class DeviceProfile:
         "product": "caiman",
         "fingerprint": "google/caiman/caiman:14/AP1A/user",
         "thread_priority": 0,     # Process.getThreadPriority Default
+        "clock_epoch_ms": None,   # optionale feste Startzeit (Epoch-ms)
+        "clock_iso":      None,   # optionale Startzeit als ISO-String ("2026-11-21 14:30:00")
+        "clock_tz":       None,   # optionale Zeitzone ("Europe/Berlin", "UTC", ...; None = Host-Lokal)
+        "clock_frozen":   False,  # True = System.currentTimeMillis() schreitet nicht automatisch voran
     }
 
     def __init__(self, **over):

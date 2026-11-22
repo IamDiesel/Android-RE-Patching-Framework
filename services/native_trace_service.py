@@ -80,6 +80,8 @@ class NativeTraceService:
                 pass
         cpu.lr = _SENT
         cpu.pc = int(entry) & _M64
+        cpu.stopped = False
+        cpu.stop_reason = None
         if faithful:
             try:
                 cpu.inline_loops = False
@@ -104,7 +106,7 @@ class NativeTraceService:
             return {"ok": False, "why": "error", "error": repr(e)}
         return {"ok": True, "done": (newpc == _SENT), "pc": newpc, "pc_hex": f"0x{newpc:x}"}
 
-    def step_insn(self, eng) -> dict:
+    def _step_one_insn(self, eng) -> dict:
         """Eine Instruktion (Interpreter-Pfad). Block-Einstieg nur bei Blockwechsel anhaengen."""
         cpu = eng.cpu
         pc = int(cpu.pc) & _M64
@@ -139,6 +141,32 @@ class NativeTraceService:
         return {"ok": True, "done": (newpc == _SENT), "pc": newpc, "pc_hex": f"0x{newpc:x}",
                 "insn": {"pc_hex": f"0x{pc:x}", "mnem": mnem, "ops": ins[2]}}
 
+    def step_insn(self, eng, n: int = 1) -> dict:
+        """Eine oder ``n`` Instruktionen (Interpreter-Pfad); bricht bei Fehler/Ende/stopped ab."""
+        steps = max(1, int(n))
+        res = None
+        for _ in range(steps):
+            if getattr(eng.cpu, "stopped", False):
+                pc = int(eng.cpu.pc) & _M64
+                if res is not None and res.get("ok"):
+                    res["stopped"] = True
+                    res["stop_reason"] = getattr(eng.cpu, "stop_reason", None) or "stopped"
+                    return res
+                return {"ok": True, "done": False, "stopped": True,
+                        "stop_reason": getattr(eng.cpu, "stop_reason", None) or "stopped",
+                        "pc": pc, "pc_hex": f"0x{pc:x}"}
+            res = self._step_one_insn(eng)
+            if not res.get("ok") or res.get("done"):
+                if getattr(eng.cpu, "stopped", False) and res.get("ok"):
+                    res["stopped"] = True
+                    res["stop_reason"] = getattr(eng.cpu, "stop_reason", None) or "stopped"
+                return res
+            if getattr(eng.cpu, "stopped", False):
+                res["stopped"] = True
+                res["stop_reason"] = getattr(eng.cpu, "stop_reason", None) or "stopped"
+                return res
+        return res
+
     # ---- Lauf bis Breakpoint / Ende / Budget ----------------------------
     def run(self, eng, breakpoints: Sequence = (), maxins: int = 2_000_000,
             mode: str = "block", skip_first_bp: bool = False) -> dict:
@@ -149,7 +177,7 @@ class NativeTraceService:
         bps = set()
         for b in (breakpoints or []):
             try:
-                bps.add(int(b) & _M64)
+                bps.add((int(b, 0) if isinstance(b, str) else int(b)) & _M64)
             except Exception:
                 pass
         tick = self.step_insn if mode == "insn" else self.step_block
@@ -157,6 +185,10 @@ class NativeTraceService:
         first = True
         while True:
             pc = int(eng.cpu.pc) & _M64
+            if getattr(eng.cpu, "stopped", False):
+                return {"ok": True, "stopped": True,
+                        "stop_reason": getattr(eng.cpu, "stop_reason", None) or "stopped",
+                        "steps": steps, "pc": pc, "pc_hex": f"0x{pc:x}"}
             if pc == _SENT:
                 return {"ok": True, "done": True, "steps": steps, "pc": pc, "pc_hex": f"0x{pc:x}"}
             _sv = getattr(eng, "_survive", None)
@@ -191,6 +223,11 @@ class NativeTraceService:
                 r["steps"] = steps
                 return r
             steps += 1
+            if getattr(eng.cpu, "stopped", False):
+                pcn = int(eng.cpu.pc) & _M64
+                return {"ok": True, "stopped": True,
+                        "stop_reason": getattr(eng.cpu, "stop_reason", None) or "stopped",
+                        "steps": steps, "pc": pcn, "pc_hex": f"0x{pcn:x}"}
             # G-OS-0: Syscall-Breakpoint -> an der Block-/Insn-Grenze pausieren
             sb = getattr(eng.cpu, "_svc_break", None)
             if sb is not None:
@@ -254,25 +291,31 @@ class NativeTraceService:
 
     def dispatch_trace_enable(self, eng, vt_base: int = 0x137740,
                               lo: int = 0x136000, hi: int = 0x13a000,
-                              cap: int = 200000) -> dict:
+                              cap: int = 200000, row_stride: int = 0x7f0) -> dict:
         """Read-Watchpoint auf die CFF-vtable-Region [lo,hi). Jeder 8-Byte-Read dort ist ein
         Dispatch-Fetch und wird als {pc,slot,idx1,col,val,empty,val_taint,x19,x20,x20_taint}
         an eng._disp['log'] protokolliert. Additiv, bit-neutral (nur Lesen). disable() stellt
         die Originale wieder her."""
-        st = {"vt": int(vt_base), "lo": int(lo), "hi": int(hi), "cap": int(cap), "log": []}
+        if getattr(eng, "_disp_orig", None):
+            self.dispatch_trace_disable(eng)
+        stride = int(row_stride) or 0x7f0
+        st = {"vt": int(vt_base), "lo": int(lo), "hi": int(hi), "cap": int(cap),
+              "row_stride": stride, "log": []}
         eng._disp = st
         eng._disp_orig = {}
         m = eng.cpu.m
         log = st["log"]
         taint = self._disp_taint
+        in_r64 = [False]
 
         def rec(ai, val):
             if len(log) >= st["cap"]:
                 return
             cpu = eng.cpu
             off = ai - st["vt"]
-            idx1 = off // 0x7f0 if off >= 0 else -((-off) // 0x7f0 + 1)
-            col = (off - idx1 * 0x7f0) // 8
+            rs = st["row_stride"]
+            idx1 = off // rs
+            col = (off - idx1 * rs) // 8
             v = int(val) & _M64
             x20 = int(cpu.x[20]) & _M64
             log.append({"pc": int(getattr(cpu, "pc", 0) or 0) & _M64, "slot": ai, "idx1": idx1, "col": col,
@@ -284,7 +327,13 @@ class NativeTraceService:
             eng._disp_orig["r64"] = orig64
 
             def w64(a):
-                val = orig64(a)
+                if in_r64[0]:
+                    return orig64(a)
+                in_r64[0] = True
+                try:
+                    val = orig64(a)
+                finally:
+                    in_r64[0] = False
                 if st["lo"] <= a < st["hi"]:
                     rec(a, val)
                 return val
@@ -296,7 +345,7 @@ class NativeTraceService:
 
             def wr(a, sz):
                 val = origr(a, sz)
-                if sz == 8 and st["lo"] <= a < st["hi"]:
+                if not in_r64[0] and sz == 8 and st["lo"] <= a < st["hi"]:
                     rec(a, val)
                 return val
             m.r = wr

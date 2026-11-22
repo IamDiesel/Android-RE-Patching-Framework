@@ -36,6 +36,7 @@ class DockManager:
         self._popups = {}
         self._group_tops = {}   # (zone,group) -> Toplevel (abgedockt)
         self._nb_arrows = {}    # str(nb) -> (prev,next) Scroll-Pfeile
+        self._realized_frame_vids = {}
         self._drag = None
         self._ghost = None
         self.layout_path = layout_path or os.path.join("config", "ui_layouts", "debugger.json")
@@ -99,9 +100,6 @@ class DockManager:
                     w = pane.nametowidget(p); pane.forget(w); w.destroy()
                 except Exception:
                     pass
-        for fr in (self.top_zone, self.status_zone):
-            for ch in list(fr.winfo_children()):
-                ch.destroy()
         self._group_nb.clear()
         self._nb_arrows.clear()
         # _nb_info/_tab_vid: externe Eintraege behalten, interne neu aufbauen
@@ -113,8 +111,13 @@ class DockManager:
         self._zone_items = {}       # zone -> list[(collapsed_bool, weight)]
         self._zone_visible = {}     # zone -> hat mindestens eine sichtbare Gruppe
         for zone, fr in self._frame_zone.items():
-            for vid in self.model.views_in(zone):
-                self._make_widget(vid, fr, as_tab=False)
+            want_vids = tuple(self.model.views_in(zone))
+            if self._realized_frame_vids.get(zone) != want_vids or not fr.winfo_children():
+                for ch in list(fr.winfo_children()):
+                    ch.destroy()
+                for vid in want_vids:
+                    self._make_widget(vid, fr, as_tab=False)
+                self._realized_frame_vids[zone] = want_vids
         for zone in self._notebook_zones:
             pane = self._zone_pane[zone]
             items = []
@@ -491,13 +494,13 @@ class DockManager:
         if idx < 0 or idx >= len(tabs):
             self._drag = None; return
         vid = self._tab_vid.get(tabs[idx])   # None = app-eigener Tab (nicht verschiebbar)
-        self._drag = {"vid": vid, "src": nb, "x": e.x_root, "y": e.y_root, "active": False}
+        self._drag = {"vid": vid, "src": nb, "idx": idx, "x": e.x_root, "y": e.y_root, "active": False}
 
     def _dnd_motion(self, e):
         d = self._drag
         if not d or d.get("vid") is None:
             return
-        if not d["active"] and (abs(e.x_root - d["x"]) + abs(e.y_root - d["y"])) > 6:
+        if not d["active"] and (abs(e.x_root - d["x"]) + abs(e.y_root - d["y"])) > 18:
             d["active"] = True
             self._start_ghost(self.model.views[d["vid"]].title)
         if d["active"]:
@@ -523,6 +526,9 @@ class DockManager:
             tnb.index("@%d,%d" % (lx, ly))
         except Exception:
             on_tab = False
+        # Gleiche Tableiste im selben Notebook -> kein Rebuild/Reset ausloesen!
+        if tnb is d.get("src") and on_tab:
+            return
         if zone in self._ext_nb:
             self.model.set_zone(vid, zone); self.model.set_group(vid, 0)
         elif on_tab:

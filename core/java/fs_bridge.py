@@ -17,6 +17,17 @@ import posixpath
 import zipfile
 
 from core.java.objects import JString, JObject, JArray
+from core.java.sdk_breadth_g15 import (
+    bb_buf,
+    bb_is_big,
+    bb_limit,
+    bb_make,
+    bb_order_is_big,
+    bb_pos,
+    bb_set_big,
+    bb_set_limit,
+    bb_set_pos,
+)
 
 
 # ---- VFS 2.0 des laufenden OS beschaffen (lazy aufbauen, SELBES Objekt wie Syscalls) ----
@@ -163,11 +174,21 @@ def _reg_file(stubs):
         return JString(posixpath.basename(_file_path(a[0]) or ""))
     R("Ljava/io/File;", "getName", "()Ljava/lang/String;", _name)
 
+    def _parent_path(a):
+        p = (_file_path(a[0]) or "") if a else ""
+        if not p or p == "/":
+            return None
+        par = posixpath.dirname(p.rstrip("/") or "/")
+        if not par or (par == "/" and p == "/"):
+            return None
+        return par
+
     def _parent(a):
-        return JString(posixpath.dirname(_file_path(a[0]) or ""))
+        par = _parent_path(a)
+        return JString(par) if par is not None else None
     R("Ljava/io/File;", "getParent", "()Ljava/lang/String;", _parent)
     R("Ljava/io/File;", "getParentFile", "()Ljava/io/File;",
-      lambda a: _mkfile(posixpath.dirname(_file_path(a[0]) or "")))
+      lambda a: (lambda par: _mkfile(par) if par is not None else None)(_parent_path(a)))
 
     def _exists(a):
         p = _file_path(a[0])
@@ -1650,11 +1671,10 @@ def _reg_dexloaders(stubs):
         return _dex_from_bytes(fs.read(ino))
 
     def _buf_bytes(bb):
-        """ByteBuffer-JObject -> bytes (fields['buf'] oder umhuelltes [B)."""
+        """ByteBuffer-JObject -> bytes (unifiziertes buf/_buf oder umhuelltes [B)."""
         if isinstance(bb, JObject):
-            b = bb.fields.get("buf")
-            if b is not None:
-                return bytes(b)
+            if "buf" in bb.fields or "_buf" in bb.fields:
+                return bytes(bb_buf(bb))
             arr = bb.fields.get("array")
             if isinstance(arr, JArray):
                 return _bytes_of_array(arr)
@@ -1793,12 +1813,9 @@ def _reg_dexloaders(stubs):
     bn("loadClass", "(Ljava/lang/String;Z)Ljava/lang/Class;", _loadclass)
     bn("findClass", "(Ljava/lang/String;)Ljava/lang/Class;", _loadclass)
 
-    # --- minimale ByteBuffer-Unterstuetzung (allocate/wrap/put/position/flip) fuer InMemory-Loader ---
+    # --- unifizierte ByteBuffer-Unterstuetzung (geteilt mit G14/G15 via bb_*) ---
     def _bb_new(buf, lim=None):
-        ba = bytearray(buf)
-        return JObject("Ljava/nio/ByteBuffer;", {
-            "buf": ba, "pos": 0, "limit": len(ba) if lim is None else int(lim), "order": "big",
-        })
+        return bb_make(buf, lim)
 
     def _bb_put_bytes(a):
         o = a[0] if a else None
@@ -1811,23 +1828,23 @@ def _reg_dexloaders(stubs):
             chunk = bytes(int(x) & 0xFF for x in src.data[off:off + max(0, cnt)])
         elif isinstance(src, JObject):
             raw = _buf_bytes(src)
-            chunk = raw[int(src.fields.get("pos", 0)):int(src.fields.get("limit", len(raw)))]
+            spos = bb_pos(src)
+            slim = bb_limit(src)
+            chunk = raw[spos:slim]
+            bb_set_pos(src, spos + len(chunk))
         elif isinstance(src, int):
             chunk = bytes([src & 0xFF])
         else:
             chunk = b""
-        ba = o.fields.get("buf")
-        if not isinstance(ba, bytearray):
-            ba = bytearray(ba or b"")
-            o.fields["buf"] = ba
-        pos = int(o.fields.get("pos", 0))
+        ba = bb_buf(o)
+        pos = bb_pos(o)
         end = pos + len(chunk)
         if end > len(ba):
             ba.extend(b"\x00" * (end - len(ba)))
         ba[pos:end] = chunk
-        o.fields["pos"] = end
-        if end > int(o.fields.get("limit", len(ba))):
-            o.fields["limit"] = end
+        bb_set_pos(o, end)
+        if end > bb_limit(o):
+            bb_set_limit(o, end)
         return o
 
     def _bb_pos(a):
@@ -1835,9 +1852,8 @@ def _reg_dexloaders(stubs):
         if not isinstance(o, JObject):
             return 0
         if len(a) > 1 and isinstance(a[1], int):
-            o.fields["pos"] = max(0, int(a[1]))
-            return o
-        return int(o.fields.get("pos", 0))
+            return bb_set_pos(o, int(a[1]))
+        return bb_pos(o)
 
     R("Ljava/nio/ByteBuffer;", "allocate", "(I)Ljava/nio/ByteBuffer;",
       lambda a: _bb_new(bytearray(max(0, int(a[0])) if a else 0)))
@@ -1858,42 +1874,47 @@ def _reg_dexloaders(stubs):
     R("Ljava/nio/Buffer;", "position", "()I", _bb_pos)
     R("Ljava/nio/Buffer;", "position", "(I)Ljava/nio/Buffer;", _bb_pos)
     R("Ljava/nio/ByteBuffer;", "limit", "()I",
-      lambda a: int(a[0].fields.get("limit", len(a[0].fields.get("buf", b"")))) if a and isinstance(a[0], JObject) else 0)
+      lambda a: bb_limit(a[0]) if a and isinstance(a[0], JObject) else 0)
     R("Ljava/nio/ByteBuffer;", "limit", "(I)Ljava/nio/Buffer;",
-      lambda a: (a[0].fields.__setitem__("limit", int(a[1])) or a[0]) if len(a) > 1 and isinstance(a[0], JObject) else None)
+      lambda a: bb_set_limit(a[0], int(a[1])) if len(a) > 1 and isinstance(a[0], JObject) else None)
     R("Ljava/nio/ByteBuffer;", "capacity", "()I",
-      lambda a: len(a[0].fields.get("buf", b"")) if a and isinstance(a[0], JObject) else 0)
+      lambda a: len(bb_buf(a[0])) if a and isinstance(a[0], JObject) else 0)
     R("Ljava/nio/ByteBuffer;", "remaining", "()I",
-      lambda a: max(0, int(a[0].fields.get("limit", len(a[0].fields.get("buf", b"")))) - int(a[0].fields.get("pos", 0)))
-      if a and isinstance(a[0], JObject) else 0)
+      lambda a: max(0, bb_limit(a[0]) - bb_pos(a[0])) if a and isinstance(a[0], JObject) else 0)
     R("Ljava/nio/ByteBuffer;", "flip", "()Ljava/nio/Buffer;",
-      lambda a: (a[0].fields.update({"limit": int(a[0].fields.get("pos", 0)), "pos": 0}) or a[0])
+      lambda a: (bb_set_limit(a[0], bb_pos(a[0])), bb_set_pos(a[0], 0), a[0])[2]
       if a and isinstance(a[0], JObject) else None)
     R("Ljava/nio/ByteBuffer;", "flip", "()Ljava/nio/ByteBuffer;",
-      lambda a: (a[0].fields.update({"limit": int(a[0].fields.get("pos", 0)), "pos": 0}) or a[0])
+      lambda a: (bb_set_limit(a[0], bb_pos(a[0])), bb_set_pos(a[0], 0), a[0])[2]
       if a and isinstance(a[0], JObject) else None)
     R("Ljava/nio/ByteBuffer;", "clear", "()Ljava/nio/Buffer;",
-      lambda a: (a[0].fields.update({"limit": len(a[0].fields.get("buf", b"")), "pos": 0}) or a[0])
+      lambda a: (bb_set_limit(a[0], len(bb_buf(a[0]))), bb_set_pos(a[0], 0), a[0])[2]
       if a and isinstance(a[0], JObject) else None)
     R("Ljava/nio/ByteBuffer;", "rewind", "()Ljava/nio/Buffer;",
-      lambda a: (a[0].fields.__setitem__("pos", 0) or a[0]) if a and isinstance(a[0], JObject) else None)
+      lambda a: bb_set_pos(a[0], 0) if a and isinstance(a[0], JObject) else None)
     R("Ljava/nio/ByteBuffer;", "hasArray", "()Z", lambda a: 1)
     R("Ljava/nio/ByteBuffer;", "array", "()[B",
-      lambda a: JArray("[B", list(a[0].fields.get("buf", b""))) if a and isinstance(a[0], JObject) else JArray("[B", []))
+      lambda a: JArray("[B", list(bb_buf(a[0]))) if a and isinstance(a[0], JObject) else JArray("[B", []))
     R("Ljava/nio/ByteBuffer;", "order", "(Ljava/nio/ByteOrder;)Ljava/nio/ByteBuffer;",
-      lambda a: (a[0].fields.__setitem__("order", a[1].fields.get("order", "big") if isinstance(a[1], JObject) else "big") or a[0])
+      lambda a: bb_set_big(a[0], bb_order_is_big(a[1]))
       if len(a) > 1 and isinstance(a[0], JObject) else None)
     R("Ljava/nio/ByteBuffer;", "order", "()Ljava/nio/ByteOrder;",
-      lambda a: JObject("Ljava/nio/ByteOrder;", {"order": a[0].fields.get("order", "big") if a and isinstance(a[0], JObject) else "big"}))
+      lambda a: (lambda big: JObject("Ljava/nio/ByteOrder;", {"order": "big" if big else "little", "_le": not big}))(
+          bb_is_big(a[0]) if a and isinstance(a[0], JObject) else True))
 
     def _sb_view(a, view_cls):
         o = a[0] if a else None
         if not isinstance(o, JObject):
-            return JObject(view_cls, {"buf": b"", "pos": 0, "order": "big"})
-        pos = int(o.fields.get("pos", 0))
-        lim = int(o.fields.get("limit", len(o.fields.get("buf", b""))))
-        raw = bytes(o.fields.get("buf", b""))[pos:lim]
-        return JObject(view_cls, {"buf": raw, "pos": 0, "order": o.fields.get("order", "big")})
+            return JObject(view_cls, {"buf": bytearray(), "_buf": bytearray(), "pos": 0, "_pos": 0, "order": "big", "_big": True})
+        pos = bb_pos(o)
+        lim = bb_limit(o)
+        raw = bytearray(bytes(bb_buf(o))[pos:lim])
+        big = bb_is_big(o)
+        return JObject(view_cls, {
+            "buf": raw, "_buf": raw, "pos": 0, "_pos": 0,
+            "limit": len(raw), "_lim": len(raw),
+            "order": "big" if big else "little", "_big": big,
+        })
 
     def _view_get_arr(a, signed: bool):
         import struct as _st
@@ -1903,15 +1924,15 @@ def _reg_dexloaders(stubs):
         cnt = int(a[3]) if len(a) > 3 else (len(dst.data) if isinstance(dst, JArray) else 0)
         if not isinstance(o, JObject) or not isinstance(dst, JArray):
             return o
-        raw = o.fields.get("buf", b"")
-        bpos = int(o.fields.get("pos", 0)) * 2
-        fmt = ("<" if o.fields.get("order", "big") == "little" else ">") + ("h" if signed else "H")
+        raw = bytes(bb_buf(o))
+        bpos = bb_pos(o) * 2
+        fmt = ("<" if not bb_is_big(o) else ">") + ("h" if signed else "H")
         for i in range(max(0, cnt)):
             if bpos + 2 > len(raw) or off + i >= len(dst.data):
                 break
             dst.data[off + i] = _st.unpack_from(fmt, raw, bpos)[0]
             bpos += 2
-        o.fields["pos"] = bpos // 2
+        bb_set_pos(o, bpos // 2)
         return o
 
     R("Ljava/nio/ByteBuffer;", "asShortBuffer", "()Ljava/nio/ShortBuffer;", lambda a: _sb_view(a, "Ljava/nio/ShortBuffer;"))

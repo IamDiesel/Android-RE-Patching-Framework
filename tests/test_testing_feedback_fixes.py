@@ -754,6 +754,12 @@ def test_virtuagym_onboarding_viewpager2_questions_and_next_navigation():
     assert "Beginner" not in txts2_after
 
     _tap_node(tree.root.find("primary_button"))
+    txts3 = [c.get("text", "") for c in surf.paint() if c.get("text")]
+    if "Connect with Health Connect" in txts3:
+        _tap_node(tree.root.find("primary_button"))
+        txts4 = [c.get("text", "") for c in surf.paint() if c.get("text")]
+        if "Who do you want as your coach?" in txts4:
+            _tap_node(tree.root.find("primary_button"))
     pending = getattr(stubs, "_pending_nav_target", "") or ""
     assert "LoadingIntakeActivity" in pending
     assert runner.navigate_to_pending() is True

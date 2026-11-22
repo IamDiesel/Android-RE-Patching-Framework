@@ -53,6 +53,7 @@ class NativeLinkRuntime:
         self.inner = inner
         self.bridge = bridge
         self.table = table
+        self.stubs = getattr(inner, "stubs", None)
 
     def resolve_invoke(self, cls, name, sig, args, static):
         ent = self.table.lookup(cls, name, sig)
@@ -128,8 +129,11 @@ def _install_loadlibrary_stub(vm, on_load_library, on_load_path=None):
             return inner.resolve_invoke(cls, name, sig, args, static)
         return False, 0
 
+    _orig_inner = inner
+
     class _LoadLibWrap:
-        stubs = getattr(inner, "stubs", None)
+        inner = _orig_inner
+        stubs = getattr(_orig_inner, "stubs", None)
 
         def resolve_invoke(self, cls, name, sig, args, static):
             return _cb(cls, name, sig, args, static)

@@ -33,7 +33,8 @@ def to_descriptor(dotted):
 
 class AppManifest:
     def __init__(self, package=None, application=None, launchers=None, activities=None, *,
-                 receivers=None, services=None, providers=None, deep_links=None, meta_data=None):
+                 receivers=None, services=None, providers=None, deep_links=None, meta_data=None,
+                 launch_modes=None):
         self.package = package
         self.application = application
         self.launchers = launchers or []
@@ -43,6 +44,7 @@ class AppManifest:
         self.providers = providers or []
         self.deep_links = deep_links or []
         self.meta_data = meta_data or {}
+        self.launch_modes = dict(launch_modes or {})
 
     def entry(self):
         """Bevorzugter App-Einstieg: erste Launcher-Activity, sonst erste Activity, sonst None."""
@@ -63,6 +65,7 @@ class AppManifest:
             "providers": list(self.providers),
             "deep_links": list(self.deep_links),
             "meta_data": dict(self.meta_data),
+            "launch_modes": dict(self.launch_modes),
         }
 
 
@@ -97,6 +100,15 @@ def parse_manifest_text(xml_text):
                     acts.append(an)
         return acts
 
+    def _extract_meta(parent_el):
+        out = {}
+        for md in parent_el.findall("meta-data"):
+            mk = _name_attr(md)
+            if mk:
+                mv = md.get(_A + "value") or md.get("value") or md.get(_A + "resource") or md.get("resource") or ""
+                out[mk] = mv
+        return out
+
     app_el = root.find("application")
     application = None
     launchers = []
@@ -106,15 +118,12 @@ def parse_manifest_text(xml_text):
     providers = []
     deep_links = []
     meta_data = {}
+    launch_modes = {}
     if app_el is not None:
         app_name = _name_attr(app_el)
         if app_name and app_name not in ("androidx.core.app.CoreComponentFactory",):
             application = to_descriptor(_qualify(app_name))
-        for md in app_el.findall("meta-data"):
-            mk = _name_attr(md)
-            if mk:
-                mv = md.get(_A + "value") or md.get("value") or md.get(_A + "resource") or md.get("resource") or ""
-                meta_data[mk] = mv
+        meta_data.update(_extract_meta(app_el))
         for act in app_el.findall("activity") + app_el.findall("activity-alias"):
             nm = _name_attr(act)
             # activity-alias: Ziel ist targetActivity
@@ -123,6 +132,9 @@ def parse_manifest_text(xml_text):
             desc = to_descriptor(cls)
             if desc and desc not in activities:
                 activities.append(desc)
+            lm = (_attr(act, "launchMode", "") or "").strip()
+            if desc and lm:
+                launch_modes[desc] = lm
             is_launcher = False
             for itf in act.findall("intent-filter"):
                 has_main = any(_name_attr(a) == "android.intent.action.MAIN"
@@ -151,16 +163,35 @@ def parse_manifest_text(xml_text):
         for svc in app_el.findall("service"):
             sdesc = to_descriptor(_qualify(_name_attr(svc)))
             if sdesc:
-                services.append({"cls": sdesc, "actions": _extract_actions(svc)})
+                services.append({
+                    "cls": sdesc,
+                    "actions": _extract_actions(svc),
+                    "meta_data": _extract_meta(svc),
+                })
         for prv in app_el.findall("provider"):
             pdesc = to_descriptor(_qualify(_name_attr(prv)))
             if pdesc:
                 auth = _attr(prv, "authorities")
-                providers.append({"cls": pdesc, "authorities": auth})
+                init_raw = _attr(prv, "initOrder", "0")
+                try:
+                    init_order = int(str(init_raw).strip(), 0)
+                except Exception:
+                    init_order = 0
+                en_raw = (_attr(prv, "enabled", "true") or "true").strip().lower()
+                exp_raw = (_attr(prv, "exported", "false") or "false").strip().lower()
+                providers.append({
+                    "cls": pdesc,
+                    "authorities": auth,
+                    "init_order": init_order,
+                    "enabled": (en_raw not in ("false", "0")),
+                    "exported": (exp_raw in ("true", "1")),
+                    "meta_data": _extract_meta(prv),
+                })
     return AppManifest(
         package, application, launchers, activities,
         receivers=receivers, services=services, providers=providers,
         deep_links=deep_links, meta_data=meta_data,
+        launch_modes=launch_modes,
     )
 
 

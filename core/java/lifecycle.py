@@ -22,6 +22,25 @@ class _StubRuntime:
     def resolve_invoke(self, cls, name, sig, args, static):
         return self.stubs.resolve(cls, name, sig, args, static)
 
+    def resolve_phased(self, wants, rcls, cls, name, sig, args, static):
+        if hasattr(self.stubs, "resolve_phased"):
+            return self.stubs.resolve_phased(wants, rcls, cls, name, sig, args, static)
+        for want in wants:
+            h, r = self.stubs.resolve(want, name, sig, args, static)
+            if h:
+                return h, r
+        return False, 0
+
+
+def _is_fatal_vm_exc(exc, include_budget=False):
+    from core.java.deviation_journal import DebugStop
+    if isinstance(exc, DebugStop):
+        return True
+    if include_budget:
+        from core.java.dalvik import DalvikUnknownOpcode, VmBudgetExceeded
+        return isinstance(exc, (DalvikUnknownOpcode, VmBudgetExceeded))
+    return False
+
 
 class LifecycleRunner:
     # (Methode, Signatur, Anzahl Stub-Argumente nach `this`)
@@ -72,6 +91,7 @@ class LifecycleRunner:
         self.activity_stack = existing_stack if isinstance(existing_stack, list) else []
         if self.stubs is not None:
             self.stubs._activity_stack = self.activity_stack
+            self.stubs._active_runner = self
         # Echter Context fuer attachBaseContext (statt None)
         self._context = None
         try:
@@ -100,7 +120,10 @@ class LifecycleRunner:
             label = "Entry-Klasse nicht gefunden" if role == "entry" else "Klasse nicht gefunden"
             phase["skipped"].append({"m": "*", "sig": "*", "grund": label})
             return phase
-        this = JObject(descriptor, {})
+        if role == "application" and self.stubs is not None and isinstance(getattr(self.stubs, "application", None), JObject) and self.stubs.application.cls == descriptor:
+            this = self.stubs.application
+        else:
+            this = JObject(descriptor, {})
         if intent is not None:
             this.fields["_intent"] = intent
         if role == "application" and self.stubs is not None:
@@ -117,7 +140,11 @@ class LifecycleRunner:
                 ftag.clear()
             tree = getattr(self.stubs, "view_tree", None)
             if tree is not None:
+                tree.root = None
                 tree._compose_recompose = None
+                rst = getattr(tree, "_reset_compose_for_new_activity", None)
+                if callable(rst):
+                    rst()
         for name, sig, extra in sequence:
             md = methods.get((name, sig))
             if md is None:                                # geerbte Lifecycle-Methode (z.B. ReactActivity)
@@ -130,17 +157,68 @@ class LifecycleRunner:
                 continue
             args = tuple([this] + self._extra_args(name, extra))
             try:
-                self.vm._run_mdef(md, list(args))         # md ggf. aus Superklasse, this = Subklasse
+                if role == "activity" and name == "onCreate" and self.stubs is not None:
+                    self.stubs._in_activity_oncreate = True
+                try:
+                    self.vm._run_mdef(md, list(args))         # md ggf. aus Superklasse, this = Subklasse
+                finally:
+                    if role == "activity" and name == "onCreate" and self.stubs is not None:
+                        self.stubs._in_activity_oncreate = False
                 phase["called"].append({"m": name, "sig": sig, "in": md.cls})
                 if role == "activity":
                     self._fire_activity_callbacks(name, sig, this)
+                    if self.stubs is not None and (
+                        getattr(self.stubs, "_activity_finished", False)
+                        or bool(this.fields.get("_finishing"))
+                    ):
+                        txs = getattr(self.stubs, "_pending_fragment_txs", None)
+                        if isinstance(txs, list):
+                            txs.clear()
+                        break
                     if name in ("onCreate", "onResume") and self.stubs is not None:
                         fl = getattr(self.stubs, "_flush_fragment_transactions", None)
                         if callable(fl):
                             fl()
+                        if name == "onCreate":
+                            bind_menu = getattr(self.stubs, "_bind_activity_options_menu", None)
+                            if callable(bind_menu):
+                                bind_menu(this)
             except Exception as e:                       # noqa
+                if _is_fatal_vm_exc(e):
+                    raise
                 phase["errors"].append({"m": name, "sig": sig, "err": repr(e)})
+        if role == "activity" and self.stubs is not None and not (
+            getattr(self.stubs, "_activity_finished", False) or bool(this.fields.get("_finishing"))
+        ):
+            self._recompose_if_needed()
         return phase
+
+    def _recompose_if_needed(self):
+        if self.stubs is None or getattr(self, "_in_recompose_sync", False):
+            return
+        if getattr(self.stubs, "_pending_nav_target", None) or getattr(self.stubs, "_activity_finished", False):
+            return
+        tree = getattr(self.stubs, "view_tree", None)
+        rc_dirty = getattr(tree, "recompose_if_dirty", None) if tree is not None else None
+        if not callable(rc_dirty):
+            return
+        from core.java.dalvik import VmBudgetExceeded
+        old_b = getattr(self.vm, "step_budget", None) if self.vm is not None else None
+        cur_s = int(getattr(self.vm, "steps", 0) or 0) if self.vm is not None else 0
+        self._in_recompose_sync = True
+        try:
+            if isinstance(old_b, int) and old_b > 0:
+                self.vm.step_budget = max(old_b, cur_s + 900_000)
+            try:
+                rc_dirty()
+            except VmBudgetExceeded:
+                if not (tree.root is not None and tree.root.children):
+                    raise
+        finally:
+            if isinstance(old_b, int) and old_b > 0 and self.vm is not None:
+                rem = max(0, old_b - cur_s)
+                self.vm.step_budget = max(old_b, int(getattr(self.vm, "steps", 0) or 0) + min(rem, 100_000))
+            self._in_recompose_sync = False
 
     _ACT_CB = {
         ("onCreate", "(Landroid/os/Bundle;)V"):
@@ -181,13 +259,21 @@ class LifecycleRunner:
                     ok_h, _ = _hk(cls, cls, name, sig, list(args), False, self.vm)
                     if ok_h:
                         return
-                except Exception:
-                    pass
+                except Exception as _eh:
+                    if _is_fatal_vm_exc(_eh):
+                        raise
+            if cls == "Landroid/os/Handler$MessageDispatchRunnable;" and self.stubs is not None:
+                try:
+                    self.stubs.resolve(cls, name, sig, list(args), False, allow_default=False)
+                except Exception as _es:
+                    if _is_fatal_vm_exc(_es):
+                        raise
             return
         try:
             self.vm._run_mdef(md, list(args))
-        except Exception:
-            pass
+        except Exception as _ei:
+            if _is_fatal_vm_exc(_ei):
+                raise
 
     def _extra_args(self, name, extra):
         """Zusatzargumente einer Lifecycle-Methode: echter Context fuer attachBaseContext,
@@ -250,6 +336,13 @@ class LifecycleRunner:
                 if r.fields.get("_defer_until_activity") and getattr(self.stubs, "_current_activity", None) is None:
                     deferred.append(r)
                     continue
+                if r.cls == "Landroid/os/Handler$MessageDispatchRunnable;":
+                    orig_d = int(r.fields.get("_orig_delay_ms", 0) or 0)
+                    due_ms = int(r.fields.get("_due_ms", 0) or 0)
+                    clock_ms = int(getattr(self.stubs, "_clock_ms", 0) or 0)
+                    if orig_d >= 1000 and clock_ms < due_ms:
+                        deferred.append(r)
+                        continue
                 count += 1
                 if r.fields.get("_bg_thread") and self.vm is not None:
                     old_budget = self.vm.step_budget
@@ -264,11 +357,16 @@ class LifecycleRunner:
         finally:
             if deferred:
                 q[0:0] = deferred
+        if count > 0:
+            self._recompose_if_needed()
 
     def _maybe_finish_empty_onboarding(self):
         """Wenn ein Splash-Uebergang auf einem leeren ViewPager2-Onboarding mit done/skip-onClick
         landet, diesen Abschluss-Callback ausfuehren, damit die Haupt-Activity sichtbar wird."""
         if self.stubs is None:
+            return
+        seam_cfg = getattr(self, "seam_config", None) or getattr(self.stubs, "_seam_config", None)
+        if seam_cfg is not None and not getattr(seam_cfg, "auto_finish_empty_onboarding", True):
             return
         tree = getattr(self.stubs, "view_tree", None)
         act = getattr(self.stubs, "_current_activity", None)
@@ -283,6 +381,18 @@ class LifecycleRunner:
         for n in tree.nodes():
             oc = (getattr(n, "props", None) or {}).get("onClick")
             if oc in ("done", "skip", "finish", "continue"):
+                step = int(getattr(self.vm, "steps", 0) or 0) if self.vm is not None else 0
+                dev = getattr(self.vm, "deviations", None) if self.vm is not None else None
+                if dev is not None and callable(getattr(dev, "record", None)):
+                    dev.record(
+                        "auto_onboarding_skip",
+                        site=f"{act.cls}->{oc}",
+                        detail="auto-clicked onboarding completion on empty ViewPager",
+                        step=step,
+                    )
+                dbg = getattr(self.vm, "_dbg", None) if self.vm is not None else None
+                if dbg is not None and isinstance(getattr(dbg, "markers", None), list):
+                    dbg.markers.append({"step": step, "kind": "auto_onboarding_skip", "label": f"auto_onboarding_skip:{act.cls}->{oc}"})
                 view_obj = JObject("Landroid/view/View;", {"$view": n})
                 self._invoke_on(act, oc, "(Landroid/view/View;)V", [act, view_obj])
                 return
@@ -295,12 +405,15 @@ class LifecycleRunner:
         tree = getattr(self.stubs, "view_tree", None)
         if not isinstance(cur, JObject) or tree is None or getattr(tree, "root", None) is None:
             return False
+        sv_comp = getattr(tree, "_compose_save_state", None)
         entry = {
             "activity": cur,
             "cls": cur.cls,
             "intent": cur.fields.get("_intent"),
             "root": tree.root,
             "compose_recomp": getattr(tree, "_compose_recompose", None),
+            "compose_state": sv_comp() if callable(sv_comp) else None,
+            "compose_nav_controller": getattr(self.stubs, "_compose_nav_controller", None),
         }
         if self.activity_stack and self.activity_stack[-1].get("activity") is cur:
             self.activity_stack[-1] = entry
@@ -315,10 +428,15 @@ class LifecycleRunner:
         self.stubs._current_activity = act
         self.stubs._current_activity_obj = act
         self.stubs._activity_finished = False
+        if "compose_nav_controller" in entry:
+            self.stubs._compose_nav_controller = entry.get("compose_nav_controller")
         if isinstance(act, JObject):
             act.fields.pop("_finishing", None)
         tree = getattr(self.stubs, "view_tree", None)
         if tree is not None:
+            rs_comp = getattr(tree, "_compose_restore_state", None)
+            if entry.get("compose_state") is not None and callable(rs_comp):
+                rs_comp(entry.get("compose_state"))
             tree._compose_recompose = entry.get("compose_recomp")
             if entry.get("root") is not None:
                 tree.set_root(entry["root"])
@@ -337,6 +455,16 @@ class LifecycleRunner:
             self._invoke_on(cb, "onActivityResult", "(Ljava/lang/Object;)V", [cb, ar])
             return True
         return False
+
+    def _cancel_activity_coroutines(self, act):
+        if not isinstance(act, JObject) or self.stubs is None:
+            return
+        cancel_fn = getattr(self.stubs, "_cancel_owner_coroutines", None)
+        if callable(cancel_fn):
+            try:
+                cancel_fn(act)
+            except Exception:
+                pass
 
     def pop_activity(self):
         """Vorherige Activity vom Back-Stack wiederherstellen."""
@@ -362,28 +490,39 @@ class LifecycleRunner:
             self.stubs._last_result_data = None
             if not nxt:
                 if finished:
+                    self._cancel_activity_coroutines(getattr(self.stubs, "_current_activity", None))
                     if self.activity_stack:
                         moved = self.pop_activity() or moved
                     moved = self._deliver_pending_result(rc, rdata) or moved
                 break
+            man = getattr(self.stubs, "_loaded_manifest", None)
+            lmodes = getattr(man, "launch_modes", None) or {}
+            lmode = lmodes.get(nxt, "")
             flags = int(intent.fields.get("_flags", 0) or 0) if isinstance(intent, JObject) else 0
             clear_task = bool(flags & 0x00008000)   # FLAG_ACTIVITY_CLEAR_TASK
-            clear_top = bool(flags & 0x04000000)    # FLAG_ACTIVITY_CLEAR_TOP
-            single_top = bool(flags & 0x20000000)   # FLAG_ACTIVITY_SINGLE_TOP
+            clear_top = bool(flags & 0x04000000) or lmode in ("singleTask", "singleInstance")
+            single_top = bool(flags & 0x20000000) or lmode in ("singleTop", "singleTask", "singleInstance")
             cur_act = getattr(self.stubs, "_current_activity", None)
             cur_cls = self._as_desc(cur_act.cls) if isinstance(cur_act, JObject) else None
+            if finished:
+                self._cancel_activity_coroutines(cur_act)
             if single_top and not clear_task and not finished and isinstance(cur_act, JObject) and cur_cls == nxt:
                 if intent is not None:
                     cur_act.fields["_intent"] = intent
                 self._invoke_on(cur_act, "onNewIntent", "(Landroid/content/Intent;)V", [cur_act, intent])
                 self._invoke_on(cur_act, "onResume", "()V", [cur_act])
                 self._drain_runnables()
+                self._recompose_if_needed()
                 tree = getattr(self.stubs, "view_tree", None)
                 if tree is not None:
                     tree.touch()
                 moved = True
                 continue
             if clear_task:
+                self._cancel_activity_coroutines(cur_act)
+                for _se in list(self.activity_stack):
+                    if isinstance(_se, dict):
+                        self._cancel_activity_coroutines(_se.get("activity"))
                 self.activity_stack.clear()
             else:
                 existing_idx = next(
@@ -394,7 +533,7 @@ class LifecycleRunner:
                 if existing_idx is not None:
                     target_entry = self.activity_stack[existing_idx]
                     self.activity_stack[:] = self.activity_stack[:existing_idx]
-                    if clear_top and single_top and not finished:
+                    if (clear_top or single_top) and not finished:
                         self._restore_activity_entry(target_entry)
                         act_r = getattr(self.stubs, "_current_activity", None)
                         if isinstance(act_r, JObject):
@@ -403,6 +542,7 @@ class LifecycleRunner:
                             self._invoke_on(act_r, "onNewIntent", "(Landroid/content/Intent;)V", [act_r, intent])
                             self._invoke_on(act_r, "onResume", "()V", [act_r])
                         self._drain_runnables()
+                        self._recompose_if_needed()
                         tree = getattr(self.stubs, "view_tree", None)
                         if tree is not None:
                             tree.touch()
@@ -410,6 +550,7 @@ class LifecycleRunner:
                         continue
                 elif not finished:
                     self.push_current_activity()
+            self.stubs._compose_nav_controller = None
             self._run_class(nxt, self.SEQ_ACTIVITY, role="activity", intent=intent)
             self._drain_runnables()
             tree = getattr(self.stubs, "view_tree", None)
@@ -422,47 +563,118 @@ class LifecycleRunner:
         """Hardware-Zurueck: ruft Activity.onBackPressed()V ueber Vererbung auf und pflegt Back-Stack."""
         if self.stubs is None:
             return False
-        fctrl = getattr(getattr(self.stubs, "view_tree", None), "_flutter_ctrl", None)
-        if fctrl is not None and fctrl.handle_back():
-            return True
+        for _ca in ("_flutter_ctrl", "_rn_ctrl", "_hybrid_ctrl"):
+            _ic = getattr(getattr(self.stubs, "view_tree", None), _ca, None)
+            if _ic is not None and _ic.handle_back():
+                return True
         try:
             from core.java.nav_rx_paging_g8 import pop_compose_nav_if_possible
             if pop_compose_nav_if_possible(self.stubs):
                 return True
-        except Exception:
-            pass
+        except Exception as _ehw:
+            if _is_fatal_vm_exc(_ehw):
+                raise
         act = getattr(self.stubs, "_current_activity", None)
         if not isinstance(act, JObject):
             return self.pop_activity()
         self.stubs._pending_nav_target = None
         self.stubs._pending_nav_intent = None
         self.stubs._activity_finished = False
+        self.stubs._back_callback_consumed = False
         if self.vm is not None and hasattr(self.vm, "invoke_virtual"):
             try:
                 self.vm.invoke_virtual(act, "onBackPressed", "()V", (act,))
             except Exception as e:
-                emsg = str(e)
-                if type(e).__name__ in ("DebugStop", "DalvikUnknownOpcode") or any(
-                    k in emsg for k in ("StepBudget", "WallBudget", "StackOverflow", "max_depth")
-                ):
+                if _is_fatal_vm_exc(e, include_budget=True):
                     raise
         self._drain_runnables()
         if getattr(self.stubs, "_pending_nav_target", None) or getattr(self.stubs, "_activity_finished", False):
             return self.navigate_to_pending()
+        if getattr(self.stubs, "_back_callback_consumed", False):
+            self._recompose_if_needed()
+            return True
+        if self.activity_stack:
+            return self.pop_activity()
         return False
 
     def handle_home(self):
         """Home-Button: Root-Activity vom Stack wiederherstellen."""
         if self.stubs is None:
             return False
-        fctrl = getattr(getattr(self.stubs, "view_tree", None), "_flutter_ctrl", None)
-        if fctrl is not None and fctrl.handle_home():
-            return True
+        for _ca in ("_flutter_ctrl", "_rn_ctrl", "_hybrid_ctrl"):
+            _ic = getattr(getattr(self.stubs, "view_tree", None), _ca, None)
+            if _ic is not None and _ic.handle_home():
+                return True
         if not self.activity_stack:
             return False
         root_entry = self.activity_stack[0]
         self.activity_stack.clear()
         return self._restore_activity_entry(root_entry)
+
+    def _run_init_providers(self, man, application_desc=None):
+        """Initialisiert Bootstrap-ContentProvider (z. B. FirebaseInitProvider) vor Application.onCreate."""
+        if man is None or self.stubs is None or self.vm is None:
+            return
+        from core.java.objects import JString
+        providers = getattr(man, "providers", None) or []
+        if not providers:
+            return
+        _init_markers = (
+            "InitProvider",
+            "InitializationProvider",
+            "firebaseinitprovider",
+            "androidx-startup",
+            "ProcessLifecycleOwner",
+            "WorkManagerInitializer",
+        )
+        cands = []
+        for prv in providers:
+            if not isinstance(prv, dict) or prv.get("enabled") is False:
+                continue
+            pcls = str(prv.get("cls") or "")
+            auth = str(prv.get("authorities") or "")
+            if any(mk in pcls or mk in auth for mk in _init_markers):
+                cands.append(prv)
+        if not cands:
+            return
+        cands.sort(key=lambda d: int(d.get("init_order", 0) or 0), reverse=True)
+        app_cls = application_desc or "Landroid/app/Application;"
+        app_obj = getattr(self.stubs, "application", None)
+        if not isinstance(app_obj, JObject):
+            app_obj = JObject(app_cls, {})
+            self.stubs.application = app_obj
+        pkg = getattr(man, "package", None) or "com.example.app"
+        for entry in cands:
+            pcls = entry.get("cls") or ""
+            if not pcls:
+                continue
+            auth = str(entry.get("authorities") or "").split(";", 1)[0].strip()
+            methods = self._methods_of(pcls)
+            if not methods and getattr(self.provider, "get_class", None) is None:
+                continue
+            prv_obj = JObject(pcls, {})
+            pinfo = JObject("Landroid/content/pm/ProviderInfo;", {
+                "authority": JString(auth),
+                "packageName": JString(pkg),
+                "name": JString(pcls[1:-1].replace("/", ".") if pcls.startswith("L") and pcls.endswith(";") else pcls),
+            })
+            old_budget = self.vm.step_budget
+            cap = self.vm.steps + 150_000
+            self.vm.step_budget = min(old_budget, cap) if old_budget is not None else cap
+            try:
+                init_md = self.vm._resolve_method(pcls, pcls, "<init>", "()V")
+                if init_md is not None:
+                    self.vm._run_mdef(init_md, [prv_obj])
+                att_md = self.vm._resolve_method(pcls, "Landroid/content/ContentProvider;", "attachInfo", "(Landroid/content/Context;Landroid/content/pm/ProviderInfo;)V")
+                if att_md is not None:
+                    self.vm._run_mdef(att_md, [prv_obj, app_obj, pinfo])
+                else:
+                    self.stubs.resolve("Landroid/content/ContentProvider;", "attachInfo", "(Landroid/content/Context;Landroid/content/pm/ProviderInfo;)V", [prv_obj, app_obj, pinfo], False)
+            except Exception as _ep:
+                if _is_fatal_vm_exc(_ep):
+                    raise
+            finally:
+                self.vm.step_budget = old_budget
 
     def run_app(self, studio_root=None, application=None, launcher=None):
         """GENERISCHER App-Lauf: Application-Phase (falls vorhanden) + Launcher-Activity-Phase.
@@ -520,6 +732,8 @@ class LifecycleRunner:
             "phases": [],
             "missing": [],
         }
+        if man is not None:
+            self._run_init_providers(man, application_desc=application)
         if application:
             report["phases"].append(self._run_class(application, self.SEQ_APPLICATION, role="application"))
             self._drain_runnables()
@@ -553,16 +767,22 @@ class LifecycleRunner:
         if not application and not launcher:
             report["phases"].append({"class": None, "role": "none", "called": [], "skipped": [],
                                      "errors": [{"m": "*", "sig": "*", "err": "kein Einstieg im Manifest"}]})
-        # Flutter-In-Phone-UI direkt in FlutterView einhängen (statt leerer Surface-Huelle / Textwand)
+        # Flutter/React-Native-In-Phone-UI direkt einhaengen (statt leerer Surface-Huelle / RUNTIME-GRENZE)
         try:
             rt_root = studio_root or getattr(self.provider, "root", None) or ""
             vtree = getattr(self.stubs, "view_tree", None) if self.stubs is not None else None
             if rt_root and vtree is not None:
-                from core.java.app_runtime import detect_runtime, is_unrendered_surface_shell
-                if (vtree.root is None or is_unrendered_surface_shell(vtree)) and detect_runtime(rt_root)[0] == "Flutter":
-                    from core.java.flutter_app_producer import mount_flutter_app_into_tree
-                    mount_flutter_app_into_tree(vtree, rt_root, stubs=self.stubs)
-        except Exception:
-            pass
+                from core.java.app_runtime import mount_inphone_runtime_if_needed
+                mount_inphone_runtime_if_needed(vtree, rt_root, stubs=self.stubs)
+        except Exception as _ehw:
+            if _is_fatal_vm_exc(_ehw):
+                raise
+        vtree = getattr(self.stubs, "view_tree", None) if self.stubs is not None else None
+        if vtree is not None and hasattr(vtree, "ensure_layout"):
+            try:
+                vtree.ensure_layout()
+            except Exception as _el:
+                if _is_fatal_vm_exc(_el):
+                    raise
         report["missing"] = self._missing()
         return report

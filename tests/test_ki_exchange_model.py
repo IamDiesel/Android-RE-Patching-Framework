@@ -92,7 +92,8 @@ def test_top_titlebar_integrates_context_and_ki_controls():
         root._build_global_context_bar()
 
         children_before = list(root.winfo_children())
-        assert getattr(root, "_has_custom_titlebar", False) is True
+        assert getattr(root, "_has_custom_titlebar", False) is False
+        assert not bool(root.overrideredirect())
         assert getattr(root, "_context_controls_built", False) is True
         assert len(children_before) == 1 and children_before[0] is root._titlebar
 
@@ -115,7 +116,7 @@ def test_top_titlebar_integrates_context_and_ki_controls():
         assert any("An KI" in t for t in texts)
         assert any("Von KI" in t for t in texts)
         assert any("Abgleich" in t for t in texts)
-        assert "?" in texts
+        assert any("Hilfe" in t or "?" in t for t in texts)
     finally:
         try:
             root.destroy()

@@ -12,6 +12,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+import zipfile
 
 _IGNORED_HOSTS = (
     "schemas.android.com",
@@ -39,7 +40,262 @@ _APPSYNC_URL_RE = re.compile(r"https?://[a-zA-Z0-9.-]+\.appsync-api\.[a-z0-9-]+\
 _APPSYNC_KEY_RE = re.compile(r"\bda2-[a-z0-9]{20,32}\b")
 _URL_RE = re.compile(r"https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?::\d+)?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?")
 _PATH_RE = re.compile(r"^/(?:api|v[1-9]|auth|oauth|token|user|users|device|devices|graphql)[A-Za-z0-9._/{}/?-]*$")
-_GQL_OP_RE = re.compile(r"\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\([^)]{0,300}\))?\s*\{[^{}]{8,800}\}", re.DOTALL)
+_GQL_OP_HEAD_RE = re.compile(
+    r"\b(query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]{2,47})\s*(?:\([^()\x00]{0,300}\))?\s*\{"
+)
+_DART_GQL_SYM_RE = re.compile(
+    r"(?:Variables\$)?\b(Query|Mutation|Subscription)\$([A-Za-z_][A-Za-z0-9_]*(?:\$[A-Za-z_][A-Za-z0-9_]*)*)"
+)
+
+
+def _is_gql_op_identifier(op_name: str) -> bool:
+    if not op_name or len(op_name) < 3:
+        return False
+    return op_name[0].isupper() or any(ch.isupper() or ch == "_" for ch in op_name[1:])
+
+
+def format_graphql_query(query_str: str) -> str:
+    """Formatiert eine GraphQL-Abfrage mit sauberer mehrzeiliger Einrueckung."""
+    s = str(query_str or "").strip()
+    if not s:
+        return ""
+    tokens: List[str] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch.isspace() or ch == ",":
+            i += 1
+            continue
+        if ch in "{}":
+            tokens.append(ch)
+            i += 1
+            continue
+        if ch == "(":
+            depth = 1
+            j = i + 1
+            in_str = False
+            while j < n and depth > 0:
+                c = s[j]
+                if c == '"' and s[j - 1] != "\\":
+                    in_str = not in_str
+                elif not in_str:
+                    if c == "(":
+                        depth += 1
+                    elif c == ")":
+                        depth -= 1
+                j += 1
+            arg_txt = re.sub(r"\s+", " ", s[i:j]).strip()
+            if tokens and tokens[-1] not in ("{", "}") and not tokens[-1].endswith(")"):
+                tokens[-1] = f"{tokens[-1]}{arg_txt}"
+            else:
+                tokens.append(arg_txt)
+            i = j
+            continue
+        j = i
+        while j < n and not s[j].isspace() and s[j] not in "{}(),":
+            j += 1
+        tok = s[i:j]
+        if tokens and tokens[-1].endswith(":") and tok not in ("{", "}"):
+            tokens[-1] = f"{tokens[-1]} {tok}"
+        elif tokens and tokens[-1] in ("query", "mutation", "subscription", "fragment", "on") and tok not in ("{", "}"):
+            tokens[-1] = f"{tokens[-1]} {tok}"
+        else:
+            tokens.append(tok)
+        i = j
+
+    lines: List[str] = []
+    indent = 0
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        nxt = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+        if tok == "{":
+            if lines and not lines[-1].endswith("{"):
+                lines[-1] = f"{lines[-1]} {{"
+            else:
+                lines.append(f"{'  ' * indent}{{")
+            indent += 1
+        elif tok == "}":
+            indent = max(0, indent - 1)
+            lines.append(f"{'  ' * indent}}}")
+        elif nxt == "{":
+            lines.append(f"{'  ' * indent}{tok} {{")
+            indent += 1
+            idx += 1
+        else:
+            lines.append(f"{'  ' * indent}{tok}")
+        idx += 1
+    return "\n".join(lines)
+
+
+def _extract_balanced_gql_ops(text: str) -> List[Tuple[str, str, str]]:
+    """Extrahiert echte GraphQL-Queries/Mutations/Subscriptions mit balancierten { ... }-Bloecken."""
+    ops: List[Tuple[str, str, str]] = []
+    seen = set()
+    n = len(text or "")
+    for m in _GQL_OP_HEAD_RE.finditer(text or ""):
+        kind, op_name = m.group(1).lower(), m.group(2)
+        if op_name in seen:
+            continue
+        brace_start = m.end() - 1
+        depth = 0
+        pos = brace_start
+        limit = min(n, brace_start + 1600)
+        in_str = False
+        valid = True
+        while pos < limit:
+            ch = text[pos]
+            if ord(ch) < 9:
+                valid = False
+                break
+            if ch == '"' and (pos == 0 or text[pos - 1] != "\\"):
+                in_str = not in_str
+            elif not in_str:
+                if ch == "{":
+                    depth += 1
+                    if depth > 8:
+                        valid = False
+                        break
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        raw_op = text[m.start() : pos + 1]
+                        if '"variables"' in raw_op:
+                            valid = False
+                        break
+            pos += 1
+        if not valid or depth != 0:
+            continue
+        raw_op = re.sub(r"\s+", " ", text[m.start() : pos + 1]).strip()
+        body_part = raw_op[raw_op.find("{") + 1 : -1].strip()
+        if len(body_part) < 4 or not re.search(r"[A-Za-z_][A-Za-z0-9_]*", body_part):
+            continue
+        pretty = format_graphql_query(raw_op)
+        if pretty:
+            seen.add(op_name)
+            ops.append((kind, op_name, pretty))
+            if len(ops) >= 24:
+                break
+    return ops
+
+
+def _extract_dart_codegen_gql_ops(text: str, *, exclude_ops: Optional[set] = None) -> List[Tuple[str, str, str]]:
+    """Rekonstruiert GraphQL-Operationen aus Dart-graphql_codegen-Klassensymbolen."""
+    skip = set(exclude_ops or ())
+    grouped: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for m in _DART_GQL_SYM_RE.finditer(text or ""):
+        kind = m.group(1).lower()
+        seg_str = m.group(2)
+        parts = [p for p in seg_str.split("$") if p]
+        if not parts:
+            continue
+        op_name = parts[0]
+        if op_name in skip or not _is_gql_op_identifier(op_name):
+            continue
+        key = (kind, op_name)
+        tree = grouped.setdefault(key, {})
+        cur = tree
+        for depth_i, seg in enumerate(parts[1:6]):
+            if seg == "__typename" or seg.endswith("_impl"):
+                continue
+            if len(cur) >= 12 and seg not in cur:
+                break
+            cur = cur.setdefault(seg, {})
+
+    def _render_tree(node_dict: Dict[str, Any], indent_lvl: int) -> List[str]:
+        out_lines: List[str] = []
+        pad = "  " * indent_lvl
+        for fname, children in list(node_dict.items())[:12]:
+            if children:
+                out_lines.append(f"{pad}{fname} {{")
+                out_lines.append(f"{pad}  __typename")
+                out_lines.extend(_render_tree(children, indent_lvl + 1))
+                out_lines.append(f"{pad}}}")
+            else:
+                out_lines.append(f"{pad}{fname} {{")
+                out_lines.append(f"{pad}  __typename")
+                out_lines.append(f"{pad}}}")
+        return out_lines
+
+    order_rank = {"query": 0, "mutation": 1, "subscription": 2}
+    def _sort_key(item):
+        (k, op), tr = item
+        return (order_rank.get(k, 9), 0 if tr else 1, op.lower())
+
+    rebuilt: List[Tuple[str, str, str]] = []
+    for (kind, op_name), tree in sorted(grouped.items(), key=_sort_key):
+        if tree:
+            inner = "\n".join(_render_tree(tree, 1))
+        else:
+            inner = f"  {op_name} {{\n    __typename\n  }}"
+        doc = f"{kind} {op_name} {{\n{inner}\n}}"
+        rebuilt.append((kind, op_name, doc))
+        if len(rebuilt) >= 35:
+            break
+    return rebuilt
+
+
+def find_flutter_libapp_blobs(
+    app_root: str,
+    extra_lib_dirs: Optional[List[str]] = None,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> List[Tuple[str, bytes]]:
+    """Findet `libapp.so` direkt, in extra_lib_dirs, Geschwister-Entpackungen oder Split-APKs."""
+    results: List[Tuple[str, bytes]] = []
+    seen_real = set()
+    abs_root = os.path.abspath(app_root) if app_root else ""
+
+    def _add_file(fp: str) -> None:
+        if len(results) >= 2 or not os.path.isfile(fp):
+            return
+        rp = os.path.realpath(fp)
+        if rp in seen_real:
+            return
+        try:
+            with open(fp, "rb") as fh:
+                blob = fh.read(max_bytes)
+            if not blob:
+                return
+            seen_real.add(rp)
+            lbl = os.path.relpath(fp, abs_root) if abs_root and fp.startswith(abs_root) else os.path.basename(fp)
+            results.append((lbl, blob))
+        except Exception:
+            pass
+
+    if abs_root and os.path.isdir(abs_root):
+        for lp in sorted(glob.glob(os.path.join(abs_root, "lib", "*", "libapp.so"))):
+            _add_file(lp)
+    for d in (extra_lib_dirs or ()):
+        if d and os.path.isdir(d):
+            _add_file(os.path.join(d, "libapp.so"))
+            for lp in sorted(glob.glob(os.path.join(d, "lib", "*", "libapp.so"))):
+                _add_file(lp)
+
+    if not results and abs_root:
+        parent = os.path.dirname(abs_root)
+        if parent and os.path.isdir(parent):
+            for lp in sorted(glob.glob(os.path.join(parent, "base_unpacked*", "lib", "*", "libapp.so"))):
+                _add_file(lp)
+            if not results:
+                for apk_p in sorted(glob.glob(os.path.join(parent, "split_config*.apk"))):
+                    if len(results) >= 2:
+                        break
+                    try:
+                        with zipfile.ZipFile(apk_p, "r") as zf:
+                            for member in sorted(zf.namelist()):
+                                if member.startswith("lib/") and member.endswith("/libapp.so"):
+                                    key = f"{os.path.realpath(apk_p)}::{member}"
+                                    if key in seen_real:
+                                        continue
+                                    blob = zf.read(member)[:max_bytes]
+                                    if blob:
+                                        seen_real.add(key)
+                                        results.append((f"{os.path.basename(apk_p)}!/{member}", blob))
+                                        break
+                    except Exception:
+                        pass
+    return results
 
 
 def _extract_ascii_strings(blob: bytes, min_len: int = 5, max_items: int = 120000) -> List[str]:
@@ -139,20 +395,10 @@ class FlutterApiExtractorService:
             except Exception:
                 pass
 
-        # 2) libapp.so Strings scannen
-        libapp_cands = sorted(glob.glob(os.path.join(app_root, "lib", "*", "libapp.so")))
-        for d in (extra_lib_dirs or ()):
-            if d and os.path.isdir(d):
-                libapp_cands.extend(sorted(glob.glob(os.path.join(d, "libapp.so"))))
-        for lp in libapp_cands[:2]:
-            if os.path.isfile(lp):
-                try:
-                    with open(lp, "rb") as fh:
-                        blob = fh.read()
-                    raw_strings.extend(_extract_ascii_strings(blob))
-                    scanned_files.append(os.path.relpath(lp, app_root) if lp.startswith(app_root) else os.path.basename(lp))
-                except Exception:
-                    pass
+        # 2) libapp.so Strings scannen (inkl. Geschwister-Entpackung / Split-APKs)
+        for lbl, blob in find_flutter_libapp_blobs(app_root, extra_lib_dirs=extra_lib_dirs, max_bytes=24 * 1024 * 1024):
+            raw_strings.extend(_extract_ascii_strings(blob))
+            scanned_files.append(lbl)
 
         joined = "\n".join(raw_strings)
 
@@ -246,14 +492,13 @@ class FlutterApiExtractorService:
             if mk:
                 api_key = mk.group(0)
 
-        gql_ops: List[Tuple[str, str, str]] = []
-        seen_op = set()
-        for m in _GQL_OP_RE.finditer(joined):
-            kind, op_name = m.group(1), m.group(2)
-            snippet = re.sub(r"\s+", " ", m.group(0)).strip()
-            if (kind, op_name) not in seen_op:
-                seen_op.add((kind, op_name))
-                gql_ops.append((kind, op_name, snippet))
+        gql_ops: List[Tuple[str, str, str]] = _extract_balanced_gql_ops(joined)
+        seen_op_names = {op for _k, op, _q in gql_ops}
+        codegen_ops = _extract_dart_codegen_gql_ops(joined, exclude_ops=seen_op_names)
+        for item in codegen_ops:
+            if item[1] not in seen_op_names:
+                seen_op_names.add(item[1])
+                gql_ops.append(item)
 
         if gql_urls:
             g_url = gql_urls[0]
@@ -262,20 +507,23 @@ class FlutterApiExtractorService:
                 g_hdrs["x-api-key"] = api_key
             else:
                 g_hdrs["Authorization"] = "Bearer <ID_TOKEN>"
-            if gql_ops:
-                for kind, op_name, snippet in gql_ops[:25]:
-                    _add_tpl(
-                        "GraphQL", "POST", g_url, dict(g_hdrs),
-                        json.dumps({"operationName": op_name, "query": snippet, "variables": {}}, indent=2),
-                        f"{kind} {op_name}",
-                        f"GraphQL {kind} {op_name}",
-                    )
-            else:
+            for kind, op_name, snippet in gql_ops[:34]:
                 _add_tpl(
                     "GraphQL", "POST", g_url, dict(g_hdrs),
-                    json.dumps({"query": "query Introspection { __schema { queryType { name } } }", "variables": {}}, indent=2),
-                    "Endpoint",
-                    f"GraphQL Endpoint ({g_url})",
+                    json.dumps({"operationName": op_name, "query": snippet, "variables": {}}, indent=2),
+                    f"{kind} {op_name}",
+                    f"GraphQL {kind} {op_name}",
+                )
+            if "Introspection" not in seen_op_names:
+                _add_tpl(
+                    "GraphQL", "POST", g_url, dict(g_hdrs),
+                    json.dumps({
+                        "operationName": "Introspection",
+                        "query": format_graphql_query("query Introspection { __schema { queryType { name } } }"),
+                        "variables": {},
+                    }, indent=2),
+                    "Schema Introspection" if gql_ops else "Endpoint",
+                    f"GraphQL Schema Introspection ({g_url})" if gql_ops else f"GraphQL Endpoint ({g_url})",
                 )
 
         # C) REST / Base-URLs + Route-Pfade

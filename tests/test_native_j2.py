@@ -82,15 +82,18 @@ def test_end_to_end_native_calls_back_into_java():
     # Trampoline: Argumente von J0 kommen als x2=arg0(cls), x3=arg1(mid), x4=arg2(jint).
     #   CallStaticIntMethod(env=x0, clazz, methodID, jint) erwartet x1=clazz, x2=mid, x3=jint.
     code = b"".join([
+        _w(0xA9BF7BFD),                               # stp x29, x30, [sp, #-16]!
         _w(0xAA0203E1),                               # mov x1, x2   (clazz)
         _w(0xAA0303E2),                               # mov x2, x3   (methodID)
         _w(0xAA0403E3),                               # mov x3, x4   (jint)
         _w(0xF9400008),                               # ldr x8, [x0]        ; ENV_TABLE
         _w(0xF9400000 | (slot << 10) | (8 << 5) | 9), # ldr x9, [x8, #slot*8]
         _w(0xD63F0120),                               # blr x9
+        _w(0xA8C17BFD),                               # ldp x29, x30, [sp], #16
         _w(0xD65F03C0),                               # ret
     ])
     svc.load_blob(eng, 0x4000, code)
     br = JavaToNativeBridge(eng, jni)
     # Java->native (J0) mit (clsHandle, midHandle, 21); native->Java (J2) verdoppelt -> 42
     assert br.call_native(0x4000, args=(clsh, mid, 21), ret="int") == 42
+    assert br.errors == []

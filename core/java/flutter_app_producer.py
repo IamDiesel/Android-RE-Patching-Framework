@@ -98,6 +98,7 @@ def _pick_brand_images(fa_dir: str, brand_hint: str = "") -> Dict[str, str]:
                 all_pngs.append(os.path.join(dp, fn))
     if not all_pngs:
         return {}
+    sharp_pngs = [p for p in all_pngs if "blur" not in os.path.basename(p).lower()]
     b = brand_hint.strip().lower()
 
     def _pref(paths: List[str]) -> str:
@@ -110,19 +111,20 @@ def _pick_brand_images(fa_dir: str, brand_hint: str = "") -> Dict[str, str]:
         return paths_sorted[0]
 
     def _match(patterns: tuple[str, ...]) -> str:
-        for pat in patterns:
-            hits = [p for p in all_pngs if pat in os.path.basename(p).lower()]
-            if hits:
-                return _pref(hits)
+        for pool in (sharp_pngs, all_pngs):
+            for pat in patterns:
+                hits = [p for p in pool if pat in os.path.basename(p).lower()]
+                if hits:
+                    return _pref(hits)
         return ""
 
     return {
-        "logo": _match(("logo_1153", "logo_1152", "logo", "app_icon")),
+        "logo": _match(("kippy_main_logo", "logo_1153", "logo_1152", "logo", "app_icon")),
         "hero": _match(("auth_screen", "splash", "cat_intro", "dog_intro")),
         "pet": _match(("dog_intro", "cat_intro", "device.png", "dog_banner", "cat.png")),
-        "position": _match(("blur_position_page", "position", "map")),
-        "activity": _match(("blur_activity_page", "activity")),
-        "health": _match(("blur_gauge", "battery_full", "battery")),
+        "position": _match(("gps_banner", "geofence_educational", "geofence_instr", "localization", "position", "map")),
+        "activity": _match(("steps_counter_pet", "energy_dog", "energy_cat", "dog_on_the_move", "calories", "activity")),
+        "health": _match(("battery_full", "graphic_dog_info", "battery")),
     }
 
 
@@ -224,7 +226,8 @@ def extract_flutter_app_spec(app_root: str) -> Dict[str, Any]:
     api_scan = FlutterApiExtractorService.extract_from_app_root(app_root)
     templates = list(api_scan.get("templates") or ())
     cog_tpl = next((t for t in templates if t.get("category") == "Cognito" and "InitiateAuth" in str(t.get("description", ""))), None)
-    gql_tpl = next((t for t in templates if t.get("category") == "GraphQL"), None)
+    gql_tpls = [t for t in templates if t.get("category") == "GraphQL"]
+    gql_tpl = gql_tpls[0] if gql_tpls else None
     rest_tpl = next((t for t in templates if t.get("category") == "REST"), None)
 
     cognito_cfg = None
@@ -283,6 +286,7 @@ def extract_flutter_app_spec(app_root: str) -> Dict[str, Any]:
         "cognito": cognito_cfg,
         "graphql_url": graphql_url,
         "graphql_template": gql_tpl,
+        "graphql_templates": gql_tpls,
         "rest_template": rest_tpl,
         "api_key": api_key,
         "templates": templates,
@@ -303,7 +307,7 @@ _AOT_SKIP_PREFIXES = (
 )
 
 
-def _scan_libapp_aot_metadata(app_root: Optional[str], max_bytes: int = 12 * 1024 * 1024) -> Dict[str, Any]:
+def _scan_libapp_aot_metadata(app_root: Optional[str], max_bytes: int = 24 * 1024 * 1024) -> Dict[str, Any]:
     """Begrenzter AOT-Scanner fuer `libapp.so`: extrahiert Routen, Platform-Channels und HTTPS-Endpunkte."""
     routes: List[str] = []
     channels: List[str] = []
@@ -314,19 +318,15 @@ def _scan_libapp_aot_metadata(app_root: Optional[str], max_bytes: int = 12 * 102
     kdart_symbols: List[str] = []
     sections: List[str] = []
     demo_email = ""
-    if not app_root or not os.path.isdir(os.path.join(app_root, "lib")):
+    if not app_root:
         return {
             "routes": routes, "channels": channels, "endpoints": endpoints, "demo_email": demo_email,
             "dart_packages": dart_packages, "dart_classes": dart_classes,
             "graphql_queries": graphql_queries, "kdart_symbols": kdart_symbols, "sections": sections,
         }
+    from services.flutter_api_extractor_service import find_flutter_libapp_blobs
     seen_r, seen_c, seen_e = set(), set(), set()
-    for lp in sorted(glob.glob(os.path.join(app_root, "lib", "*", "libapp.so")))[:2]:
-        try:
-            with open(lp, "rb") as fh:
-                blob = fh.read(max_bytes)
-        except Exception:
-            continue
+    for _lbl, blob in find_flutter_libapp_blobs(app_root, max_bytes=max_bytes):
         try:
             from core.java.engine_deep_g12 import analyze_flutter_libapp_deep
             deep = analyze_flutter_libapp_deep(blob, max_bytes=max_bytes)
@@ -945,6 +945,8 @@ class FlutterInPhoneController:
         self.auth_token = ""
         self.demo_mode = False
         self.api_log_summary = ""
+        self.selected_gql_idx: Optional[int] = None
+        self.last_gql_exchange: Optional[Dict[str, Any]] = None
         self.browser = InPhoneBrowserController(
             tree=tree,
             app_root=app_root,
@@ -1040,30 +1042,169 @@ class FlutterInPhoneController:
         self.mount()
         return True
 
-    def _fire_backend_sync(self) -> tuple[int, str]:
+    def _current_tab_key(self) -> str:
+        return ("home", "position", "activity", "menu")[self.home_tab % 4]
+
+    @staticmethod
+    def _tpl_op_label(tpl: Optional[dict]) -> str:
+        if not isinstance(tpl, dict):
+            return "GraphQL"
+        try:
+            body_obj = json.loads(tpl.get("body") or "{}")
+            if isinstance(body_obj, dict) and body_obj.get("operationName"):
+                return str(body_obj["operationName"])
+        except Exception:
+            pass
+        hint = str(tpl.get("source_hint") or "").strip()
+        if " " in hint:
+            return hint.split(" ", 1)[1].strip()
+        return hint or "GraphQL"
+
+    def _pick_gql_template_for_tab(self, tab_key: str) -> Optional[dict]:
+        gql_tpls = list(self.spec.get("graphql_templates") or ())
+        if not gql_tpls:
+            tpl = self.spec.get("graphql_template")
+            return tpl if isinstance(tpl, dict) else None
+        if self.selected_gql_idx is not None and 0 <= self.selected_gql_idx < len(gql_tpls):
+            return gql_tpls[self.selected_gql_idx]
+        kw_map = {
+            "home": ("getpets", "getproducts", "getposts", "getbaseconfig"),
+            "position": ("getpetlinkgps", "getpositionshistory", "getgeofences", "ongpsmessageposition"),
+            "activity": ("getactivities", "getactivitiescat", "getactivitiesbyhour", "getactivitiesaverage"),
+            "menu": ("getuser", "getbaseconfig", "getsubscription"),
+        }
+        for kw in kw_map.get(tab_key, ()):
+            for tpl in gql_tpls:
+                hay = f"{tpl.get('source_hint', '')} {tpl.get('description', '')}".lower()
+                if kw in hay:
+                    return tpl
+        return gql_tpls[0]
+
+    def _resolve_gql_op_chips(self) -> List[tuple]:
+        gql_tpls = list(self.spec.get("graphql_templates") or ())
+        if not gql_tpls:
+            return []
+        chosen: List[tuple] = []
+        used_idx = set()
+        for kw in ("getpets", "getpetlinkgps", "getactivities", "getuser"):
+            for idx, tpl in enumerate(gql_tpls):
+                if idx in used_idx:
+                    continue
+                hay = f"{tpl.get('source_hint', '')} {tpl.get('description', '')}".lower()
+                if kw in hay:
+                    chosen.append((idx, self._tpl_op_label(tpl), tpl))
+                    used_idx.add(idx)
+                    break
+        for idx, tpl in enumerate(gql_tpls):
+            if len(chosen) >= 4:
+                break
+            if idx not in used_idx:
+                chosen.append((idx, self._tpl_op_label(tpl), tpl))
+                used_idx.add(idx)
+        return chosen[:4]
+
+    def _fire_backend_sync(self, tpl_override: Optional[dict] = None) -> tuple[int, str]:
         gql_url = self.spec.get("graphql_url") or ""
         api_key = self.spec.get("api_key") or ""
-        gql_tpl = self.spec.get("graphql_template")
+        tpl = tpl_override or self._pick_gql_template_for_tab(self._current_tab_key()) or self.spec.get("graphql_template")
         rest_tpl = self.spec.get("rest_template")
         if gql_url:
             hdrs = {
                 "Content-Type": "application/json",
                 "User-Agent": f"{self.spec.get('brand', 'Flutter')}-App/Android",
             }
-            if api_key:
-                hdrs["x-api-key"] = api_key
+            tpl_hdrs = (tpl or {}).get("headers") or {}
+            eff_key = api_key or tpl_hdrs.get("x-api-key") or ""
+            if eff_key:
+                hdrs["x-api-key"] = eff_key
             if self.auth_token and self.auth_token != "demo-session":
                 hdrs["Authorization"] = self.auth_token
-            body_s = (gql_tpl or {}).get("body") or json.dumps({"query": "query GetDashboard { __typename }"})
-            resp = self._net_fire("POST", gql_url, hdrs, body_s.encode("utf-8"))
-            return int(getattr(resp, "code", 200)), gql_url
+
+            op_name = ""
+            query_txt = ""
+            vars_obj: Dict[str, Any] = {}
+            raw_body = (tpl or {}).get("body") or ""
+            if raw_body:
+                try:
+                    parsed_b = json.loads(raw_body)
+                    if isinstance(parsed_b, dict):
+                        query_txt = str(parsed_b.get("query") or "")
+                        op_name = str(parsed_b.get("operationName") or "")
+                        if isinstance(parsed_b.get("variables"), dict):
+                            vars_obj = parsed_b["variables"]
+                except Exception:
+                    query_txt = ""
+            if not query_txt:
+                query_txt = "query GetDashboard {\n  __typename\n}"
+                op_name = op_name or "GetDashboard"
+            if not op_name:
+                m_op = re.search(r"\b(?:query|mutation|subscription)\s+([A-Za-z_][A-Za-z0-9_]*)", query_txt)
+                op_name = m_op.group(1) if m_op else "GraphQL"
+            m_kind = re.search(r"\b(query|mutation|subscription)\b", query_txt)
+            kind = m_kind.group(1) if m_kind else "query"
+
+            payload_obj: Dict[str, Any] = {"operationName": op_name, "query": query_txt, "variables": vars_obj}
+            resp = self._net_fire("POST", gql_url, hdrs, json.dumps(payload_obj).encode("utf-8"))
+            code = int(getattr(resp, "code", 200))
+            rbody = bytes(getattr(resp, "body", b"") or b"")
+            rhdrs = getattr(resp, "headers", None) or {}
+            glass_src = str(rhdrs.get("X-Glass-Source", "") or "")
+            is_mock_empty = (
+                len(rbody) == 0
+                and code == 200
+                and ("mock-default" in glass_src or not rhdrs)
+            )
+            parsed_res = None
+            if rbody:
+                try:
+                    parsed_res = json.loads(rbody.decode("utf-8", "replace"))
+                except Exception:
+                    parsed_res = None
+
+            if is_mock_empty:
+                summary = f"⚠ Offline-Mock ({code}, 0 B) — unten 'Modus: Live-HTTP' wählen für echte Server-Antwort"
+                data_preview = "Keine Nutzdaten im Offline-Mock (0 Bytes). Im Netz-Tab 'Modus: Live-HTTP' aktivieren oder eine Mock-Regel anlegen."
+            elif isinstance(parsed_res, dict) and parsed_res.get("errors") and not parsed_res.get("data"):
+                errs = parsed_res["errors"]
+                first_err = errs[0] if isinstance(errs, list) and errs else errs
+                if isinstance(first_err, dict):
+                    err_msg = str(first_err.get("message") or first_err.get("errorType") or first_err)
+                else:
+                    err_msg = str(first_err)
+                summary = f"❌ GraphQL-Fehler ({code}): {_short_label(err_msg, 52)}"
+                data_preview = json.dumps(errs[:2] if isinstance(errs, list) else errs, indent=2, ensure_ascii=False)[:320]
+            elif isinstance(parsed_res, dict) and "data" in parsed_res:
+                summary = f"✅ {op_name} · HTTP {code} ({len(rbody)} B)"
+                data_preview = json.dumps(parsed_res["data"], indent=2, ensure_ascii=False)[:320]
+            else:
+                summary = f"HTTP {code} ({len(rbody)} B) · {op_name}"
+                data_preview = rbody.decode("utf-8", "replace")[:260] if rbody else "(leere Antwort)"
+
+            self.last_gql_exchange = {
+                "op_name": op_name,
+                "kind": kind,
+                "query": query_txt,
+                "code": code,
+                "bytes": len(rbody),
+                "is_mock_empty": is_mock_empty,
+                "summary": summary,
+                "data_preview": data_preview,
+                "url": gql_url,
+            }
+            self.api_log_summary = summary
+            return code, gql_url
         if rest_tpl and rest_tpl.get("url"):
             u = rest_tpl["url"]
             m = rest_tpl.get("method") or "GET"
             hdrs = dict(rest_tpl.get("headers") or {})
             body_b = (rest_tpl.get("body") or "").encode("utf-8")
             resp = self._net_fire(m, u, hdrs, body_b)
-            return int(getattr(resp, "code", 200)), u
+            code = int(getattr(resp, "code", 200))
+            self.last_gql_exchange = None
+            self.api_log_summary = f"REST {code} ({_short_label(u, 32)})"
+            return code, u
+        self.last_gql_exchange = None
+        self.api_log_summary = "Lokal aktiv (kein Server-Endpunkt)"
         return 200, "offline-local"
 
     def submit_login(self, _node=None) -> None:
@@ -1126,10 +1267,12 @@ class FlutterInPhoneController:
             self.auth_token = tok or "session-ok"
             self.demo_mode = False
             self.auth_status = ""
-            sc, ep = self._fire_backend_sync()
-            self.api_log_summary = f"Auth {code} · Sync {sc} ({_short_label(ep, 32)})"
             self.screen = "home"
             self.home_tab = 0
+            self.selected_gql_idx = None
+            sc, ep = self._fire_backend_sync()
+            if not self.last_gql_exchange:
+                self.api_log_summary = f"Auth {code} · Sync {sc} ({_short_label(ep, 32)})"
             self.mount()
             return
 
@@ -1145,10 +1288,12 @@ class FlutterInPhoneController:
         self.demo_mode = True
         self.auth_token = "demo-session"
         self.auth_status = ""
-        sc, ep = self._fire_backend_sync()
-        self.api_log_summary = f"Demo aktiv · Sync {sc} ({_short_label(ep, 32)})"
         self.screen = "home"
         self.home_tab = 0
+        self.selected_gql_idx = None
+        sc, ep = self._fire_backend_sync()
+        if not self.last_gql_exchange:
+            self.api_log_summary = f"Demo aktiv · Sync {sc} ({_short_label(ep, 32)})"
         self.mount()
 
     def _build_welcome_root(self) -> ViewNode:
@@ -1331,13 +1476,13 @@ class FlutterInPhoneController:
             card.add(ViewNode("TextView", vid="home_card_t", text=self._tr("home", "add_your_pet", f"Willkommen in {app_name}")))
             card.add(ViewNode("TextView", vid="home_card_geo", text=f"Status: {self._tr('home', 'geo', 'Sicher im Geofence')} · {self._tr('home', 'bluetooth', 'In Ihrer Nähe.')}"))
         elif tab_key == "position":
-            pv = _image_node("home_pos_img", imgs.get("position") or imgs.get("pet") or "", h=170, scale="crop")
+            pv = _image_node("home_pos_img", imgs.get("position") or imgs.get("pet") or "", h=112, scale="fit")
             if pv is not None:
                 card.add(pv)
             card.add(ViewNode("TextView", vid="pos_card_t", text="Live-Position & Geofence"))
             card.add(ViewNode("TextView", vid="pos_card_d", text="Interaktiver GPS-/AppSync-Tracker über Debugger-Netzwerk-Pipeline."))
         elif tab_key == "activity":
-            av = _image_node("home_act_img", imgs.get("activity") or imgs.get("health") or "", h=170, scale="crop")
+            av = _image_node("home_act_img", imgs.get("activity") or imgs.get("health") or "", h=112, scale="fit")
             if av is not None:
                 card.add(av)
             card.add(ViewNode("TextView", vid="act_card_t", text="Aktivität & Gesundheit"))
@@ -1349,19 +1494,75 @@ class FlutterInPhoneController:
             card.add(ViewNode("TextView", vid="menu_card_t", text=self._tr("menu", "app_settings", "App-Einstellungen")))
             card.add(ViewNode("TextView", vid="menu_card_d", text=self._tr("menu", "edit_profile", "Profil & Geräte-Einstellungen")))
 
-        if self.api_log_summary:
-            card.add(ViewNode("TextView", vid="home_api_summary", text=f"✅ {self.api_log_summary}"))
+        gql_url = self.spec.get("graphql_url") or ""
+        if self.api_log_summary and not gql_url:
+            card.add(ViewNode("TextView", vid="home_api_summary", text=self.api_log_summary))
 
-        sync_btn = ViewNode("Button", vid="btn_home_sync", text="🔄 API / GraphQL Sync ausführen", clickable=True)
+        sync_lbl = "🔄 GraphQL Query ausführen" if gql_url else "🔄 API Sync ausführen"
+        sync_btn = ViewNode("Button", vid="btn_home_sync", text=sync_lbl, clickable=True)
 
         def _do_sync(_v=None):
-            sc, ep = self._fire_backend_sync()
-            self.api_log_summary = f"Sync {sc} ({_short_label(ep, 32)})"
+            self._fire_backend_sync()
             self.mount()
 
         sync_btn.on_click = _do_sync
         card.add(sync_btn)
         box.add(card)
+
+        if gql_url:
+            gql_card = ViewNode("LinearLayout", vid="home_gql_card", props={"role": "card"})
+            gql_host = urllib.parse.urlsplit(gql_url).netloc or _short_label(gql_url, 36)
+            gql_card.add(ViewNode("TextView", vid="home_gql_hdr", text=f"GraphQL / AppSync · {gql_host}", props={"bold": True}))
+            chips = self._resolve_gql_op_chips()
+            cur_tpl = self._pick_gql_template_for_tab(tab_key)
+            if chips:
+                crow = None
+                for ci, (t_idx, op_lbl, tpl_obj) in enumerate(chips):
+                    if ci % 2 == 0:
+                        crow = ViewNode("LinearLayout", props={"orientation": "horizontal"})
+                        gql_card.add(crow)
+                    is_sel = (cur_tpl is tpl_obj) or (cur_tpl is None and self.last_gql_exchange and self.last_gql_exchange.get("op_name") == op_lbl)
+                    cbtn = ViewNode(
+                        "Button",
+                        vid=f"gql_op_btn_{ci}",
+                        text=_short_label(op_lbl, 18),
+                        clickable=True,
+                        props={"layout_weight": 1.0, "selected": bool(is_sel), "h": 30},
+                    )
+                    cbtn.on_click = lambda _v=None, _i=t_idx, _t=tpl_obj: (
+                        setattr(self, "selected_gql_idx", _i),
+                        self._fire_backend_sync(_t),
+                        self.mount(),
+                    )
+                    crow.add(cbtn)
+
+            ex = self.last_gql_exchange
+            cur_op = self._tpl_op_label(cur_tpl) if cur_tpl else ""
+            ex_matches = bool(ex and (not cur_op or ex.get("op_name") == cur_op))
+            q_src = (ex.get("query") if ex_matches else "") or ""
+            if not q_src and isinstance(cur_tpl, dict):
+                try:
+                    q_src = str(json.loads(cur_tpl.get("body") or "{}").get("query") or "")
+                except Exception:
+                    q_src = ""
+            if q_src:
+                q_lines = [ln for ln in q_src.splitlines() if ln.strip()]
+                q_short = "\n".join(q_lines[:6]) + ("\n  ..." if len(q_lines) > 6 else "")
+                gql_card.add(ViewNode("TextView", vid="home_gql_query", text=q_short))
+
+            if ex and ex_matches:
+                gql_card.add(ViewNode("TextView", vid="home_gql_status", text=ex.get("summary", "")))
+                if ex.get("data_preview"):
+                    gql_card.add(ViewNode("TextView", vid="home_gql_preview", text=ex["data_preview"]))
+            else:
+                g_cnt = len(self.spec.get("graphql_templates") or ())
+                ready_txt = (
+                    f"Bereit für {cur_op} ({g_cnt} Operationen — Query ausführen klicken)"
+                    if cur_op else
+                    f"Bereit ({g_cnt} Operationen erkannt — Query wählen oder 'Ausführen' klicken)"
+                )
+                gql_card.add(ViewNode("TextView", vid="home_gql_status", text=ready_txt))
+            box.add(gql_card)
 
         q_urls = self.spec.get("quick_urls") or []
         if q_urls:
@@ -1392,7 +1593,11 @@ class FlutterInPhoneController:
                 clickable=True,
                 props={"role": "navitem", "selected": (idx == self.home_tab)},
             )
-            nb.on_click = lambda _v=None, _i=idx: (setattr(self, "home_tab", _i), self.mount())
+            nb.on_click = lambda _v=None, _i=idx: (
+                setattr(self, "home_tab", _i),
+                setattr(self, "selected_gql_idx", None),
+                self.mount(),
+            )
             navbar.add(nb)
         box.add(navbar)
         return box

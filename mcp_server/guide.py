@@ -84,7 +84,14 @@ VERSIONIERUNG (Libs, Patch-Favoriten & Frida) — PFLICHT:\n- Jede Lib und jeder
    - libcarve.assemble_preview -> DRY-RUN (ARM64-ASM oder C-Cave) mit Byte-Budget-Pruefung VOR libcarve.patch_add!
    - libcarve.patch_add -> fuegt Patch inkl. Wildcard-AOB zur aktiven Session hinzu (sofort in GUI + zone='live').
    - libcarve.gui_focus / KI-Sync: gui_focus fokussiert die GUI und stagt einen Entwurf in data/ki_exchange/workspace_sync.json.
-10. ZERO-BUILD SIMULATOR (native.glass_run zone='live') & STATISCHER FLUTTER-EXTRACTOR:
+10. ZERO-BUILD SIMULATOR (native.glass_run zone='live') & STATISCHE ENGINE-API-EXTRAKTOREN:
    - zone='live' fuehrt aktive Smali-, LibForge-, LibCarve- und Hex-Patches im RAM/VFS 2.0 ohne APK-Build aus!
-   - api.extract_flutter_static scannt optional flutter_assets & libapp.so; api.import_templates uebernimmt gewaehlte Vorlagen in api_traffic.db.
+   - Virtuelle Uhr / Datumsvorgabe: native.glass_clock (op=get|set|shift|reset) oder virtual_clock= in native.glass_run steuert Dalvik-Zeit-APIs, ARM64 clock_gettime & Statusleiste gemeinsam.
+   - Debugger-Steuerung & Tiefen-Inspektion: native.glass_control (auch reset_appdata/clear_appdata/set_persist_session/reverse_step/goto/set_net_mode/add_net_mock/set_options/generate_befund; target='gui'|'headless'|'both'), native.glass_inspect (app_state/prefs/sqlite/missing/seams/timeline/heap/befund).
+   - api.extract_engine_static scannt statische APIs fuer Hybrid-Web, React Native/Hermes, Flutter & Web-Assets; api.extract_flutter_static spezialisiert auf Flutter; api.import_templates + api.update/replay/clear verwalten api_traffic.db.
+11. SIMULIERTE APP-GUI, WEBVIEW, MANIFEST & WORKSPACE:
+   - native_ui_view liefert der KI den aktuellen Screen (laufende Desktop-GUI oder letzter native_glass_run) direkt als echtes PNG-ImageContent + visible_texts + interactive_elements (tap_xy). Mit annotate=true erscheinen [1], [2], ... Nummernschilder direkt auf den Klickzielen.
+   - native_ui_tap(x, y, forward_to_gui=true) / native_ui_key(text, forward_to_gui=true) sowie native_glass_control(cmd='ui_scroll'|'open_browser'|'toggle_pw_mask') steuern auch die laufende Desktop-GUI fern.
+   - native.webview_inspect entdeckt App-URLs & inspiziert HTTP/HTML-Assets im DOM-Parser.
+   - app.list_local / app.import / app.pull_apk (gated) / workspace.renew_id / app.manifest_info / smali.callgraph / patch.fuzzy_match / lib.import_so / lib.set_active / logcat.capture / app.start+app.stop (gated: app_start) schliessen die Studio-Paritaet.
 """

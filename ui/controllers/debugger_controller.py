@@ -60,7 +60,15 @@ class DebuggerController:
         self.jni_aps = []           # Grenz-Aktionspunkt-Specs (Java<->nativ)
         self._fusion = None         # {eng,jni,table,bridge,hook} des gläsernen Laufs
         self.jni_log = None         # JniBoundaryLog des gläsernen Laufs
+        self._state_lock = threading.RLock()
+        self._appdata_lock = threading.RLock()
+        self._worker_thread = None
+        self._main_thread_id = threading.get_ident()
         self._busy = False
+        self._run_seq = 0
+        self._pause_pending = False
+        self._stop_pending = False
+        self._last_start_mode = ""
         self._log_lines = []
         # gebundene Widgets des aktuellen Layouts
         self._w = {}
@@ -78,6 +86,8 @@ class DebuggerController:
         self.flight_recorder_enabled = False
         self._heartbeat_id = None
         self._stubs = None
+        self._clock_preset = None
+        self._budget_override = None
         try:
             from core.java.net_recorder import NetCondition
             self.net_condition = NetCondition()
@@ -85,9 +95,16 @@ class DebuggerController:
             self.net_condition = None
         # Paket 1: 2-Ebenen Seam-Konfiguration + Instanzen (Fork/Merge) + Projekt-Snapshots
         try:
+            _cfg_map = getattr(getattr(self.app, "cfg", None), "config", None)
+            _init_ps = bool(_cfg_map.get("DEBUGGER_PERSIST_SESSION", False)) if isinstance(_cfg_map, dict) else False
+        except Exception:
+            _init_ps = False
+        self.persist_session = _init_ps
+        try:
             from core.java.seam_config import SeamConfig
             from core.java.glass_runner import InstanceState, ProjectSnapshotService
             self.seam_config = SeamConfig.from_profile("self_cache")
+            self.seam_config.persist_appdata = bool(self.persist_session)
             self.instance_state = InstanceState(zone=self.zone, apply_patches=self.apply_patches)
             self.snapshot_service = ProjectSnapshotService(base_dir=self._base_dir())
         except Exception:
@@ -171,11 +188,18 @@ class DebuggerController:
         return None
 
     def _after(self, fn):
-        if self.app is not None and hasattr(self.app, "after"):
+        if not callable(fn):
+            return
+        app = self.app
+        if app is not None and hasattr(app, "after"):
             try:
-                self.app.after(0, fn); return
+                app.after(0, fn)
+                return
             except Exception:
-                pass
+                # Nie Tk aus Worker-Threads direkt anfassen (M4).
+                if threading.get_ident() != getattr(self, "_main_thread_id", -1):
+                    return
+                return
         fn()
 
     # ---- Logging / Console ------------------------------------------------
@@ -214,13 +238,13 @@ class DebuggerController:
                     EventBus.publish("GLASS_STATE", {"mode": st.get("mode"), "tree": self.glass_tree})
             except Exception:
                 pass
-            if getattr(self, "_busy", False):
+            if getattr(self, "_busy", False) and not getattr(self, "_stop_pending", False):
                 try:
-                    self._heartbeat_id = self.app.after(250, _tick)
+                    self._heartbeat_id = self.app.after(400, _tick)
                 except Exception:
                     pass
         try:
-            self._heartbeat_id = self.app.after(250, _tick)
+            self._heartbeat_id = self.app.after(400, _tick)
         except Exception:
             pass
 
@@ -320,6 +344,26 @@ class DebuggerController:
         except Exception:
             pass
 
+    def _schedule_live_state_push(self, st):
+        """Schreibt Live-State & UI-Snapshot entkoppelt im Hintergrund-Thread (blockiert nie die Tk-Mainloop)."""
+        self._pending_live_state = dict(st) if isinstance(st, dict) else {"mode": "idle"}
+        if getattr(self, "_live_state_pushing", False):
+            return
+        self._live_state_pushing = True
+
+        def _bg():
+            try:
+                while True:
+                    snap = getattr(self, "_pending_live_state", None)
+                    self._pending_live_state = None
+                    if snap is None:
+                        break
+                    self._push_live_state_json(snap)
+            finally:
+                self._live_state_pushing = False
+
+        threading.Thread(target=_bg, daemon=True).start()
+
     def _push_live_state_json(self, st):
         """Schreibt aktuellen Live-Zustand fuer MCP/KI-Abgleich nach secrets/probe/out/glass/live_state.json."""
         try:
@@ -356,6 +400,41 @@ class DebuggerController:
                     net_entries = self.net_log.to_list()[-30:]
             except Exception:
                 pass
+            vclock_state = None
+            app_state_snap = None
+            try:
+                from core.java.glass_runner import extract_app_state_snapshot
+                app_state_snap = extract_app_state_snapshot(self._stubs, fusion=getattr(self, "_fusion", None))
+                vclock_state = app_state_snap.get("virtual_clock")
+            except Exception:
+                pass
+            if vclock_state is None and isinstance(getattr(self, "_clock_preset", None), dict):
+                vclock_state = dict(self._clock_preset)
+            missing_list = list(getattr(self, "_last_missing", []) or [])
+            tl_raw = (getattr(jdb, "timeline", None) or []) if jdb else []
+            tl_tail = [
+                {
+                    "step": r.get("step"),
+                    "cls": r.get("cls"),
+                    "name": r.get("name"),
+                    "pc": r.get("pc"),
+                    "op": r.get("op"),
+                }
+                for r in tl_raw[-30:]
+                if isinstance(r, dict)
+            ]
+            watches_out = []
+            try:
+                watches_out = self.watch_values()
+            except Exception:
+                watches_out = []
+            vm_cur = getattr(jdb, "vm", None) if jdb is not None else None
+            devs = []
+            if vm_cur is not None and hasattr(vm_cur, "deviations") and callable(getattr(vm_cur.deviations, "to_list", None)):
+                try:
+                    devs = vm_cur.deviations.to_list()
+                except Exception:
+                    devs = []
             payload = {
                 "mode": st.get("mode"),
                 "step": st.get("step"),
@@ -371,8 +450,11 @@ class DebuggerController:
                 "package": self._resolve_pkg(),
                 "instance_id": getattr(getattr(self, "instance_state", None), "instance_id", "main"),
                 "seam_profile": getattr(getattr(self, "seam_config", None), "unpack_mode", "self_cache"),
+                "persist_session": bool(getattr(self, "persist_session", False)),
                 "net_mode": self.net_mode,
                 "net_condition": self.net_condition.to_dict() if getattr(self, "net_condition", None) else None,
+                "virtual_clock": vclock_state,
+                "app_state": app_state_snap,
                 "callstack": (jdb.callstack() if jdb and hasattr(jdb, "callstack") else []),
                 "loaded_classes_count": len(self.loaded_classes()),
                 "net_count": len(getattr(self.net_log, "entries", []) or []) if self.net_log else 0,
@@ -380,6 +462,13 @@ class DebuggerController:
                 "views_count": len(views_snap),
                 "registers": regs_snap,
                 "net_entries": net_entries,
+                "missing": missing_list[:100],
+                "missing_count": len(missing_list),
+                "deviations": devs[:100],
+                "timeline_count": len(tl_raw),
+                "timeline_tail": tl_tail,
+                "jni_entries": self.jni_entries()[-30:],
+                "watches": watches_out,
             }
             tmp = os.path.join(out_dir, "live_state.json.tmp")
             dst = os.path.join(out_dir, "live_state.json")
@@ -388,6 +477,20 @@ class DebuggerController:
             with open(tmp, "w", encoding="utf-8", errors="replace") as fh:
                 fh.write(raw)
             os.replace(tmp, dst)
+            try:
+                tree = getattr(self, "glass_tree", None)
+                if tree is not None and getattr(tree, "root", None) is not None:
+                    from core.java.ui_mcp_bridge import build_ui_snapshot_dict, persist_live_ui_snapshot
+                    persist_live_ui_snapshot(
+                        build_ui_snapshot_dict(
+                            tree=tree,
+                            package=self._resolve_pkg(),
+                            source="debugger_live",
+                        ),
+                        out_dir=out_dir,
+                    )
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -426,6 +529,12 @@ class DebuggerController:
             if lbl is not None:
                 try:
                     ex = st.get("exception") or {}
+                    _show_ex = bool(
+                        ex and (
+                            st.get("mode") in ("error", "paused")
+                            or (not ex.get("handled") and not ex.get("lenient"))
+                        )
+                    )
                     rsn = (" (%s)" % st.get("reason")) if st.get("reason") else ""
                     _glass_active = getattr(getattr(self, "glass_tree", None), "root", None) is not None
                     _mode_txt = ("\U0001f7e2 Bereit (UI interaktiv / Event-Loop)"
@@ -433,7 +542,7 @@ class DebuggerController:
                     lbl.config(text="mode=%s%s  step=%s  %s->%s  pc=%s op=%s  depth=%s  result=%r%s%s" % (
                         _mode_txt, rsn, st.get("step"), st.get("cls"), st.get("name"),
                         st.get("pc"), st.get("op"), st.get("depth"), st.get("result"),
-                        ("  EXC=%s" % ex.get("cls")) if ex else "",
+                        ("  EXC=%s" % ex.get("cls")) if _show_ex else "",
                         ("  ERR=%s" % st.get("error")) if st.get("error") else ""))
                 except Exception:
                     pass
@@ -513,7 +622,8 @@ class DebuggerController:
                 except Exception:
                     pass
             self._sync_os_view()
-            self._push_live_state_json(st)
+            if not isinstance(st, dict) or st.get("mode") not in ("run", "step", "over", "out"):
+                self._schedule_live_state_push(st)
             v = getattr(self, "view", None)
             if v is not None:
                 try:
@@ -679,6 +789,12 @@ class DebuggerController:
             from core.java.dex_loader import AndroidStubs
             from core.java.lifecycle import _StubRuntime
             _stubs = AndroidStubs(vm=vm)
+            if isinstance(getattr(self, "_clock_preset", None), dict):
+                try:
+                    from core.java.virtual_clock import set_virtual_clock
+                    set_virtual_clock(_stubs, **self._clock_preset)
+                except Exception:
+                    pass
             try:
                 _stubs.seed_framework_statics(vm)
             except Exception:
@@ -730,10 +846,26 @@ class DebuggerController:
             raise ValueError("Methode '%s' nicht gefunden" % nm)
         return mds[0]
 
+    def on_budget_changed(self):
+        """Synchronisiert Aenderungen am Budget-Dropdown sofort in die aktive JavaDebugger-Session."""
+        steps = self._parse_budget_steps()
+        if self._jdb is not None and hasattr(self._jdb, "set_budget"):
+            try:
+                self._jdb.set_budget(steps, pause_on_budget=True)
+            except Exception:
+                pass
+        v = getattr(self, "view", None)
+        if v is not None and hasattr(v, "sync_code_views"):
+            try:
+                st = self._jdb.inspect() if self._jdb else {"mode": "idle"}
+                v.sync_code_views(st)
+            except Exception:
+                pass
+
     def _parse_budget_steps(self):
         """Liest das ausgewaehlte Schritt-Budget je Lauf/Weiter-Klick."""
         v = getattr(getattr(self, "view", None), "v_step_budget", None)
-        raw = (v.get() if v is not None else "200k") or "200k"
+        raw = (v.get() if v is not None else getattr(self, "_budget_override", None)) or "200k"
         raw = raw.strip().lower()
         mapping = {
             "50k": 50_000,
@@ -776,38 +908,51 @@ class DebuggerController:
         self._after(_upd)
 
     def _async(self, fn, label):
-        if self._busy:
-            self._log("Debugger beschaeftigt."); return
-        self._busy = True
+        lock = getattr(self, "_state_lock", None)
+        if lock is not None:
+            with lock:
+                if self._busy:
+                    self._log("Debugger beschaeftigt."); return
+                self._busy = True
+                self._stop_pending = False
+                self._run_seq += 1
+                my_seq = self._run_seq
+        else:
+            if self._busy:
+                self._log("Debugger beschaeftigt."); return
+            self._busy = True
+            self._stop_pending = False
+            self._run_seq += 1
+            my_seq = self._run_seq
         self._start_heartbeat()
 
         def _w():
             try:
                 fn()
-                while self._jdb is not None and getattr(self._jdb, "mode", None) in ("run", "step", "over", "out"):
+                while (not self._stop_pending) and (self._run_seq == my_seq) and self._jdb is not None and getattr(self._jdb, "mode", None) in ("run", "step", "over", "out"):
                     try:
-                        self._jdb._paused.wait(0.25)
+                        self._jdb._paused.wait(0.20)
                     except Exception:
                         break
-                if "app" in label:
+                if self._run_seq != my_seq or self._stop_pending:
+                    return
+                if ("app" in label or label.startswith("ui-")) and self._should_persist_session():
                     self.persist_active_appdata()
-                if self.glass_tree is not None:
+                if self.glass_tree is not None and getattr(self._jdb, "mode", None) in ("done", "idle"):
                     try:
                         _rt_root = self._resolve_root()
                         if _rt_root:
-                            from core.java.app_runtime import detect_runtime, is_unrendered_surface_shell
-                            if (self.glass_tree.root is None or is_unrendered_surface_shell(self.glass_tree)) and detect_runtime(_rt_root)[0] == "Flutter":
-                                from core.java.flutter_app_producer import mount_flutter_app_into_tree
-                                mount_flutter_app_into_tree(
-                                    self.glass_tree,
-                                    _rt_root,
-                                    stubs=self._stubs,
-                                    on_async_update=self._notify_glass_ui_updated,
-                                )
-                            elif getattr(self.glass_tree, "_flutter_ctrl", None) is not None:
-                                self.glass_tree._flutter_ctrl.set_async_updater(self._notify_glass_ui_updated)
+                            from core.java.app_runtime import mount_inphone_runtime_if_needed
+                            mount_inphone_runtime_if_needed(
+                                self.glass_tree,
+                                _rt_root,
+                                stubs=self._stubs,
+                                on_async_update=self._notify_glass_ui_updated,
+                            )
                     except Exception:
                         pass
+                if self._run_seq != my_seq:
+                    return
                 ins = (self._jdb.inspect() if self._jdb else {"mode": "idle"})
                 self._refresh(ins)
                 _m = ins.get("mode")
@@ -834,11 +979,29 @@ class DebuggerController:
                 else:
                     self._log("> %s -> %s" % (label, _m))
             except Exception as e:
-                self._log("> FEHLER (%s): %r" % (label, e))
+                if self._run_seq == my_seq:
+                    self._log("> FEHLER (%s): %r" % (label, e))
             finally:
-                self._busy = False
-                self._after(self._stop_heartbeat)
-        threading.Thread(target=_w, daemon=True).start()
+                if lock is not None:
+                    with lock:
+                        cur_match = (self._run_seq == my_seq)
+                        if cur_match:
+                            self._busy = False
+                else:
+                    cur_match = (self._run_seq == my_seq)
+                    if cur_match:
+                        self._busy = False
+                if cur_match:
+                    self._after(self._stop_heartbeat)
+
+        th = threading.Thread(target=_w, daemon=True)
+        if lock is not None:
+            with lock:
+                if self._run_seq == my_seq:
+                    self._worker_thread = th
+        else:
+            self._worker_thread = th
+        th.start()
 
     # ---- Debugger-Operationen ---------------------------------------------
     def select_stack_frame(self, idx):
@@ -912,6 +1075,7 @@ class DebuggerController:
         self._jdb.stop_on_exception = bool(getattr(self, "stop_on_exception", False))
         self._jdb.exception_unhandled_only = bool(getattr(self, "exception_unhandled_only", True))
         self._jdb.flight_recorder_enabled = bool(getattr(self, "flight_recorder_enabled", False))
+        self._last_start_mode = "method"
         self._jdb_sig = (md.cls, md.name, md.sig)
         self._loaded_cls = md.cls
         self._register_all_bps_on_jdb()
@@ -919,33 +1083,82 @@ class DebuggerController:
             md.cls, md.name, md.sig, self.bps, self.entry_stop, self.zone))
         self._rebuild_view()
         self._async(lambda: self._jdb.start(md.cls, md.name, md.sig, tuple(args),
-                                            stop_at_entry=self.entry_stop), "start")
+                                            stop_at_entry=self.entry_stop, wait_timeout=0.05), "start")
+
+    def _run_single_step(self, step_kind):
+        """Fuehrt In/Over/Out im glaesernen oder Einzelmethoden-Lauf robust aus."""
+        jdb = self._jdb
+        if not jdb:
+            self._log("> %s: kein Lauf aktiv — zuerst '▶ Start/Weiter' ausfuehren." % step_kind)
+            return
+
+        def _exec_step():
+            if step_kind == "step":
+                self._jdb.step(wait_timeout=0.05)
+            elif step_kind == "step_over":
+                self._jdb.step_over(wait_timeout=0.05)
+            else:
+                self._jdb.step_out(wait_timeout=0.05)
+
+        if self._busy:
+            if getattr(jdb, "_pause_requested", False) or getattr(jdb, "mode", None) in ("run", "step", "over", "out"):
+                def _wait_then_step():
+                    deadline = time.monotonic() + 1.5
+                    while self._busy and time.monotonic() < deadline and not self._stop_pending:
+                        time.sleep(0.02)
+                    if not self._busy and self._jdb is jdb and jdb.mode == "paused":
+                        self._active_stack_idx = 0
+                        self._async(_exec_step, step_kind)
+                    else:
+                        self._log("> %s: Debugger ist noch im Uebergang zur Pause (bitte kurz warten)." % step_kind)
+                threading.Thread(target=_wait_then_step, daemon=True).start()
+                return
+            self._log("> %s: Debugger arbeitet noch." % step_kind)
+            return
+        if jdb.mode in ("done", "stopped", "error"):
+            self._log("> %s: Lauf bereits beendet (%s) — nutze 'Rev' fuer 1 Schritt zurueck oder '🔄 Neu' mit 'Bei Schritt 0 pausieren'." % (step_kind, jdb.mode))
+            return
+        if jdb.mode != "paused":
+            self._log("> %s: Bitte zuerst mit '⏸ Pause' anhalten (aktuell: %s)." % (step_kind, jdb.mode))
+            return
+        self._active_stack_idx = 0
+        self._async(_exec_step, step_kind)
 
     def step(self):
-        if self._jdb:
-            self._active_stack_idx = 0
-            self._async(lambda: self._jdb.step(), "step")
+        self._run_single_step("step")
 
     def step_over(self):
-        if self._jdb:
-            self._active_stack_idx = 0
-            self._async(lambda: self._jdb.step_over(), "step_over")
+        self._run_single_step("step_over")
 
     def step_out(self):
-        if self._jdb:
-            self._active_stack_idx = 0
-            self._async(lambda: self._jdb.step_out(), "step_out")
+        self._run_single_step("step_out")
 
     def reverse_step(self):
-        if self._jdb and self._jdb.timeline:
-            self.goto(max(0, len(self._jdb.timeline) - 2))
+        jdb = self._jdb
+        if not jdb:
+            self._log("> Rev: kein Lauf aktiv.")
+            return
+        cur_step = int(getattr(jdb, "step_count", 0) or 0)
+        if jdb.mode in ("paused", "done", "stopped", "error"):
+            if cur_step <= 0:
+                self._log("> Rev: bereits bei Schritt 0.")
+                return
+            self.goto(max(0, cur_step - 1))
+        else:
+            self._log("> Rev: Bitte zuerst mit '⏸ Pause' anhalten.")
 
     def pause(self):
         """Pausiert einen laufenden Java+ARM64 Debug-Lauf sauber und aktualisiert Stack/Editor."""
         if not self._jdb:
-            self._log("> pause: kein Lauf aktiv"); return
+            if self._busy:
+                self._pause_pending = True
+                self._log("> Pause vorgemerkt (haelt direkt nach dem Setup bei Schritt 0 an).")
+            else:
+                self._log("> pause: kein Lauf aktiv")
+            return
         jdb = self._jdb
         try:
+            self._pause_pending = True
             jdb.pause()
             if self._session is not None and hasattr(self._session, "pause"):
                 try:
@@ -964,9 +1177,9 @@ class DebuggerController:
                     ins = jdb.inspect()
                     self._refresh(ins)
                     from core.application.event_bus import EventBus
-                    EventBus.publish("DEBUG_PAUSED", {"paused": ins.get("mode") == "paused", "mode": ins.get("mode")})
+                    self._after(lambda: EventBus.publish("DEBUG_PAUSED", {"paused": ins.get("mode") == "paused", "mode": ins.get("mode")}))
                     if self.glass_tree is not None:
-                        EventBus.publish("GLASS_STATE", {"mode": ins.get("mode"), "tree": self.glass_tree})
+                        self._after(lambda: EventBus.publish("GLASS_STATE", {"mode": ins.get("mode"), "tree": self.glass_tree}))
                 except Exception:
                     pass
 
@@ -978,10 +1191,22 @@ class DebuggerController:
         if self._jdb:
             self._active_stack_idx = 0
             self._jdb.set_budget(self._parse_budget_steps(), pause_on_budget=True)
-            self._async(lambda: self._jdb.cont(), "cont")
+            self._async(lambda: self._jdb.cont(wait_timeout=0.05), "cont")
 
-    def stop(self):
-        # Abbruch muss IMMER durchgehen - auch waehrend 'cont' laeuft (Busy-Guard umgehen).
+    def stop(self, persist=True):
+        # Abbruch muss IMMER sofort durchgehen - auch waehrend Setup/JNI/Run (UI nie blockieren).
+        lock = getattr(self, "_state_lock", None)
+        if lock is not None:
+            with lock:
+                self._stop_pending = True
+                self._pause_pending = False
+                self._run_seq += 1
+                jdb = self._jdb
+        else:
+            self._stop_pending = True
+            self._pause_pending = False
+            self._run_seq += 1
+            jdb = self._jdb
         self._stop_heartbeat()
         hc = getattr(self, "_hermes_client", None)
         if hc is not None and hasattr(hc, "close"):
@@ -990,17 +1215,42 @@ class DebuggerController:
             except Exception:
                 pass
             self._hermes_client = None
-        if not self._jdb:
+        eng = (getattr(self, "_fusion", None) or {}).get("eng")
+        if eng is not None and getattr(eng, "cpu", None) is not None:
+            try:
+                eng.cpu.stopped = True
+            except Exception:
+                pass
+        if not jdb:
+            if lock is not None:
+                with lock:
+                    self._busy = False
+            else:
+                self._busy = False
+            self._log("> stop -> abgebrochen")
             return
         try:
-            self._jdb.stop()
-            self.persist_active_appdata()
+            jdb.stop(wait_timeout=0.15)
         except Exception as e:
             self._log("> stop -> FEHLER %r" % e); return
-        self._busy = False
-        self._log("> stop -> %s" % self._jdb.mode)
+        if lock is not None:
+            with lock:
+                self._busy = False
+        else:
+            self._busy = False
+        self._log("> stop -> %s" % jdb.mode)
+        if persist and not getattr(self, "_clearing_appdata", False):
+            def _fin_appdata():
+                wt = getattr(self, "_worker_thread", None)
+                if wt is not None and wt.is_alive() and wt is not threading.current_thread():
+                    wt.join(timeout=0.5)
+                if self._should_persist_session():
+                    self.persist_active_appdata()
+                else:
+                    self._cleanup_ephemeral_session()
+            threading.Thread(target=_fin_appdata, daemon=True).start()
         try:
-            self._refresh(self._jdb.inspect())
+            self._refresh(jdb.inspect())
         except Exception:
             pass
 
@@ -1038,9 +1288,15 @@ class DebuggerController:
                             return nd
                 if "x" in kw or "y" in kw:
                     x, y = float(kw.get("x", 0)), float(kw.get("y", 0))
-                    nd = tree.clickable_at(x, y) if prefer_clickable else tree.node_at(x, y)
-                    if nd is None and not prefer_clickable:
-                        nd = tree.clickable_at(x, y)
+                    fix_flag = kw.get("fixed")
+                    if fix_flag is True and hasattr(tree, "fixed_clickable_at"):
+                        nd = tree.fixed_clickable_at(x, y) if prefer_clickable else tree.fixed_node_at(x, y)
+                        if nd is None and not prefer_clickable:
+                            nd = tree.fixed_clickable_at(x, y)
+                    else:
+                        nd = tree.clickable_at(x, y) if prefer_clickable else tree.node_at(x, y)
+                        if nd is None and not prefer_clickable:
+                            nd = tree.clickable_at(x, y)
                     if nd is not None:
                         return nd
                 if txt_q is not None:
@@ -1146,7 +1402,15 @@ class DebuggerController:
                             recomp()
                 except Exception:
                     pass
-        self._async(lambda: jdb.run_interaction(_interact, stop_at_entry=bool(self.entry_stop)), "ui-%s" % kind)
+        sel_budget = self._parse_budget_steps()
+        try:
+            jdb.set_budget(sel_budget, pause_on_budget=True)
+        except Exception:
+            pass
+        self._async(
+            lambda: jdb.run_interaction(_interact, stop_at_entry=bool(self.entry_stop), min_budget=sel_budget),
+            "ui-%s" % kind,
+        )
 
     def refresh_interactive_ui(self):
         """Aktualisiert die laufende interaktive UI-Session ohne App-Reset."""
@@ -1170,317 +1434,304 @@ class DebuggerController:
         self._async(_u, "ui-refresh")
 
     # ---- Gläserner App-Lauf (Anzeige + Debugger am selben VM) --------------
-    def start_app(self):
-        """Fährt den GANZEN App-Lifecycle durch den Debugger, mit View-Recorder am selben VM.
-        Breakpoints (an geladene Methode gebunden) + Aktionspunkte feuern über den ganzen Lauf.
-        Der aufgezeichnete View-Baum (`self.glass_tree`) wird der Anzeige bereitgestellt."""
+    def _launch_glass_app_async(self, pause_at_step=None):
+        """Bereitet den glaesernen App-Lauf vollstaendig asynchron vor, ohne die GUI zu blockieren."""
+        if self._jdb is not None and getattr(self._jdb, "mode", None) in ("run", "step", "over", "out", "paused"):
+            self.stop()
+        if self._busy:
+            self._log("Debugger beschaeftigt."); return
         try:
             root = self._resolve_root()
-            if not root:
-                self._log("> Gläsern: Zonen-Wurzel/App-Root fehlt."); return
-            from core.java.dalvik import DalvikVM
-            from core.java.class_provider import StudioClassProvider
-            from core.java.dex_loader import AndroidStubs
-            from core.java.lifecycle import LifecycleRunner, _StubRuntime
-            from core.java.view_tree import install_view_stubs
-            vm = DalvikVM(); vm.lenient = bool(getattr(self, "tolerant", True))
-            vm.step_budget = 100_000_000
-            prov = StudioClassProvider(root, zone=self.zone)
-            resolved_ov = None
-            if self._should_apply_overlays():
-                try:
-                    from services.workspace_overlay_service import WorkspaceOverlayResolver
-                    _pkg_hint = self._resolve_pkg()
-                    try:
-                        from core.java.manifest import parse_manifest
-                        _pkg_hint = getattr(parse_manifest(root), "package", "") or _pkg_hint
-                    except Exception:
-                        pass
-                    _cfg_dict = getattr(getattr(self.app, "cfg", None), "config", None) or {}
-                    resolved_ov = WorkspaceOverlayResolver.collect(
-                        self._base_dir(), _pkg_hint, root, app=self.app, cfg=_cfg_dict,
-                        overlay_smali=bool(getattr(self, "overlay_smali", True)),
-                        overlay_libcarve=bool(getattr(self, "overlay_libcarve", True)),
-                        overlay_libforge=bool(getattr(self, "overlay_libforge", True)),
-                    )
-                    if resolved_ov.get("smali_patches") and hasattr(prov, "apply_smali_patches"):
-                        np = prov.apply_smali_patches(resolved_ov["smali_patches"])
-                        if np:
-                            self._log("> %d Smali-Patch(es) live im ClassProvider ueberlagert" % np)
-                except Exception as _ep:
-                    self._log("> Workspace-Overlay Warnung: %r" % _ep)
-            vm.class_provider = prov
-            stubs = AndroidStubs(vm=vm)
-            self._stubs = stubs
-            try:
-                stubs.seed_framework_statics(vm)
-            except Exception:
-                pass
-            tree = install_view_stubs(stubs, app_root=root)
-            try:
-                from core.java.net_recorder import install_net_stubs, NetLog, DbReplayResponder, NetCondition
-                self.net_log = NetLog()
-                self._synced_os_net_count = 0
-                _api_db = None; _rules_path = None
-                try:
-                    paths = getattr(self.app.cfg, "paths", {}) or {}
-                    _dbp = paths.get("API_DB") if hasattr(paths, "get") else None
-                    _rules_path = paths.get("API_RULES") if hasattr(paths, "get") else None
-                    if _dbp:
-                        from services.api_db_service import ApiDbService
-                        _api_db = ApiDbService(_dbp)       # emulierter Traffic -> APIInspectorTab
-                except Exception as _edb:
-                    self._log("> API-DB nicht angebunden: %r" % _edb)
-                self._api_db = _api_db
-                self._mock_hint_urls = set()
-                install_net_stubs(stubs, responder=self._dispatch_net_request, net_log=self.net_log,
-                                  api_db=_api_db, rules_path=_rules_path,
-                                  net_condition=getattr(self, "net_condition", None))
-            except Exception as _e:
-                self._log("> Netz-Recorder nicht geladen: %r" % _e)
-            try:
-                from core.java.asset_bridge import install_asset_stubs, seed_assets_from_dir
-                install_asset_stubs(stubs)
-                _ar = self._resolve_root() or self.zone_root or ""
-                if _ar:
-                    _na = seed_assets_from_dir(stubs, _ar)
-                    if _na:
-                        self._log("> Assets bereitgestellt (AssetManager): %d Dateien" % _na)
-            except Exception as _ea:
-                self._log("> AssetManager-Bruecke nicht geladen: %r" % _ea)
-            vm.runtime = _StubRuntime(stubs)
-            self._fusion = None; self.jni_log = None; self._session = None
-            try:
-                from core.java.seam_config import SeamConfig
-                from core.java.glass_runner import InstanceState, sync_appdata_into_vfs
-            except Exception:
-                SeamConfig = None; InstanceState = None; sync_appdata_into_vfs = None
+        except Exception:
+            root = ""
+        if not root:
+            self._log("> Gläsern: Zonen-Wurzel/App-Root fehlt."); return
+
+        cfg_snap = {
+            "root": root,
+            "zone": self.zone,
+            "zone_root": self.zone_root,
+            "entry": (self.app_entry or "").strip() or None,
+            "budget": self._parse_budget_steps(),
+            "entry_stop": bool(self.entry_stop),
+            "tolerant": bool(getattr(self, "tolerant", True)),
+            "apply_overlays": bool(self._should_apply_overlays()),
+            "overlay_smali": bool(getattr(self, "overlay_smali", True)),
+            "overlay_libcarve": bool(getattr(self, "overlay_libcarve", True)),
+            "overlay_libforge": bool(getattr(self, "overlay_libforge", True)),
+            "apply_patches": bool(getattr(self, "apply_patches", False)),
+            "native_fusion": bool(getattr(self, "native_fusion", True)),
+            "record_timeline": bool(getattr(self, "record_timeline", False)),
+            "record_regs": bool(getattr(self, "record_regs", False)),
+            "stop_on_exception": bool(getattr(self, "stop_on_exception", False)),
+            "exception_unhandled_only": bool(getattr(self, "exception_unhandled_only", True)),
+            "flight_recorder_enabled": bool(getattr(self, "flight_recorder_enabled", False)),
+            "pkg_hint": self._resolve_pkg(),
+            "pause_at_step": pause_at_step,
+        }
+        self._last_start_mode = "app"
+        self._pause_pending = False
+
+        def _prepare_and_launch():
+            from core.java.glass_runner import GlassAppRunner, InstanceState
+            from core.java.net_recorder import NetLog
+            if self._stop_pending:
+                return
             seam_cfg = getattr(self, "seam_config", None)
-            if seam_cfg is None and SeamConfig is not None:
+            if seam_cfg is None:
+                from core.java.seam_config import SeamConfig
                 seam_cfg = SeamConfig.from_profile("self_cache")
                 self.seam_config = seam_cfg
+            seam_cfg.persist_appdata = self._should_persist_session()
             inst_state = getattr(self, "instance_state", None)
-            if inst_state is None and InstanceState is not None:
-                inst_state = InstanceState(zone=self.zone, apply_patches=self.apply_patches)
+            if inst_state is None:
+                inst_state = InstanceState(zone=cfg_snap["zone"], apply_patches=cfg_snap["apply_patches"])
                 self.instance_state = inst_state
-            _man_pkg = ""
-            _man_entry = ""
-            try:
-                from core.java.manifest import parse_manifest
-                _man = parse_manifest(root)
-                _man_pkg = getattr(_man, "package", "") or ""
-                _man_entry = (_man.entry() or "") if hasattr(_man, "entry") else ""
-            except Exception:
-                pass
-            if _man_pkg:
-                try:
-                    from core.java.device_profile import DeviceProfile
-                    stubs.set_profile(DeviceProfile(package=_man_pkg), vm=vm)
-                except Exception:
-                    try:
-                        stubs.profile.package = _man_pkg
-                    except Exception:
-                        pass
-            _pkg_det = _man_pkg or getattr(getattr(stubs, "profile", None), "package", None) or self._resolve_pkg() or "com.example.app"
-            self._active_pkg = _pkg_det
-            if inst_state is not None:
-                inst_state.package = _pkg_det
-                inst_state.app_root = root
-                inst_state.zone = self.zone
-                inst_state.apply_patches = bool(self.apply_patches)
-                if seam_cfg is not None:
-                    inst_state.seam_profile = seam_cfg.unpack_mode
+            inst_state.app_root = cfg_snap["root"]
+            inst_state.zone = cfg_snap["zone"]
+            inst_state.apply_patches = cfg_snap["apply_patches"]
+            inst_state.seam_profile = seam_cfg.unpack_mode
 
-            _fusion_active = bool(self.native_fusion) and (seam_cfg is None or seam_cfg.unpack_mode != "noop_native")
-            if _fusion_active:
+            self.net_log = NetLog()
+            self._synced_os_net_count = 0
+            _api_db = None
+            _rules_path = None
+            try:
+                paths = getattr(self.app.cfg, "paths", {}) or {}
+                _dbp = paths.get("API_DB") if hasattr(paths, "get") else None
+                _rules_path = paths.get("API_RULES") if hasattr(paths, "get") else None
+                if _dbp:
+                    from services.api_db_service import ApiDbService
+                    _api_db = ApiDbService(_dbp)
+            except Exception as _edb:
+                self._log("> API-DB nicht angebunden: %r" % _edb)
+            self._api_db = _api_db
+            self._mock_hint_urls = set()
+
+            _cfg_dict = getattr(getattr(self.app, "cfg", None), "config", None) or {}
+            _vclock = getattr(self, "_clock_preset", None)
+            gr = GlassAppRunner(
+                cfg_snap["root"],
+                zone=cfg_snap["zone"],
+                seam_config=seam_cfg,
+                instance_state=inst_state,
+                base_dir=self._base_dir(),
+                log_fn=self._log,
+            )
+            built = gr.build(
+                native_fusion=cfg_snap["native_fusion"],
+                net_mode=getattr(self, "net_mode", "mock"),
+                net_responder=self._dispatch_net_request,
+                rules_path=_rules_path,
+                api_db=_api_db,
+                net_log=self.net_log,
+                net_condition=getattr(self, "net_condition", None),
+                virtual_clock=(_vclock if isinstance(_vclock, dict) else None),
+                tolerant=cfg_snap["tolerant"],
+                step_budget=100_000_000,
+                apply_overlays=cfg_snap["apply_overlays"],
+                overlay_opts={
+                    "overlay_smali": cfg_snap["overlay_smali"],
+                    "overlay_libcarve": cfg_snap["overlay_libcarve"],
+                    "overlay_libforge": cfg_snap["overlay_libforge"],
+                },
+                app_ctx=self.app,
+                cfg_dict=_cfg_dict,
+                force_sync_appdata=True,
+                fallback_java_on_fusion_err=True,
+                jni_aps=list(self.jni_aps or ()),
+                on_load_library=self._fusion_load_library,
+                on_load_path=self._fusion_load_path,
+                cancel_check=lambda: bool(self._stop_pending),
+            )
+            if not built or built.get("cancelled") or self._stop_pending:
+                return
+
+            vm = built["vm"]
+            prov = built["provider"]
+            stubs = built["stubs"]
+            tree = built["tree"]
+            runner = gr.runner
+            jdb = built["jdb"]
+            _pkg_det = built.get("man_pkg") or cfg_snap["pkg_hint"] or "com.example.app"
+            _man_entry = built.get("man_entry") or ""
+
+            self._stubs = stubs
+            self._active_pkg = _pkg_det
+            self._nld = built.get("nld") or ("/data/app/%s/lib/arm64" % _pkg_det)
+            self._fusion = built.get("fusion")
+            if self._fusion and self._fusion.get("hook"):
+                self.jni_log = self._fusion["hook"].log
+                self._log("> Fusion aktiv: echte arm64-Engine am gläsernen Lauf (Java<->nativ beobachtbar+manipulierbar)")
+            else:
+                self.jni_log = None
+            self._session = built.get("session")
+            if self._should_persist_session():
+                self._log("> Session-Modus: persistent (AppData aktiv)")
+            else:
+                self._log("> Session-Modus: clean/temporär (kein Laden alter AppData)")
+            self.glass_tree = tree
+            self._runner = runner
+            self._jdb = jdb
+
+            budget_lim = cfg_snap["budget"]
+            if cfg_snap["pause_at_step"] is not None:
+                budget_lim = max(budget_lim, int(cfg_snap["pause_at_step"]) + 1)
+            jdb.set_budget(budget_lim, pause_on_budget=True)
+            jdb.record_timeline = cfg_snap["record_timeline"]
+            jdb.record_regs = cfg_snap["record_regs"]
+            jdb.stop_on_exception = cfg_snap["stop_on_exception"]
+            jdb.exception_unhandled_only = cfg_snap["exception_unhandled_only"]
+            jdb.flight_recorder_enabled = cfg_snap["flight_recorder_enabled"]
+            self._jdb_sig = None
+            self._register_all_bps_on_jdb()
+            self._apply_aps()
+            entry = cfg_snap["entry"]
+            _preload_cls = entry or _man_entry
+            if _preload_cls:
                 try:
-                    from services.native_emu_service import NativeEmuService
-                    from services.native_ffi_service import NativeFfiService
-                    from services.native_jni_env_service import NativeJniEnvService
-                    from core.java.native_link import install_native_link, NativeMethodTable
-                    from core.java.jni_boundary import install_jni_boundary
-                    _svc = NativeEmuService(publish=False); _eng = _svc.new_engine()
-                    stubs._vfs_eng = _eng
-                    _ffi = NativeFfiService(publish=False)
-                    _jni = NativeJniEnvService(publish=False, app_base=root)   # AP2.1: zonenbewusst
-                    _jni.install(_eng, _ffi, set_entry_reg=None)
-                    # AP2.1 (J2-Rueckkanal): native Call*Method erreicht die LAUFENDE VM + Stubs
-                    try:
-                        from core.java.runtime import VmBackedJavaRuntime
-                        _jni.java_runtime = VmBackedJavaRuntime(vm, _jni)
-                    except Exception as _ejr:
-                        self._log("> J2-Rueckkanal nicht verbunden: %r" % _ejr)
-                    # echtes System.load/loadLibrary wird vom native_link-Router an den Fusion-Loader gereicht
-                    vm._fusion_load_library = self._fusion_load_library
-                    vm._fusion_load_path = self._fusion_load_path
-                    try:
-                        from services.native_os_service import NativeOsService
-                        _os = NativeOsService(publish=False); _os.attach_env(_eng); _os.install(_eng)
-                    except Exception as _eos:
-                        _os = None; self._log("> OS-8 nicht attachiert: %r" % _eos)
-                    if _os is not None:
-                        try:
-                            from core.java.fusion_autoload import mirror_tree_to_vfs
-                            _root = self._resolve_root() or self.zone_root or ""
-                            _pkg0 = _pkg_det
-                            self._nld = "/data/app/%s/lib/arm64" % _pkg0   # == ApplicationInfo.nativeLibraryDir
-                            if _root:
-                                _na = mirror_tree_to_vfs(_os, _eng, _root, "assets", "/data/app/assets")
-                                _nl = mirror_tree_to_vfs(_os, _eng, _root, "lib/arm64-v8a", self._nld)
-                                self._log("> VFS gespiegelt: %d Assets, %d Libs -> %s (App liest selbst)" % (_na, _nl, self._nld))
-                        except Exception as _em:
-                            self._log("> VFS-Spiegelung uebersprungen: %r" % _em)
-                        # AP2.1.2: gemeinsames VFS fuer Java-I/O + base.apk-Mount + App-Verzeichnisse
-                        try:
-                            from core.java.fs_bridge import install_fs_stubs, get_shared_fs
-                            import os as _osmod
-                            _r2 = self._resolve_root() or self.zone_root or ""
-                            _apk = None
-                            for _cand in ("merged_base.apk", "base.apk"):
-                                _ap = _osmod.path.join(_osmod.path.dirname(_r2), _cand)
-                                if _r2 and _osmod.path.isfile(_ap):
-                                    with open(_ap, "rb") as _afh:
-                                        _apk = _afh.read()
-                                    break
-                            _pkg = _pkg_det
-                            _nld = getattr(self, "_nld", "/data/app/%s/lib/arm64" % _pkg)
-                            install_fs_stubs(stubs, _eng, pkg=_pkg,
-                                             native_lib_dir=_nld, apk_bytes=_apk)
-                            _fs_shared = get_shared_fs(_eng)
-                            if getattr(stubs, "net_condition", None) is not None:
-                                stubs._net_os_eng = _eng
-                                stubs.net_condition.apply_to_os(_eng)
-                            # Zero-Build Live-Overlays: LibForge + LibCarve + Hex + Lib-Replace in VFS 2.0 mounten (Prio 1)
-                            if self._should_apply_overlays() and _fs_shared is not None:
-                                try:
-                                    _ov_libs = (resolved_ov or {}).get("vfs_so_overlays") or {}
-                                    _ov_names = set()
-                                    for _soname, _blob in _ov_libs.items():
-                                        if _blob:
-                                            _bn = _osmod.path.basename(_soname)
-                                            _fs_shared.add_file(f"{_nld}/{_bn}", bytes(_blob))
-                                            _ov_names.add(_bn)
-                                    _eng._vfs_overlay_libs = _ov_names
-                                    _ov_sum = (resolved_ov or {}).get("summary") or {}
-                                    for _warn in _ov_sum.get("warnings") or ():
-                                        self._log("> [Overlay-Warnung] %s" % _warn)
-                                    if _ov_names:
-                                        self._log(
-                                            "> Native Live-Overlays in VFS 2.0 gemountet: %d Datei(en) "
-                                            "(LibForge=%d, LibCarve=%d, Hex=%d, Replace=%d) -> %s"
-                                            % (
-                                                len(_ov_names),
-                                                _ov_sum.get("libforge", 0),
-                                                _ov_sum.get("libcarve", 0),
-                                                _ov_sum.get("hex", 0),
-                                                _ov_sum.get("lib_replace", 0),
-                                                ", ".join(sorted(_ov_names)),
-                                            )
-                                        )
-                                except Exception as _elfg:
-                                    self._log("> Native Live-Overlay VFS-Mount: %r" % _elfg)
-                            if (seam_cfg is None or seam_cfg.persist_appdata) and sync_appdata_into_vfs is not None:
-                                _fs_shared = get_shared_fs(_eng)
-                                _app_dir = (inst_state.pkg_appdata_dir(self._base_dir())
-                                            if inst_state is not None
-                                            else _osmod.path.join(self._base_dir(), "data", "vfs_appdata", _pkg))
-                                _nsync = sync_appdata_into_vfs(_fs_shared, _pkg, _app_dir)
-                                if _nsync:
-                                    self._log("> AppData synchronisiert: %d Dateien aus %s" % (_nsync, _app_dir))
-                            self._log("> VFS geteilt (Java-I/O<->nativ); base.apk gemountet: %s; nativeLibraryDir=%s"
-                                      % ("ja" if _apk else "nein", _nld))
-                        except Exception as _efs:
-                            self._log("> fs-Bruecke nicht installiert: %r" % _efs)
-                    _tbl = NativeMethodTable()
-                    from core.java.fusion_loader import NativeFusionLoader
-                    _loader = NativeFusionLoader(
-                        svc=_svc, eng=_eng, jni=_jni, table=_tbl, ffi=_ffi, stubs=stubs,
-                        app_root=root or "", pkg=_pkg_det, base_dir=self._base_dir(),
-                        seam_config=seam_cfg, log_fn=self._log,
-                    )
-                    install_native_link(vm, _eng, _jni, table=_tbl,
-                                        on_load_library=self._fusion_load_library,
-                                        on_load_path=self._fusion_load_path)
-                    try:
-                        from core.java.fusion_dlopen import install_native_dlopen
-                        _dl = install_native_dlopen(_eng, _ffi, _svc, _jni, _tbl,
-                                                    vfs_read=lambda p: _loader.vfs_read(_eng, p),
-                                                    fusion_loader=_loader)
-                    except Exception as _ed:
-                        _dl = None; self._log("> dlopen-Bruecke nicht installiert: %r" % _ed)
-                    _hook = install_jni_boundary(vm.bridge, vm=vm)
-                    for _s in self.jni_aps:
-                        try: _hook.add_action_point(**_s)
-                        except Exception as _e2: self._log("> Grenz-AP-Fehler: %r" % _e2)
-                    if seam_cfg is not None:
-                        seam_cfg.apply_to_vm(vm, native_fusion=True, jni_hook=_hook)
-                    self._fusion = {"eng": _eng, "jni": _jni, "table": _tbl,
-                                    "bridge": vm.bridge, "hook": _hook, "svc": _svc, "os": _os,
-                                    "ffi": _ffi, "dl": _dl, "loader": _loader, "stubs": stubs}
-                    self.jni_log = _hook.log
-                    try:
-                        from core.java.debug_unified import DebugSession
-                        self._session = DebugSession(_eng, _jni, vm=vm)
-                    except Exception as _es:
-                        self._session = None; self._log("> DebugSession nicht gebaut: %r" % _es)
-                    self._log("> Fusion aktiv: echte arm64-Engine am gläsernen Lauf (Java<->nativ beobachtbar+manipulierbar)")
-                except Exception as _e:
-                    self._log("> Fusion-Setup fehlgeschlagen (Java-only Fallback): %r" % _e)
-                    self._fusion = None
-            elif seam_cfg is not None:
-                seam_cfg.apply_to_vm(vm, native_fusion=False, jni_hook=None)
-            if seam_cfg is None or seam_cfg.persist_appdata:
-                try:
-                    from core.java.sqlite_prefs_bridge import sync_java_appdata_from_dir
-                    _japp_dir = (inst_state.pkg_appdata_dir(self._base_dir())
-                                 if inst_state is not None
-                                 else os.path.join(self._base_dir(), "data", "vfs_appdata", _pkg_det))
-                    sync_java_appdata_from_dir(stubs, _japp_dir)
+                    self._after(lambda c0=_preload_cls, p0=prov: self._auto_sync_source(c0, "onCreate", "(Landroid/os/Bundle;)V", prov=p0))
                 except Exception:
                     pass
-            self._stubs = stubs
-            self.glass_tree = tree
-            runner = LifecycleRunner(vm, provider=vm.class_provider, with_stubs=False, stubs=stubs)
-            self._runner = runner
-        except Exception as e:
-            self._log("> Gläsern-Start abgebrochen: %r" % e); return
-        from core.java.debug import JavaDebugger
-        self._jdb = (self._session.jdbg if self._session is not None else JavaDebugger(vm))
-        self._jdb.set_budget(self._parse_budget_steps(), pause_on_budget=True)
-        self._jdb.record_timeline = bool(self.record_timeline)
-        self._jdb.record_regs = bool(self.record_regs)
-        self._jdb.stop_on_exception = bool(getattr(self, "stop_on_exception", False))
-        self._jdb.exception_unhandled_only = bool(getattr(self, "exception_unhandled_only", True))
-        self._jdb.flight_recorder_enabled = bool(getattr(self, "flight_recorder_enabled", False))
-        self._jdb_sig = None
-        self._register_all_bps_on_jdb()
-        self._apply_aps()
-        entry = (self.app_entry or "").strip() or None
-        _preload_cls = entry or _man_entry
-        if _preload_cls:
+
+            def _run_fn():
+                rep = runner.run_app(studio_root=cfg_snap["root"], launcher=entry)
+                try:
+                    miss = (rep.get("missing") if isinstance(rep, dict) else None) or getattr(stubs, "missing", [])
+                    self._fill_missing(miss)
+                except Exception:
+                    pass
+                return rep
+
             try:
-                self._auto_sync_source(_preload_cls, "onCreate", "(Landroid/os/Bundle;)V", prov=prov)
+                from core.application.event_bus import EventBus
+                self._after(lambda: EventBus.publish("GLASS_STARTED", {"tree": tree, "package": _pkg_det}))
             except Exception:
                 pass
-        def _run_fn():
-            rep = runner.run_app(studio_root=root, launcher=entry)
-            try:
-                miss = (rep.get("missing") if isinstance(rep, dict) else None) or getattr(stubs, "missing", [])
-                self._fill_missing(miss)
-            except Exception:
-                pass
-            return rep
-        run_fn = _run_fn
-        try:
-            from core.application.event_bus import EventBus
-            EventBus.publish("GLASS_STARTED", {"tree": tree, "package": _pkg_det})
-        except Exception:
-            pass
-        self._log("> Gläsern starten (App=%s, Zone=%s, Entry=%s)" % (_pkg_det, self.zone, entry or _man_entry or "Manifest"))
-        self._rebuild_view()
-        self._async(lambda: self._jdb.start_app(run_fn, stop_at_entry=self.entry_stop), "app-lauf")
+            self._log("> Gläsern starten (App=%s, Zone=%s, Entry=%s)" % (_pkg_det, cfg_snap["zone"], entry or _man_entry or "Manifest"))
+            self._rebuild_view()
+            eff_stop_at_entry = bool(cfg_snap["entry_stop"] or self._pause_pending)
+            if self._stop_pending:
+                return
+            self._pause_pending = False
+            if cfg_snap["pause_at_step"] is not None:
+                jdb._statics_snap = {c: dict(d) for c, d in vm.statics.items()}
+                jdb._clinit_snap = set(getattr(vm, "_clinit_done", ()) or ())
+                jdb._entry = None
+                jdb._run_fn = _run_fn
+                jdb._launch(pause_at_step=max(0, int(cfg_snap["pause_at_step"])), min_budget=budget_lim, wait_timeout=0.05)
+            else:
+                jdb.start_app(_run_fn, stop_at_entry=eff_stop_at_entry, wait_timeout=0.05)
+
+        lbl = ("goto %d" % int(pause_at_step)) if pause_at_step is not None else "app-lauf"
+        self._async(_prepare_and_launch, lbl)
+
+    def start_app(self):
+        self._launch_glass_app_async(pause_at_step=None)
 
     # ---- Aktionspunkte (bedingte/funktionale/getriggerte Manipulation) ----
+    def set_virtual_clock_spec(self, spec):
+        """Setzt/verschiebt/resettet die virtuelle Uhr live und merkt das Preset fuer kuenftige Laeufe."""
+        spec = dict(spec or {})
+        if spec.get("reset"):
+            self._clock_preset = None
+        else:
+            preset = dict(getattr(self, "_clock_preset", None) or {})
+            iso_v = spec.get("iso")
+            if iso_v is None:
+                iso_v = spec.get("iso_str")
+            if iso_v is None:
+                iso_v = spec.get("datetime")
+            if iso_v is not None:
+                preset["iso_str"] = str(iso_v)
+                preset.pop("epoch_ms", None)
+            if spec.get("epoch_ms") is not None:
+                preset["epoch_ms"] = int(spec["epoch_ms"])
+                preset.pop("iso_str", None)
+            if "tz" in spec or "tz_name" in spec:
+                tz_v = spec.get("tz") if "tz" in spec else spec.get("tz_name")
+                preset["tz_name"] = tz_v
+            if spec.get("frozen") is not None:
+                preset["frozen"] = bool(spec["frozen"])
+            if spec.get("step_ms") is not None:
+                preset["step_ms"] = int(spec["step_ms"])
+            self._clock_preset = preset
+        if self._stubs is not None:
+            from core.java.glass_runner import apply_virtual_clock_spec
+            eng = (getattr(self, "_fusion", None) or {}).get("eng")
+            st = apply_virtual_clock_spec(self._stubs, spec, eng=eng)
+            if not spec.get("reset"):
+                preset = dict(getattr(self, "_clock_preset", None) or {})
+                preset["epoch_ms"] = st.get("epoch_ms")
+                preset["frozen"] = st.get("frozen")
+                if st.get("tz") and st.get("tz") != "System":
+                    preset["tz_name"] = st.get("tz")
+                preset.pop("iso_str", None)
+                self._clock_preset = preset
+            self._log("> Virtuelle Uhr: %s (TZ=%s, freeze=%s)" % (st.get("iso"), st.get("tz"), st.get("frozen")))
+            self._notify_glass_ui_updated()
+            return st
+        self._log("> Virtuelle-Uhr-Preset aktualisiert: %r" % (self._clock_preset,))
+        return dict(self._clock_preset or {"reset": True})
+
+    def set_run_options(self, **opts):
+        """Setzt Ausfuehrungs-, Seam-, Budget- & Trace-Optionen (auch per MCP/Queue)."""
+        if "inspect_mode" in opts and opts["inspect_mode"] is not None:
+            raw_im = str(opts["inspect_mode"]).strip().lower()
+            if "arm" in raw_im and "glass" not in raw_im:
+                self.set_inspect_mode("arm64")
+            elif raw_im in ("method", "einzelmethode"):
+                self.native_fusion = False
+                mv = getattr(getattr(self, "view", None), "_mode_var", None)
+                if mv is not None:
+                    try: mv.set("Einzelmethode")
+                    except Exception: pass
+            elif raw_im in ("glass_arm64", "gläsern+arm64", "glaesern+arm64"):
+                self.native_fusion = True
+                mv = getattr(getattr(self, "view", None), "_mode_var", None)
+                if mv is not None:
+                    try: mv.set("Gläsern+ARM64")
+                    except Exception: pass
+            elif raw_im in ("glass", "gläsern app", "glaesern app"):
+                self.native_fusion = False
+                mv = getattr(getattr(self, "view", None), "_mode_var", None)
+                if mv is not None:
+                    try: mv.set("Gläsern App")
+                    except Exception: pass
+            else:
+                self.set_inspect_mode(raw_im)
+        if "native_fusion" in opts and opts["native_fusion"] is not None:
+            self.native_fusion = bool(opts["native_fusion"])
+        if "budget" in opts and opts["budget"] is not None:
+            b_val = str(opts["budget"]).strip()
+            self._budget_override = b_val
+            v_b = getattr(getattr(self, "view", None), "v_step_budget", None)
+            if v_b is not None:
+                try: v_b.set(b_val)
+                except Exception: pass
+            if self._jdb is not None:
+                self._jdb.set_budget(self._parse_budget_steps(), pause_on_budget=True)
+        if "seam_profile" in opts and opts["seam_profile"] is not None:
+            self.set_seam_profile(str(opts["seam_profile"]))
+        if "persist_session" in opts and opts["persist_session"] is not None:
+            self.set_persist_session(bool(opts["persist_session"]))
+        elif "persist_appdata" in opts and opts["persist_appdata"] is not None:
+            self.set_persist_session(bool(opts["persist_appdata"]))
+        for attr in ("entry_stop", "tolerant", "overlay_smali", "overlay_libcarve",
+                     "overlay_libforge", "record_regs", "apply_patches"):
+            if attr in opts and opts[attr] is not None:
+                setattr(self, attr, bool(opts[attr]))
+        if "record_timeline" in opts and opts["record_timeline"] is not None:
+            self.record_timeline = bool(opts["record_timeline"])
+            if self._jdb is not None:
+                self._jdb.record_timeline = self.record_timeline
+        if "stop_on_exception" in opts and opts["stop_on_exception"] is not None:
+            unh = bool(opts.get("exception_unhandled_only", getattr(self, "exception_unhandled_only", True)))
+            self.set_stop_on_exception(bool(opts["stop_on_exception"]), unhandled_only=unh)
+        if "flight_recorder" in opts and opts["flight_recorder"] is not None:
+            self.set_flight_recorder(bool(opts["flight_recorder"]))
+        self._refresh()
+
     def set_net_mode(self, mode):
         """AP1.5/6C: Netz-Modus umschalten: 'mock' | 'live' | 'db_replay' (greift sofort live)."""
         low = str(mode or "").strip().lower()
@@ -1488,9 +1739,18 @@ class DebuggerController:
             self.net_mode = "live"
         elif "db" in low:
             self.net_mode = "db_replay"
+            if getattr(self, "_api_db", None) is None and getattr(self, "app", None) is not None:
+                try:
+                    dbp = (getattr(self.app, "cfg", None).paths or {}).get("API_DB")
+                    if dbp:
+                        from services.api_db_service import ApiDbService
+                        self._api_db = ApiDbService(dbp)
+                except Exception:
+                    pass
         else:
             self.net_mode = "mock"
         self._log("> Netz-Modus aktiv (greift sofort live): %s" % self.net_mode)
+        self._refresh()
 
     def _match_net_mock(self, req):
         """Prueft, ob eine explizite Mock-Regel fuer den Request vorliegt."""
@@ -1859,7 +2119,8 @@ class DebuggerController:
         tree = getattr(self, "glass_tree", None)
         if tree is None:
             return None
-        return SceneGraphSurface(tree)
+        stubs = getattr(self, "_stubs", None)
+        return SceneGraphSurface(tree, vm=self.cur_vm(), activity=getattr(stubs, "_current_activity", None))
 
     def ui_snapshot(self):
         from core.java.surface import snapshot
@@ -1911,40 +2172,194 @@ class DebuggerController:
         pkg = self._resolve_pkg()
         return os.path.join(sc_dir, pkg, os.path.basename(filename))
 
-    def persist_active_appdata(self):
-        """Schreibt geaenderte AppData-Dateien (Java SharedPrefs/SQLite + VFS 2.0) zurueck in die aktive Instanz."""
-        f = getattr(self, "_fusion", None)
-        seam_cfg = getattr(self, "seam_config", None)
-        if seam_cfg is not None and not seam_cfg.persist_appdata:
-            return 0
+    def _appdata_target_dir(self, pkg=None):
+        """Liefert das AppData-Zielverzeichnis der aktiven Instanz und haelt instance_state.package synchron."""
+        pkg_s = pkg or self._resolve_pkg()
         inst = getattr(self, "instance_state", None)
-        pkg = self._resolve_pkg()
-        dst = (inst.pkg_appdata_dir(self._base_dir())
-               if inst is not None
-               else os.path.join(self._base_dir(), "data", "vfs_appdata", pkg))
-        n = 0
-        try:
+        bdir = self._base_dir()
+        if inst is not None:
+            if pkg_s and pkg_s != "default.app":
+                inst.package = pkg_s
+            return inst.pkg_appdata_dir(bdir)
+        return os.path.join(bdir, "data", "vfs_appdata", pkg_s)
+
+    def _should_persist_session(self) -> bool:
+        inst = getattr(self, "instance_state", None)
+        if inst is not None and hasattr(inst, "is_fork") and inst.is_fork():
+            return True
+        return bool(getattr(self, "persist_session", False))
+
+    def _cleanup_ephemeral_session(self):
+        """Raeumt temporaere In-Memory- & nicht-persistente Main-AppData nach Stop/Exit auf."""
+        with self._appdata_lock:
+            if self._should_persist_session() or getattr(self, "_clearing_appdata", False):
+                return
+            pkg = self._resolve_pkg()
+            inst = getattr(self, "instance_state", None)
+            is_fork = bool(inst is not None and hasattr(inst, "is_fork") and inst.is_fork())
+            dst = (
+                self._appdata_target_dir(pkg)
+                if (not is_fork and pkg and pkg != "default.app")
+                else None
+            )
             stubs = getattr(self, "_stubs", None) or getattr(getattr(self, "_runner", None), "stubs", None)
-            if stubs is not None:
-                from core.java.sqlite_prefs_bridge import persist_java_appdata_to_dir
-                n += persist_java_appdata_to_dir(stubs, dst)
-        except Exception:
-            pass
-        if f and f.get("eng"):
             try:
-                from core.java.fs_bridge import get_shared_fs
-                from core.java.glass_runner import persist_appdata_from_vfs
-                fs = get_shared_fs(f["eng"])
-                n += persist_appdata_from_vfs(fs, pkg, dst)
+                from core.java.sqlite_prefs_bridge import clear_java_appdata_state
+                clear_java_appdata_state(
+                    stubs=stubs,
+                    app_dir=dst,
+                    fusion=getattr(self, "_fusion", None),
+                    package=pkg,
+                )
             except Exception:
                 pass
-        return n
+
+    def set_persist_session(self, enabled: bool, save_cfg: bool = True):
+        """Schaltet explizit um, ob App-Session/AppData dauerhaft gespeichert oder nach Stop/Exit verworfen wird."""
+        self.persist_session = bool(enabled)
+        if getattr(self, "seam_config", None) is not None:
+            self.seam_config.persist_appdata = self._should_persist_session()
+        vp = getattr(getattr(self, "view", None), "v_persist_session", None)
+        if vp is not None:
+            try:
+                vp.set(self.persist_session)
+            except Exception:
+                pass
+        if save_cfg and self.app is not None and getattr(self.app, "cfg", None) is not None:
+            try:
+                cfg_d = getattr(self.app.cfg, "config", None)
+                if isinstance(cfg_d, dict):
+                    cfg_d["DEBUGGER_PERSIST_SESSION"] = self.persist_session
+                if hasattr(self.app.cfg, "save"):
+                    self.app.cfg.save()
+            except Exception:
+                pass
+        if self.persist_session and getattr(self, "_stubs", None) is not None:
+            self.persist_active_appdata()
+        self._log(
+            "> \U0001f4be Session speichern: AKTIV (App-Daten & Login bleiben erhalten)"
+            if self.persist_session
+            else "> \U0001f9f9 Session speichern: AUS (nach Stop/Beenden wieder clean)"
+        )
+        try:
+            self._write_live_state_file()
+        except Exception:
+            pass
+        return {"ok": True, "persist_session": self.persist_session}
+
+    def on_studio_exit(self):
+        """Beendet laufende Debugger-Sessions synchron beim Schliessen von RE Studio (persistiert oder verworfen)."""
+        self._stop_pending = True
+        self._stop_heartbeat()
+        hc = getattr(self, "_hermes_client", None)
+        if hc is not None and hasattr(hc, "close"):
+            try:
+                hc.close()
+            except Exception:
+                pass
+            self._hermes_client = None
+        eng = (getattr(self, "_fusion", None) or {}).get("eng")
+        if eng is not None and getattr(eng, "cpu", None) is not None:
+            try:
+                eng.cpu.stopped = True
+            except Exception:
+                pass
+        if self._jdb is not None:
+            try:
+                self._jdb.stop(wait_timeout=0.05)
+            except Exception:
+                pass
+        if self._should_persist_session():
+            self.persist_active_appdata()
+        else:
+            self._cleanup_ephemeral_session()
+
+    def persist_active_appdata(self):
+        """Schreibt geaenderte AppData-Dateien (Java SharedPrefs/SQLite + VFS 2.0) zurueck in die aktive Instanz."""
+        with self._appdata_lock:
+            if getattr(self, "_clearing_appdata", False) or not self._should_persist_session():
+                return 0
+            f = getattr(self, "_fusion", None)
+            pkg = self._resolve_pkg()
+            dst = self._appdata_target_dir(pkg)
+            n = 0
+            try:
+                stubs = getattr(self, "_stubs", None) or getattr(getattr(self, "_runner", None), "stubs", None)
+                if stubs is not None:
+                    from core.java.sqlite_prefs_bridge import persist_java_appdata_to_dir
+                    n += persist_java_appdata_to_dir(stubs, dst)
+            except Exception:
+                pass
+            if f and f.get("eng"):
+                try:
+                    from core.java.fs_bridge import get_shared_fs
+                    from core.java.glass_runner import persist_appdata_from_vfs
+                    fs = get_shared_fs(f["eng"])
+                    n += persist_appdata_from_vfs(fs, pkg, dst)
+                except Exception:
+                    pass
+            return n
+
+    def clear_active_appdata(self, restart: bool = False, single_method: bool = False):
+        """Loescht persistierte AppData (SharedPrefs/SQLite/KeyStore/VFS) der aktiven Instanz fuer einen frischen Start."""
+        import time as _t
+        self._clearing_appdata = True
+        try:
+            if getattr(self, "_busy", False) or getattr(self, "_jdb", None) is not None:
+                try:
+                    self.stop(persist=False)
+                except TypeError:
+                    self.stop()
+                wt = getattr(self, "_worker_thread", None)
+                if wt is not None and wt.is_alive() and wt is not threading.current_thread():
+                    wt.join(timeout=1.0)
+                jdb_cur = getattr(self, "_jdb", None)
+                jth = getattr(jdb_cur, "_thread", None) if jdb_cur is not None else None
+                if jth is not None and jth.is_alive() and jth is not threading.current_thread():
+                    jth.join(timeout=1.0)
+                deadline = _t.time() + 0.35
+                while getattr(self, "_busy", False) and _t.time() < deadline:
+                    _t.sleep(0.02)
+            with self._appdata_lock:
+                pkg = self._resolve_pkg()
+                dst = self._appdata_target_dir(pkg)
+                stubs = getattr(self, "_stubs", None) or getattr(getattr(self, "_runner", None), "stubs", None)
+                from core.java.sqlite_prefs_bridge import clear_java_appdata_state
+                res = clear_java_appdata_state(
+                    stubs=stubs,
+                    app_dir=dst,
+                    fusion=getattr(self, "_fusion", None),
+                    package=pkg,
+                )
+            if getattr(self, "glass_tree", None) is not None:
+                try:
+                    self.glass_tree.root = None
+                    self.glass_tree.touch()
+                except Exception:
+                    pass
+            removed = int(res.get("removed_files", 0))
+            self._log("> \U0001f9f9 AppData zurückgesetzt (%s, %d Dateien entfernt)" % (pkg, removed))
+        finally:
+            self._clearing_appdata = False
+        if restart:
+            if single_method:
+                self.start()
+            else:
+                self.start_app()
+        else:
+            try:
+                self._refresh()
+                self._write_live_state_file()
+            except Exception:
+                pass
+        return {"ok": True, "package": pkg, "appdata_dir": dst, "removed_files": removed, "restarted": bool(restart)}
 
     def set_seam_profile(self, profile_name):
         """Wechselt Ebene-1-Seam-Profil (faithful | self_cache | noop_native)."""
         try:
             from core.java.seam_config import SeamConfig
             self.seam_config = SeamConfig.from_profile(profile_name)
+            self.seam_config.persist_appdata = self._should_persist_session()
             inst = getattr(self, "instance_state", None)
             if inst is not None:
                 inst.seam_profile = self.seam_config.unpack_mode
@@ -2092,10 +2507,13 @@ class DebuggerController:
     def goto(self, n):
         if self._jdb:
             try:
-                n = int(n)
+                n = max(0, int(n))
             except Exception:
                 self._log("> Goto: ungueltig"); return
-            self._async(lambda: self._jdb.goto(n), "goto %d" % n)
+            if getattr(self, "_last_start_mode", "") == "app":
+                self._launch_glass_app_async(pause_at_step=n)
+            else:
+                self._async(lambda: self._jdb.goto(n, wait_timeout=0.05), "goto %d" % n)
 
     def _current_bp_target(self):
         if self._jdb_sig:

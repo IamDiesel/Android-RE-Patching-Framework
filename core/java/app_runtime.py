@@ -17,12 +17,46 @@ _SURFACE_SHELL_CLS = frozenset({
     "View", "ViewGroup", "FrameLayout", "LinearLayout",
     "FlutterView", "FlutterSurfaceView", "FlutterTextureView", "FlutterImageView",
     "ReactRootView", "SurfaceView", "TextureView",
+    "SplashView", "WebView", "SystemWebView", "CordovaWebViewImpl",
+    "BridgeWebView", "AdaWebView", "DCloudWebView",
 })
+
+
+_RUNTIME_EXPLANATIONS = {
+    "flutter": (
+        "Flutter",
+        "Flutter rendert selbst auf einer Surface (Skia); es gibt keine android.view-Hierarchie. "
+        "Netzwerk läuft nativ in libapp.so/BoringSSL außerhalb von Dalvik/OkHttp — "
+        "nutze '🔍 Engine-APIs' oder '🌐 Browser & Inspect'.",
+    ),
+    "react native (js)": (
+        "React Native",
+        "Die UI wird zur Laufzeit aus JS (index.android.bundle) gebaut; beim onCreate-Lauf "
+        "entsteht kein statischer android.view-Baum.",
+    ),
+    "hybrid web": (
+        "Hybrid Web",
+        "Die UI basiert auf HTML/JS in Web-Assets (DCloud HTML5+ / Cordova / Capacitor / WebView) "
+        "und wird über die WebView-Bridge bzw. den In-Phone-WebView-Controller dargestellt.",
+    ),
+    "nativescript": (
+        "NativeScript",
+        "Die UI wird zur Laufzeit aus JS gebaut (NativeScript-Runtime); kein statischer "
+        "android.view-Baum.",
+    ),
+    "jetpack compose": (
+        "Jetpack Compose",
+        "Die App nutzt Jetpack Compose (deklarative Kotlin-UI); Composables werden "
+        "über ComponentActivityKt.setContent / ComposeView komponiert.",
+    ),
+}
 
 
 def detect_runtime(root):
     """(label, erklaerung). label == '' = klassische android.view-App (oder unbekannt)."""
     try:
+        from core.java.runtime_detect import RUNTIME_PRIORITY
+
         def has(*parts):
             return os.path.exists(os.path.join(root, *parts))
 
@@ -35,31 +69,85 @@ def detect_runtime(root):
                     return True
             return False
 
-        if has("assets", "index.android.bundle") or lib("libreactnativejni.so") \
-                or lib("libhermes.so") or smali("com/facebook/react"):
-            return ("React Native",
-                    "Die UI wird zur Laufzeit aus JS (index.android.bundle) gebaut; beim onCreate-Lauf "
-                    "entsteht kein statischer android.view-Baum.")
-        if has("assets", "app") or lib("libNativeScript.so") or smali("com/tns"):
-            return ("NativeScript",
-                    "Die UI wird zur Laufzeit aus JS gebaut (NativeScript-Runtime); kein statischer "
-                    "android.view-Baum.")
-        if lib("libflutter.so") or has("assets", "flutter_assets") or smali("io/flutter"):
-            return ("Flutter",
-                    "Flutter rendert selbst auf einer Surface (Skia); es gibt keine android.view-Hierarchie. "
-                    "Netzwerk läuft nativ in libapp.so/BoringSSL außerhalb von Dalvik/OkHttp — "
-                    "nutze '🔍 Engine-APIs' oder '🌐 Browser & Inspect'.")
-        if smali("androidx/compose/runtime") or smali("androidx/activity/compose"):
-            return ("Jetpack Compose",
-                    "Die App nutzt Jetpack Compose (deklarative Kotlin-UI); Composables werden "
-                    "über ComponentActivityKt.setContent / ComposeView komponiert.")
+        checks = {
+            "flutter": lambda: lib("libflutter.so") or has("assets", "flutter_assets") or smali("io/flutter"),
+            "react native (js)": lambda: (
+                has("assets", "index.android.bundle")
+                or lib("libreactnativejni.so")
+                or lib("libhermes.so")
+                or lib("libhermesvm.so")
+                or smali("com/facebook/react")
+            ),
+            "hybrid web": lambda: (
+                smali("io/dcloud")
+                or os.path.isfile(os.path.join(root, "assets", "data", "dcloud_control.xml"))
+                or os.path.isfile(os.path.join(root, "assets", "www", "index.html"))
+                or os.path.isfile(os.path.join(root, "assets", "public", "index.html"))
+                or os.path.isfile(os.path.join(root, "assets", "capacitor.config.json"))
+                or smali("org/apache/cordova")
+                or smali("com/getcapacitor")
+            ),
+            "nativescript": lambda: has("assets", "app") or lib("libNativeScript.so") or smali("com/tns"),
+            "jetpack compose": lambda: smali("androidx/compose/runtime") or smali("androidx/activity/compose"),
+        }
+        for key in RUNTIME_PRIORITY:
+            fn = checks.get(key)
+            if fn is not None and fn():
+                return _RUNTIME_EXPLANATIONS[key]
         return ("", "")
     except Exception:
         return ("", "")
 
 
+def mount_inphone_runtime_if_needed(tree, app_root, stubs=None, on_async_update=None) -> tuple[bool, str]:
+    """Montiert bei leerer/unrendered Engine-Shell die passende In-Phone-UI und markiert `render_source`."""
+    if tree is None or not app_root:
+        return (False, "")
+    existing_ctrl = (
+        getattr(tree, "_flutter_ctrl", None)
+        or getattr(tree, "_rn_ctrl", None)
+        or getattr(tree, "_hybrid_ctrl", None)
+    )
+    if not is_unrendered_surface_shell(tree):
+        if existing_ctrl is not None and on_async_update is not None and hasattr(existing_ctrl, "set_async_updater"):
+            existing_ctrl.set_async_updater(on_async_update)
+        return (False, "")
+    label, _why = detect_runtime(app_root)
+    if not label:
+        return (False, "")
+    ctrl = None
+    if label == "Flutter":
+        from core.java.flutter_app_producer import mount_flutter_app_into_tree
+        ctrl = mount_flutter_app_into_tree(
+            tree, app_root, stubs=stubs, on_async_update=on_async_update,
+        )
+    elif label == "React Native":
+        from core.java.rn_app_producer import mount_rn_app_into_tree
+        ctrl = mount_rn_app_into_tree(
+            tree, app_root, stubs=stubs, on_async_update=on_async_update,
+        )
+    elif label == "Hybrid Web":
+        from core.java.hybrid_web_producer import mount_hybrid_web_app_into_tree
+        ctrl = mount_hybrid_web_app_into_tree(
+            tree, app_root, stubs=stubs, on_async_update=on_async_update,
+        )
+    else:
+        return (False, label)
+    if ctrl is not None and on_async_update is not None and hasattr(ctrl, "set_async_updater"):
+        ctrl.set_async_updater(on_async_update)
+    tree.render_source = "reconstructed"
+    return (True, label)
+
+
+_ENGINE_HOST_CLS = frozenset({
+    "FlutterView", "FlutterSurfaceView", "FlutterTextureView", "FlutterImageView",
+    "ReactRootView", "SplashView", "WebView", "SystemWebView",
+    "CordovaWebViewImpl", "BridgeWebView", "AdaWebView", "DCloudWebView",
+})
+
+
 def is_unrendered_surface_shell(tree) -> bool:
-    """True, wenn der ViewTree leer ist oder nur aus leeren Surface-/Host-Huellen besteht."""
+    """True, wenn der ViewTree leer ist oder nur aus leeren Surface-/Splash-/WebView-Huellen besteht."""
     if tree is None or getattr(tree, "root", None) is None:
         return True
     try:
@@ -67,6 +155,14 @@ def is_unrendered_surface_shell(tree) -> bool:
     except Exception:
         return True
     if not nodes:
+        return True
+    has_engine_host = any(n.cls in _ENGINE_HOST_CLS for n in nodes)
+    if has_engine_host:
+        for n in nodes:
+            if (getattr(n, "text", None) or "").strip() or getattr(n, "clickable", False):
+                return False
+            if n.cls in ("Button", "EditText", "CheckBox", "Switch", "RadioButton", "TextView"):
+                return False
         return True
     for n in nodes:
         if n.cls not in _SURFACE_SHELL_CLS:

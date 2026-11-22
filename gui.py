@@ -103,9 +103,9 @@ class ReFrameworkApp(tk.Tk):
         else:
             self.attributes('-zoomed', True)
 
-        # Tools asynchron im Hintergrund prüfen/laden und in PATH injizieren
+        # Tools erst ab Mainloop-Start asynchron im Hintergrund prüfen/laden und in PATH injizieren
         base_dir = self.cfg.config.get("BASE_DIR", os.getcwd())
-        threading.Thread(target=lambda: ToolManager.setup_tools(base_dir), daemon=True).start()
+        self.after(0, lambda b=base_dir: threading.Thread(target=lambda: ToolManager.setup_tools(b), daemon=True).start())
 
     def get_loaded_native_images(self):
         """{lib_name: ElfImage} der aktuell im Native Studio oder LibCarve geladenen Lib(s)."""
@@ -152,70 +152,113 @@ class ReFrameworkApp(tk.Tk):
             print(f"[NativeBridge] focus_native_studio: {_e}")
 
     def _attach_tooltip(self, widget, text):
-        """Zeigt einen kompakten Hover-Tooltip fuer Steuerelemente in der Titelleiste."""
-        tip_win = {"w": None}
-
-        def _show(_e=None):
-            if tip_win["w"] is not None:
-                return
-            try:
-                tw = tk.Toplevel(widget)
-                tw.wm_overrideredirect(True)
-                try:
-                    tw.wm_attributes("-topmost", True)
-                except Exception:
-                    pass
-                x = widget.winfo_rootx()
-                y = widget.winfo_rooty() + widget.winfo_height() + 4
-                tw.wm_geometry("+%d+%d" % (x, y))
-                lbl = tk.Label(
-                    tw, text=text, justify="left", background="#ffffe0",
-                    foreground="#111111", relief="solid", borderwidth=1,
-                    padx=6, pady=4, font=("Segoe UI", 8),
-                )
-                lbl.pack()
-                tip_win["w"] = tw
-            except Exception:
-                tip_win["w"] = None
-
-        def _hide(_e=None):
-            tw = tip_win.get("w")
-            tip_win["w"] = None
-            if tw is not None:
-                try:
-                    tw.destroy()
-                except Exception:
-                    pass
-
+        """Zeigt einen einheitlichen Hover-Tooltip fuer Steuerelemente an."""
         try:
-            widget.bind("<Enter>", _show, add="+")
-            widget.bind("<Leave>", _hide, add="+")
-            widget.bind("<ButtonPress>", _hide, add="+")
+            from ui.widgets.tooltip import add_tooltip
+            add_tooltip(widget, text)
         except Exception:
             pass
 
-    def _show_top_bar_help(self):
-        """Erklaert den Unterschied zwischen lokaler Sandbox (Fork/Merge/Projekt) und KI-Sync (MCP)."""
-        msg = (
-            "In der oberen Fensterleiste gibt es zwei klar getrennte Bereiche:\n\n"
-            "1. Sandbox & Projekt (links: App · Stand · Instanz · Fork · Merge · Projekt)\n"
-            "   Verwaltet DEINE lokalen App-Arbeitszustaende und Experimente:\n"
-            "   • Stand (Original / Live-Patches / Build-Stand): Waehlt die ausgewaehlte Quelle:\n"
-            "     - Original: unveraendertes source/ ohne Patches\n"
-            "     - Live-Patches: sauberes source/ + aktive Smali/LibForge/LibCarve/Hex-Patches im RAM/VFS (ohne Build)\n"
-            "     - Build-Stand: physisch nach destination/ gebauter App-Stand\n"
-            "   • 🔀 Fork: Oeffnet eine isolierte Parallel-Instanz (eigene App-Daten im VFS, eigene Tests),\n"
-            "     ohne deine Hauptinstanz 'main' zu veraendern.\n"
-            "   • ✅ Merge: Uebernimmt einen erfolgreichen Fork zurueck in die Hauptinstanz 'main'.\n"
-            "   • 💾 Projekt: Speichert oder laedt komplette Projektstaende dauerhaft unter data/projects/.\n\n"
-            "2. 🤖 KI-Sync (rechts: An KI · Von KI · Abgleich · Reiter)\n"
-            "   Synchronisiert die GUI ueber MCP mit dem KI-Assistenten:\n"
-            "   • ⬆ An KI: Exportiert deinen aktuellen GUI-Stand der gewaehlten Reiter fuer die KI.\n"
-            "   • ⬇ Von KI: Holt neue Befunde, Patches oder Sessions, die die KI erstellt hat, in die GUI.\n"
-            "   • ⇅ Abgleich: Zeigt Unterschiede zwischen GUI und KI-Austauschpuffer, ohne etwas zu ueberschreiben.\n"
-            "   • Reiter ▾: Legt fest, welche Tabs am KI-Abgleich teilnehmen."
+    def show_studio_help_dialog(self):
+        """Oeffnet die uebergreifende Studio-Hilfe fuer TopBar, Sandbox, KI-Sync, Debugger, Engines & Werkzeuge."""
+        win = tk.Toplevel(self)
+        win.title("RE Studio — Übergreifende Hilfe & Funktionsreferenz")
+        win.geometry("760x620")
+        txt = tk.Text(
+            win, wrap="word", font=("Segoe UI", 9), padx=14, pady=12,
+            bg="#f8fafc", fg="#0f172a", relief="flat",
         )
-        messagebox.showinfo("Sandbox/Projekt vs. KI-Sync", msg, parent=self)
+        vs = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.tag_configure("h1", font=("Segoe UI", 11, "bold"), foreground="#1d4ed8", spacing1=10, spacing3=3)
+        txt.tag_configure("b", font=("Segoe UI", 9, "bold"), foreground="#0f172a")
+        sections = [
+            ("1. TopBar: Sandbox, Stand & Projektverwaltung (links)", [
+                ("App & Stand (Original / Live-Patches / Build-Stand)",
+                 "Wählt die Code-/Lib-Quelle über alle Tabs: 'Original' = unverändertes source/; "
+                 "'Live-Patches' = sauberes source/ + aktive Patches aus Smali Studio, LibForge, LibCarve "
+                 "und Hex sofort im RAM/VFS 2.0 (Zero-Build); 'Build-Stand' = physisch nach destination/ gebaut."),
+                ("🔀 Fork / ✅ Merge / 💾 Projekt",
+                 "Fork erzeugt eine isolierte Parallel-Instanz (eigene App-Daten & Sessions) zum gefahrlosen "
+                 "Testen, ohne 'main' zu verändern. Merge übernimmt den Fork nach 'main'. Projekt speichert oder "
+                 "lädt komplette Projektstände (VFS, Config, Patches, Rules) unter data/projects/."),
+            ]),
+            ("2. 🤖 KI-Sync & Multimodale MCP-UI-Vision (rechts)", [
+                ("⬆ An KI / ⬇ Von KI / ⇅ Abgleich / Reiter ▾",
+                 "Synchronisiert GUI-Zustand, Befunde, Patches und Sessions über MCP mit deinem KI-Assistenten. "
+                 "Mit 'native_ui_view' kann die KI zusätzlich echte annotierte Screenshots der simulierten "
+                 "Handy-Oberfläche sehen und UI-Interaktionen (Tap, Texteingabe, Back, Scroll) steuern."),
+            ]),
+            ("3. Gläserner App-Lauf: Modus & Seams", [
+                ("Gläsern+ARM64 vs. Gläsern App vs. Einzelmethode",
+                 "'Gläsern+ARM64' führt Java/Kotlin-Smali in der Dalvik-VM aus UND lädt native .so-Libraries "
+                 "über das gemeinsame VFS 2.0 in den ARM64-Emulator (JNI_OnLoad, Callbacks, Syscalls). "
+                 "'Gläsern App' startet denselben App-Lifecycle mit reinen Java/JNI-Shims ohne ARM64-Emulation; "
+                 "'Einzelmethode' führt gezielt nur die im Smali-Editor geladene Methode mit args aus."),
+                ("Seams (self_cache / faithful / noop_native)",
+                 "Steuert native Entpacker & Library-Loads: 'self_cache' (empfohlen) cached entpackte .so-Libs "
+                 "ab dem 2. Lauf, 'faithful' emuliert jedes Mal ungecached von Grund auf, 'noop_native' überspringt "
+                 "native Bibliotheken für schnelles Java-/UI-Debugging."),
+            ]),
+            ("4. Unterstützte UI- & Runtime-Engines", [
+                ("Klassisch Views/XML & Jetpack Compose",
+                 "Zeichnet entpackte XML-Layouts, Fragments, ViewPager2 sowie deklarative Compose-Composables "
+                 "direkt im Handy-Canvas inkl. Theme-, Kontrast-, Passwort-Maskierung ('👁 PW') und UI-Element-Lupe "
+                 "('🎯 UI-Lupe' -> im aktiven Zustand '🟢 UI-Lupe: AN' zeigt Mouseover Bounds/ID/Klasse, Klicks inspizieren statt App-Taps auszulösen)."),
+                ("Flutter, React Native / Hermes & Hybrid-Web",
+                 "Für Engine-Apps ohne klassische android.view-Hierarchie rendern generische Producer echte "
+                 "interaktive Oberflächen: Flutter (inkl. Engine-API-Scanner & GraphQL), React Native / Hermes "
+                 "(HBC-Parser & TurboModules) sowie Hybrid-Web (DCloud HTML5+, Cordova, Capacitor, WebView mit "
+                 "Template-, API-Tab & eingebautem In-Phone-Browser)."),
+            ]),
+            ("5. Debugger-Steuerung, Budget & Single-Step (In / Over / Out / Rev)", [
+                ("Budget & ▶ Start/Weiter / ⏸ Pause / ⏹ Stop / 🔄 Neu / 🧹 Reset / 💾 Session",
+                 "Das Budget begrenzt die Dalvik-Schritte pro Lauf-Chunk (50k bis ∞). Bei Budget-Erreichen "
+                 "hält der Debugger sauber an; '▶ Weiter' rechnet ab dort weiter. '⏸ Pause' hält an der "
+                 "nächsten Instruktion (oder direkt nach dem Setup bei Schritt 0); '⏹ Stop' bricht Java- & "
+                 "ARM64-Ausführung sofort ab, ohne die GUI zu blockieren. Standardmäßig ist '💾 Session' AUS "
+                 "(temporärer Lauf: nach ⏹ Stop oder Schließen von RE Studio startet die App wieder clean); "
+                 "nur bei explizit aktivierter Checkbox '💾 Session' bleiben Login/SharedPreferences/SQLite erhalten. "
+                 "'🧹 Reset' löscht gespeicherte App-Daten jederzeit explizit."),
+                ("Single-Step nach Pause: In / Over / Out / Rev + Timeline-Goto",
+                 "'In' tritt 1 Dalvik-Instruktion vor (inkl. Submethoden). 'Over' springt über Callees und hält "
+                 "im selben Stack-Frame. 'Out' läuft bis zum Verlassen des aktuellen Frames (auch über "
+                 "Lifecycle-Ebenen hinweg). 'Rev' springt deterministisch um 1 Schritt zurück (Re-Exec ab Schritt 0, "
+                 "auch direkt nach Pause oder Laufende); 'Timeline-Goto' springt zu einer beliebigen Schrittnummer."),
+                ("⚙ Optionen ▾ (Entry-Stop, Lenient, Overlays, Exception-Halt, Flight-Recorder)",
+                 "Steuert Halt bei Schritt 0, tolerante Ausführung fehlender Framework-Stubs, selektive "
+                 "Zero-Build-Patch-Overlays, Pause bei Exceptions, Time-Travel-Timeline & JSONL-Mitschnitt."),
+            ]),
+            ("6. Netzwerk-Inspektor, GraphQL & Hybrid-Web-Bridge", [
+                ("Netz-Tab (Mock/Replay, DB-Replay, Live-HTTP & Leitungssimulation)",
+                 "Zeichnet HTTP-/HTTPS-, AppSync/GraphQL-, Hybrid-Web-REST- und native Socket-Verbindungen auf. "
+                 "Über 'Mock +' lassen sich Antworten sofort live überschreiben; 'Live-HTTP' leitet echte Anfragen "
+                 "ins Netz; Latenz/Bandbreite/Offline sind direkt umschaltbar."),
+            ]),
+            ("7. Virtuelle Uhr & Datumsvorgabe (Seams & IPC)", [
+                ("Deterministische Zeit- & Datumssteuerung",
+                 "Über das Seams-&-IPC-Panel lässt sich die Systemzeit für Apps fest pinnen, vorspulen oder "
+                 "einfrieren — synchron über Java/Dalvik (System.currentTimeMillis, Calendar, Instant) und "
+                 "ARM64-Linux-Syscalls (clock_gettime, gettimeofday)."),
+            ]),
+            ("8. Patch-Studios & Analyse-Tabs", [
+                ("Smali Studio, Native Studio, LibForge, LibCarve, Hex & File Explorer",
+                 "Direkte Brücken aus dem Debugger ('🔧 Im Smali Studio öffnen', '🔪 In LibCarve öffnen') "
+                 "ermöglichen Live-Smali-Patches, Ghidra/ARM64-C-Dekompilate, neue C/C++-Bibliotheken und "
+                 "Binärpatches ohne langsamen APK-Rebuild."),
+            ]),
+        ]
+        for heading, items in sections:
+            txt.insert("end", heading + "\n", "h1")
+            for k, desc in items:
+                txt.insert("end", "• " + k + ": ", "b")
+                txt.insert("end", desc + "\n\n")
+        txt.configure(state="disabled")
+
+    def _show_top_bar_help(self):
+        return self.show_studio_help_dialog()
 
     def _init_context_vars(self):
         if not hasattr(self, "_ctx_app_var"):
@@ -389,39 +432,51 @@ class ReFrameworkApp(tk.Tk):
         self._ki_mb.pack(side="left", padx=(4, 2))
         self._attach_tooltip(self._ki_mb, "Waehlt, welche Tabs beim KI-Sync einbezogen werden.")
 
-        b_help = ttk.Button(parent, text="?", width=2, command=self._show_top_bar_help)
+        b_help = ttk.Button(parent, text="❓ Hilfe", width=8, command=self._show_top_bar_help)
         b_help.pack(side="left", padx=(2, 0))
-        self._attach_tooltip(b_help, "Unterschied zwischen Sandbox (Fork/Merge/Projekt) und KI-Sync (An KI/Von KI/Abgleich) erklaeren.")
+        self._attach_tooltip(
+            b_help,
+            "Öffnet die übergreifende Studio-Hilfe zu Sandbox/Projekt, KI-Sync & MCP, "
+            "Gläsernem App-Lauf (+ARM64), Engines, Single-Step, Netzwerk & Virtueller Uhr.",
+        )
 
     def _build_ki_bar(self):
-        """Zentrale Top-Leiste in der Fensterzeile: links Titel + Projekt/Sandbox, rechts KI-Sync + Fensterknoepfe."""
+        """Zentrale Top-Leiste unter der nativen OS-Titelleiste (optional frameless via ANDRE_CUSTOM_TITLEBAR=1)."""
         import tkinter as _tk
         self._init_context_vars()
         self.ki_model = KiExchangeModel()
         self._ki_vars = {}
         self._ki_all_var = _tk.BooleanVar(value=True)
         self._has_custom_titlebar = False
-        _force_native = bool(os.environ.get("ANDRE_NATIVE_TITLEBAR") or os.environ.get("KIPPY_NATIVE_TITLEBAR"))
+        _use_custom = (
+            os.environ.get("ANDRE_CUSTOM_TITLEBAR") == "1"
+            and not bool(os.environ.get("ANDRE_NATIVE_TITLEBAR") or os.environ.get("KIPPY_NATIVE_TITLEBAR"))
+        )
+        if _use_custom:
+            try:
+                self._build_custom_titlebar()
+                self._has_custom_titlebar = True
+                return
+            except Exception as e:
+                try:
+                    self.overrideredirect(False)
+                except Exception:
+                    pass
+                try:
+                    print("[KI] Custom-Titelleiste fehlgeschlagen, nutze native Titelleiste: %r" % (e,))
+                except Exception:
+                    pass
         try:
-            if _force_native:
-                raise RuntimeError("native Titelleiste erzwungen (ANDRE_NATIVE_TITLEBAR/KIPPY_NATIVE_TITLEBAR)")
-            self._build_custom_titlebar()
-            self._has_custom_titlebar = True
-        except Exception as e:
-            try:
-                self.overrideredirect(False)
-            except Exception:
-                pass
-            bar = ttk.Frame(self, relief="groove", padding=(6, 2))
-            bar.pack(side="top", fill="x")
-            self._build_context_controls(bar)
-            pos_lbl = ttk.Label(bar, textvariable=self._ctx_pos_var, foreground="#555")
-            pos_lbl.pack(side="left", fill="x", expand=True, padx=6)
-            self._build_ki_controls(bar)
-            try:
-                print("[KI] Titelleisten-Einbau fehlgeschlagen, Streifen-Fallback: %r" % (e,))
-            except Exception:
-                pass
+            self.overrideredirect(False)
+        except Exception:
+            pass
+        bar = ttk.Frame(self, relief="groove", padding=(6, 2))
+        bar.pack(side="top", fill="x")
+        self._titlebar = bar
+        self._build_context_controls(bar)
+        pos_lbl = ttk.Label(bar, textvariable=self._ctx_pos_var, foreground="#555")
+        pos_lbl.pack(side="left", fill="x", expand=True, padx=6)
+        self._build_ki_controls(bar)
 
     def _build_custom_titlebar(self):
         """Eigene Titelleiste (frameless): Titel + Sandbox/Projekt links, KI-Sync + Fensterknoepfe rechts."""
@@ -517,6 +572,8 @@ class ReFrameworkApp(tk.Tk):
             pass
 
     def _win_on_restore(self, e=None):
+        if e is not None and getattr(e, "widget", None) is not self:
+            return
         try:
             self.unbind("<Map>")
             self.overrideredirect(True)
@@ -815,8 +872,13 @@ class ReFrameworkApp(tk.Tk):
 
         if not getattr(self, "_ctx_bus_subscribed", False):
             self._ctx_bus_subscribed = True
+            def _ctx_cb(_d=None):
+                try:
+                    self.after(0, self._update_context_bar)
+                except (RuntimeError, tk.TclError):
+                    pass
             for ev in ("APP_IMPORTED", "GLASS_STARTED", "GLASS_STATE", "DEBUG_PAUSED"):
-                EventBus.subscribe(ev, lambda _d=None: self.after(0, self._update_context_bar))
+                EventBus.subscribe(ev, _ctx_cb)
 
     def _update_context_bar(self):
         try:
@@ -932,95 +994,240 @@ class ReFrameworkApp(tk.Tk):
             print(f"[ActiveSession] Init uebersprungen: {e}")
         self.after(1500, self._poll_active_session)
 
+    def _dispatch_gui_cmd(self, cmd, dbg, ctrl):
+        """Fuehrt ein einzelnes MCP-GUI-Steuerkommando aus."""
+        op = cmd.get("cmd")
+        if op == "open_debugger" and dbg is not None:
+            self.notebook.select(dbg)
+        elif op == "set_bp" and ctrl is not None:
+            ctrl.add_app_bp(cmd.get("cls"), cmd.get("name"), cmd.get("sig", ""), cmd.get("pc", 0))
+        elif op == "set_net_condition" and ctrl is not None:
+            ctrl.set_net_condition(cmd.get("mode"), cmd.get("latency_ms"), cmd.get("kbps"))
+        elif op == "load_fork" and ctrl is not None and getattr(ctrl, "snapshot_service", None) is not None:
+            ctrl.snapshot_service.load_fork(cmd.get("fork_id", ""), controller=ctrl)
+            self._update_context_bar()
+        elif op == "start_app" and ctrl is not None:
+            ctrl.start_app()
+        elif op in ("reset_appdata", "clear_appdata") and ctrl is not None:
+            ctrl.clear_active_appdata(restart=bool(cmd.get("restart", op == "reset_appdata")))
+        elif op == "set_persist_session" and ctrl is not None:
+            ctrl.set_persist_session(bool(cmd.get("enabled", cmd.get("persist_session", False))))
+        elif op == "cont" and ctrl is not None:
+            ctrl.cont()
+        elif op == "pause" and ctrl is not None:
+            ctrl.pause()
+        elif op == "stop" and ctrl is not None:
+            ctrl.stop()
+        elif op == "step" and ctrl is not None:
+            ctrl.step()
+        elif op == "step_over" and ctrl is not None:
+            ctrl.step_over()
+        elif op == "step_out" and ctrl is not None:
+            ctrl.step_out()
+        elif op == "reverse_step" and ctrl is not None:
+            ctrl.reverse_step()
+        elif op == "goto" and ctrl is not None:
+            ctrl.goto(cmd.get("step", cmd.get("n", 0)))
+        elif op == "set_virtual_clock" and ctrl is not None:
+            ctrl.set_virtual_clock_spec({k: v for k, v in cmd.items() if k != "cmd"})
+        elif op == "set_net_mode" and ctrl is not None:
+            ctrl.set_net_mode(cmd.get("mode", "mock"))
+        elif op == "add_net_mock" and ctrl is not None:
+            ctrl.add_net_mock(cmd.get("url", ""), cmd.get("code", 200), cmd.get("body", ""), cmd.get("method"))
+        elif op == "clear_net_mocks" and ctrl is not None:
+            ctrl.clear_net_mocks()
+        elif op == "set_seam_profile" and ctrl is not None:
+            ctrl.set_seam_profile(cmd.get("profile", "self_cache"))
+        elif op == "set_options" and ctrl is not None:
+            ctrl.set_run_options(**{k: v for k, v in cmd.items() if k != "cmd"})
+        elif op == "clear_bps" and ctrl is not None:
+            ctrl.clear_bp()
+        elif op == "add_action_point" and ctrl is not None:
+            ctrl.add_action_point(
+                cmd.get("cls"), cmd.get("name"), cmd.get("sig", ""), cmd.get("pc", 0),
+                cmd.get("assigns") or [], cond=cmd.get("cond"),
+                when_continue=bool(cmd.get("when_continue")),
+                one_shot=bool(cmd.get("one_shot")), hit=cmd.get("hit"),
+            )
+        elif op == "clear_action_points" and ctrl is not None:
+            ctrl.clear_action_points()
+        elif op == "add_jni_ap" and ctrl is not None:
+            ctrl.add_boundary_ap(
+                fnptr=cmd.get("fnptr"), this_cls=cmd.get("this_cls"), cond=cmd.get("cond"),
+                arg_assigns=cmd.get("arg_assigns"), ret_expr=cmd.get("ret_expr"),
+                one_shot=bool(cmd.get("one_shot")), hit=cmd.get("hit"),
+            )
+        elif op == "clear_jni_aps" and ctrl is not None:
+            ctrl.clear_boundary_aps()
+        elif op == "generate_befund" and ctrl is not None:
+            ctrl.generate_befund_report()
+        elif op == "open_browser":
+            d_tab = getattr(self, "display_tab", None) or (getattr(dbg, "screen_view", None) if dbg is not None else None)
+            if d_tab is not None and hasattr(d_tab, "toggle_browser_view"):
+                d_tab.toggle_browser_view(url=cmd.get("url"))
+        elif op == "toggle_pw_mask":
+            desired = cmd.get("mask", None)
+            for d_tab in (getattr(self, "display_tab", None), getattr(dbg, "screen_view", None) if dbg is not None else None):
+                if d_tab is None:
+                    continue
+                if desired is not None and bool(getattr(d_tab, "_pw_mask", False)) == bool(desired):
+                    continue
+                if hasattr(d_tab, "toggle_password_mask"):
+                    d_tab.toggle_password_mask()
+                    break
+        elif op == "refresh_ui" and ctrl is not None:
+            ctrl.refresh_interactive_ui()
+        elif op == "ui_tap" and ctrl is not None:
+            ctrl.dispatch_ui_event("tap", **{k: v for k, v in cmd.items() if k != "cmd"})
+        elif op == "ui_key" and ctrl is not None:
+            ctrl.dispatch_ui_event("key", **{k: v for k, v in cmd.items() if k != "cmd"})
+        elif op == "ui_back" and ctrl is not None:
+            ctrl.dispatch_ui_event("back")
+        elif op == "ui_scroll" and ctrl is not None:
+            disps = [
+                getattr(self, "display_tab", None),
+                getattr(dbg, "screen_view", None) if dbg is not None else None,
+            ]
+            for d_tab in disps:
+                if d_tab is None:
+                    continue
+                cur_sy = int(getattr(d_tab, "scroll_y", 0) or 0)
+                max_sy = int(getattr(d_tab, "_max_scroll", 0) or 0)
+                if "scroll_y" in cmd and cmd.get("scroll_y") is not None:
+                    nxt_sy = int(cmd.get("scroll_y") or 0)
+                else:
+                    nxt_sy = cur_sy + int(cmd.get("dy", 0) or 0)
+                if max_sy > 0:
+                    nxt_sy = max(0, min(max_sy, nxt_sy))
+                else:
+                    nxt_sy = max(0, nxt_sy)
+                d_tab.scroll_y = nxt_sy
+                if hasattr(d_tab, "render"):
+                    d_tab.render()
+        elif op == "set_zone" and ctrl is not None:
+            z = str(cmd.get("zone") or "live").strip()
+            if hasattr(ctrl, "set_source_zone"):
+                ctrl.set_source_zone(z)
+            else:
+                ctrl.zone = z
+            self._update_context_bar()
+        elif op == "open_libcarve":
+            ws = getattr(self, "workspace_tab", None)
+            lc = getattr(ws, "lib_carve", None) if ws is not None else None
+            tgt_lib = str(cmd.get("lib") or "").strip()
+            tgt_vaddr = cmd.get("vaddr")
+            va_int = None
+            if tgt_vaddr not in (None, ""):
+                try:
+                    va_int = int(tgt_vaddr, 0) if isinstance(tgt_vaddr, str) else int(tgt_vaddr)
+                except Exception:
+                    va_int = None
+            draft_code = str(cmd.get("code") or "")
+            mode = str(cmd.get("mode") or "asm")
+            self.focus_libcarve(lib=tgt_lib or None, vaddr=va_int)
+            if lc is not None:
+                def _apply_focus_draft():
+                    if draft_code and not getattr(lc.editor, "is_dirty", False):
+                        if hasattr(lc.editor, "var_patch_mode"):
+                            lc.editor.var_patch_mode.set(mode)
+                        lc.editor.set_edit_text(draft_code, mark_dirty=False)
+                cur_img = getattr(lc.controller, "image_path", "") or ""
+                if tgt_lib and (lc.controller.image is None or os.path.basename(cur_img) != os.path.basename(tgt_lib)):
+                    cands = lc.controller.discover_libraries()
+                    hit = next((c for c in cands if c.get("name") == os.path.basename(tgt_lib)), None)
+                    if hit:
+                        lc.controller.load_so_path(hit["path"], target_vaddr=va_int, on_ready=_apply_focus_draft)
+                else:
+                    if va_int is not None and lc.controller.image is not None:
+                        lc.controller.navigate_to(va_int, add_to_history=True)
+                    _apply_focus_draft()
+
     def _poll_gui_cmd_queue(self):
-        """Verarbeitet asynchrone UI-Steuerkommandos von MCP (`data/gui_cmd_queue.json`)."""
+        """Verarbeitet asynchrone UI-Steuerkommandos von MCP (`data/gui_cmd_queue.json`) mit Lock & Busy-Requeue."""
         import json as _json
+        import time as _time
+        from mcp_server.tools import _atomic_write_json, _file_lock
+
         base = self.cfg.config.get("BASE_DIR", os.getcwd())
-        qpath = os.path.join(base, "data", "gui_cmd_queue.json")
+        data_dir = os.path.join(base, "data")
+        qpath = os.path.join(data_dir, "gui_cmd_queue.json")
         if not os.path.isfile(qpath):
             return
+        lock_path = qpath + ".lock"
         try:
-            with open(qpath, "r", encoding="utf-8") as fh:
-                cmds = _json.load(fh)
-            os.remove(qpath)
+            with _file_lock(lock_path, timeout=2.5):
+                if not os.path.isfile(qpath):
+                    return
+                with open(qpath, "r", encoding="utf-8") as fh:
+                    cmds = _json.load(fh)
+                os.remove(qpath)
         except Exception:
             return
         if not isinstance(cmds, list):
             cmds = [cmds]
+        if not cmds:
+            return
+
         dbg = getattr(self, "debugger_tab", None)
         ctrl = getattr(dbg, "ctrl", None)
-        for cmd in cmds:
+        ack_path = os.path.join(data_dir, "gui_cmd_ack.json")
+        last_seq = 0
+        if os.path.isfile(ack_path):
+            try:
+                with open(ack_path, "r", encoding="utf-8") as afh:
+                    prev_ack = _json.load(afh)
+                if isinstance(prev_ack, dict) and prev_ack.get("last_seq") is not None:
+                    last_seq = int(prev_ack.get("last_seq") or 0)
+            except Exception:
+                last_seq = 0
+
+        processed = 0
+        remaining_cmds = []
+        for idx, cmd in enumerate(cmds):
             if not isinstance(cmd, dict):
                 continue
             op = cmd.get("cmd")
-            if op == "open_debugger" and dbg is not None:
-                self.notebook.select(dbg)
-            elif op == "set_bp" and ctrl is not None:
-                ctrl.add_app_bp(cmd.get("cls"), cmd.get("name"), cmd.get("sig", ""), cmd.get("pc", 0))
-            elif op == "set_net_condition" and ctrl is not None:
-                ctrl.set_net_condition(cmd.get("mode"), cmd.get("latency_ms"), cmd.get("kbps"))
-            elif op == "load_fork" and ctrl is not None and getattr(ctrl, "snapshot_service", None) is not None:
-                ctrl.snapshot_service.load_fork(cmd.get("fork_id", ""), controller=ctrl)
-                self._update_context_bar()
-            elif op == "start_app" and ctrl is not None:
-                ctrl.start_app()
-            elif op == "cont" and ctrl is not None:
-                ctrl.cont()
-            elif op == "pause" and ctrl is not None:
-                ctrl.pause()
-            elif op == "stop" and ctrl is not None:
-                ctrl.stop()
-            elif op == "step" and ctrl is not None:
-                ctrl.step()
-            elif op == "step_over" and ctrl is not None:
-                ctrl.step_over()
-            elif op == "step_out" and ctrl is not None:
-                ctrl.step_out()
-            elif op == "refresh_ui" and ctrl is not None:
-                ctrl.refresh_interactive_ui()
-            elif op == "ui_tap" and ctrl is not None:
-                ctrl.dispatch_ui_event("tap", **{k: v for k, v in cmd.items() if k != "cmd"})
-            elif op == "ui_key" and ctrl is not None:
-                ctrl.dispatch_ui_event("key", **{k: v for k, v in cmd.items() if k != "cmd"})
-            elif op == "ui_back" and ctrl is not None:
-                ctrl.dispatch_ui_event("back")
-            elif op == "set_zone" and ctrl is not None:
-                z = str(cmd.get("zone") or "live").strip()
-                if hasattr(ctrl, "set_source_zone"):
-                    ctrl.set_source_zone(z)
-                else:
-                    ctrl.zone = z
-                self._update_context_bar()
-            elif op == "open_libcarve":
-                ws = getattr(self, "workspace_tab", None)
-                lc = getattr(ws, "lib_carve", None) if ws is not None else None
-                tgt_lib = str(cmd.get("lib") or "").strip()
-                tgt_vaddr = cmd.get("vaddr")
-                va_int = None
-                if tgt_vaddr not in (None, ""):
-                    try:
-                        va_int = int(tgt_vaddr, 0) if isinstance(tgt_vaddr, str) else int(tgt_vaddr)
-                    except Exception:
-                        va_int = None
-                draft_code = str(cmd.get("code") or "")
-                mode = str(cmd.get("mode") or "asm")
-                self.focus_libcarve(lib=tgt_lib or None, vaddr=va_int)
-                if lc is not None:
-                    def _apply_focus_draft():
-                        if draft_code and not getattr(lc.editor, "is_dirty", False):
-                            if hasattr(lc.editor, "var_patch_mode"):
-                                lc.editor.var_patch_mode.set(mode)
-                            lc.editor.set_edit_text(draft_code, mark_dirty=False)
-                    cur_img = getattr(lc.controller, "image_path", "") or ""
-                    if tgt_lib and (lc.controller.image is None or os.path.basename(cur_img) != os.path.basename(tgt_lib)):
-                        cands = lc.controller.discover_libraries()
-                        hit = next((c for c in cands if c.get("name") == os.path.basename(tgt_lib)), None)
-                        if hit:
-                            lc.controller.load_so_path(hit["path"], target_vaddr=va_int, on_ready=_apply_focus_draft)
-                    else:
-                        if va_int is not None and lc.controller.image is not None:
-                            lc.controller.navigate_to(va_int, add_to_history=True)
-                        _apply_focus_draft()
+            if ctrl is not None and bool(getattr(ctrl, "_busy", False)) and op not in ("stop", "pause"):
+                remaining_cmds = [c for c in cmds[idx:] if isinstance(c, dict)]
+                break
+            try:
+                ReFrameworkApp._dispatch_gui_cmd(self, cmd, dbg, ctrl)
+            except Exception as _cmd_err:
+                print(f"[MCP-GUI-Queue] Kommando {op!r} fehlgeschlagen: {_cmd_err}")
+            processed += 1
+            if cmd.get("seq") is not None:
+                try:
+                    last_seq = max(last_seq, int(cmd["seq"]))
+                except Exception:
+                    pass
+
+        if remaining_cmds:
+            try:
+                with _file_lock(lock_path, timeout=2.5):
+                    newer = []
+                    if os.path.isfile(qpath):
+                        try:
+                            with open(qpath, "r", encoding="utf-8") as fh:
+                                old = _json.load(fh)
+                            if isinstance(old, list):
+                                newer = [c for c in old if isinstance(c, dict)]
+                        except Exception:
+                            newer = []
+                    _atomic_write_json(qpath, remaining_cmds + newer)
+            except Exception:
+                pass
+        try:
+            _atomic_write_json(
+                ack_path,
+                {
+                    "last_seq": last_seq,
+                    "processed": processed,
+                    "remaining": len(remaining_cmds),
+                    "ts_ms": int(_time.time() * 1000),
+                },
+            )
+        except Exception:
+            pass
 
     def _poll_active_session(self):
         try:
@@ -1285,7 +1492,7 @@ class ReFrameworkApp(tk.Tk):
 
     def log(self, msg):
         line = str(msg) + "\n"
-        def _append():
+        def _append_buf():
             try:
                 self._log_buf.append(line)
                 n = len(self._log_buf)
@@ -1293,6 +1500,9 @@ class ReFrameworkApp(tk.Tk):
                     del self._log_buf[:n - self._LOG_CAP]
             except Exception:
                 pass
+
+        def _append():
+            _append_buf()
             dead = []
             for t in list(getattr(self, "_log_sinks", [])):
                 try:
@@ -1304,7 +1514,10 @@ class ReFrameworkApp(tk.Tk):
                     self._log_sinks.remove(t)
                 except Exception:
                     pass
-        self.after(0, _append)
+        try:
+            self.after(0, _append)
+        except (RuntimeError, tk.TclError):
+            _append_buf()
 
     def register_log_sink(self, text_widget):
         """Ein Text-Widget als Log-Senke anmelden; der Puffer wird sofort nachgefuellt."""
@@ -1325,6 +1538,12 @@ class ReFrameworkApp(tk.Tk):
             pass
 
     def _on_app_exit(self):
+        try:
+            ctrl = getattr(getattr(self, "debugger_tab", None), "ctrl", None)
+            if ctrl is not None and hasattr(ctrl, "on_studio_exit"):
+                ctrl.on_studio_exit()
+        except Exception:
+            pass
         try:
             if getattr(self, "live_log_model", None):
                 self.live_log_model.shutdown()

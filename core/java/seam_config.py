@@ -56,6 +56,7 @@ class SeamConfig:
     self_cache_dir: str = "data/vfs_selfcache"
     appdata_dir: str = "data/vfs_appdata"
     persist_appdata: bool = True
+    auto_finish_empty_onboarding: bool = True
     java_cutoffs: List[Dict[str, Any]] = field(default_factory=list)
     jni_cutoffs: List[Dict[str, Any]] = field(default_factory=list)
     native_preload_libs: Optional[List[str]] = None  # None = alle JNI_OnLoad erlauben; Liste = Filter
@@ -105,6 +106,7 @@ class SeamConfig:
             "self_cache_dir": self.self_cache_dir,
             "appdata_dir": self.appdata_dir,
             "persist_appdata": bool(self.persist_appdata),
+            "auto_finish_empty_onboarding": bool(self.auto_finish_empty_onboarding),
             "java_cutoffs": copy.deepcopy(self.java_cutoffs),
             "jni_cutoffs": copy.deepcopy(self.jni_cutoffs),
             "native_preload_libs": (list(self.native_preload_libs)
@@ -121,6 +123,7 @@ class SeamConfig:
             self_cache_dir=str(d.get("self_cache_dir", "data/vfs_selfcache")),
             appdata_dir=str(d.get("appdata_dir", "data/vfs_appdata")),
             persist_appdata=bool(d.get("persist_appdata", True)),
+            auto_finish_empty_onboarding=bool(d.get("auto_finish_empty_onboarding", True)),
             java_cutoffs=copy.deepcopy(d.get("java_cutoffs") or []),
             jni_cutoffs=copy.deepcopy(d.get("jni_cutoffs") or []),
             native_preload_libs=(list(d["native_preload_libs"])

@@ -274,7 +274,12 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
             return []
 
     def _s(v):
-        return v.text if isinstance(v, JString) else ("" if v is None else str(v))
+        if isinstance(v, JString):
+            return v.text
+        if v is None:
+            return ""
+        t = stubs._txt(v)
+        return t if isinstance(t, str) else str(v)
 
     # --- java.net.URL -----------------------------------------------------
     def _url_init(a):
@@ -488,6 +493,52 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
         conn.fields["$resp"] = resp
         return resp
 
+    from urllib.parse import quote_plus as _qp
+
+    def _apply_req_body(rb_obj, method_s, body_obj):
+        if not isinstance(rb_obj, JObject):
+            return rb_obj
+        rb_obj.fields["$method"] = str(method_s or "GET").upper() or "GET"
+        if isinstance(body_obj, JObject):
+            rb_obj.fields["$body"] = bytes(body_obj.fields.get("$body", b"") or b"")
+            ct = body_obj.fields.get("$content_type")
+            if ct:
+                hdrs = rb_obj.fields.setdefault("$headers", {})
+                if not any(str(hk).lower() == "content-type" for hk in hdrs):
+                    hdrs["Content-Type"] = ct
+        else:
+            rb_obj.fields["$body"] = b""
+        return rb_obj
+
+    def _form_builder_init(a):
+        if a and isinstance(a[0], JObject):
+            a[0].fields["$form_pairs"] = []
+        return None
+
+    def _form_builder_add(a, encoded=False):
+        b = a[0] if (a and isinstance(a[0], JObject)) else None
+        if b is not None and len(a) > 2:
+            b.fields.setdefault("$form_pairs", []).append((_s(a[1]), _s(a[2]), bool(encoded)))
+        return b
+
+    def _form_body_encode(pairs):
+        parts = []
+        for k, v, is_enc in pairs or ():
+            ks = str(k or "")
+            vs = str(v or "")
+            parts.append(f"{ks}={vs}" if is_enc else f"{_qp(ks)}={_qp(vs)}")
+        return "&".join(parts).encode("utf-8")
+
+    def _form_builder_build(a):
+        b = a[0] if (a and isinstance(a[0], JObject)) else None
+        pairs = list(b.fields.get("$form_pairs") or ()) if b is not None else []
+        raw = _form_body_encode(pairs)
+        return JObject("Lokhttp3/FormBody;", {
+            "$form_pairs": pairs,
+            "$body": raw,
+            "$content_type": "application/x-www-form-urlencoded",
+        })
+
     # --- OkHttp3-Stubs (speisen dasselbe `_fire_req` -> NetCondition + API-DB) ---
     stubs.register("Lokhttp3/Request$Builder;", "<init>", "()V",
                    lambda a: a[0].fields.update({"$method": "GET", "$url": "", "$headers": {}, "$body": b""}) if a and isinstance(a[0], JObject) else None)
@@ -498,11 +549,29 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
     stubs.register("Lokhttp3/Request$Builder;", "addHeader", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Request$Builder;",
                    lambda a: (a[0].fields.setdefault("$headers", {}).__setitem__(_s(a[1]), _s(a[2])) or a[0]) if a and isinstance(a[0], JObject) and len(a) > 2 else (a[0] if a else None))
     stubs.register("Lokhttp3/Request$Builder;", "method", "(Ljava/lang/String;Lokhttp3/RequestBody;)Lokhttp3/Request$Builder;",
-                   lambda a: (a[0].fields.update({"$method": _s(a[1]).upper(), "$body": a[2].fields.get("$body", b"") if len(a) > 2 and isinstance(a[2], JObject) else b""}) or a[0]) if a and isinstance(a[0], JObject) else (a[0] if a else None))
+                   lambda a: _apply_req_body(a[0] if a else None, _s(a[1]) if len(a) > 1 else "GET", a[2] if len(a) > 2 else None))
+    for _verb in ("post", "put", "patch"):
+        stubs.register("Lokhttp3/Request$Builder;", _verb, "(Lokhttp3/RequestBody;)Lokhttp3/Request$Builder;",
+                       lambda a, _m=_verb.upper(): _apply_req_body(a[0] if a else None, _m, a[1] if len(a) > 1 else None))
+    stubs.register("Lokhttp3/Request$Builder;", "delete", "(Lokhttp3/RequestBody;)Lokhttp3/Request$Builder;",
+                   lambda a: _apply_req_body(a[0] if a else None, "DELETE", a[1] if len(a) > 1 else None))
     stubs.register("Lokhttp3/Request$Builder;", "build", "()Lokhttp3/Request;",
                    lambda a: JObject("Lokhttp3/Request;", dict(a[0].fields)) if a and isinstance(a[0], JObject) else JObject("Lokhttp3/Request;", {}))
     stubs.register("Lokhttp3/RequestBody;", "create", "(Lokhttp3/MediaType;Ljava/lang/String;)Lokhttp3/RequestBody;",
                    lambda a: JObject("Lokhttp3/RequestBody;", {"$body": (_s(a[1]) if len(a) > 1 else "").encode("utf-8")}))
+    stubs.register("Lokhttp3/FormBody$Builder;", "<init>", "()V", _form_builder_init)
+    stubs.register("Lokhttp3/FormBody$Builder;", "<init>", "(Ljava/nio/charset/Charset;)V", _form_builder_init)
+    stubs.register("Lokhttp3/FormBody$Builder;", "add", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;",
+                   lambda a: _form_builder_add(a, False))
+    stubs.register("Lokhttp3/FormBody$Builder;", "addEncoded", "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;",
+                   lambda a: _form_builder_add(a, True))
+    stubs.register("Lokhttp3/FormBody$Builder;", "build", "()Lokhttp3/FormBody;", _form_builder_build)
+    stubs.register("Lokhttp3/FormBody;", "size", "()I",
+                   lambda a: len(a[0].fields.get("$form_pairs") or ()) if a and isinstance(a[0], JObject) else 0)
+    stubs.register("Lokhttp3/FormBody;", "name", "(I)Ljava/lang/String;",
+                   lambda a: JString((a[0].fields.get("$form_pairs") or ())[int(a[1])][0]) if a and isinstance(a[0], JObject) and len(a) > 1 and 0 <= int(a[1]) < len(a[0].fields.get("$form_pairs") or ()) else JString(""))
+    stubs.register("Lokhttp3/FormBody;", "value", "(I)Ljava/lang/String;",
+                   lambda a: JString((a[0].fields.get("$form_pairs") or ())[int(a[1])][1]) if a and isinstance(a[0], JObject) and len(a) > 1 and 0 <= int(a[1]) < len(a[0].fields.get("$form_pairs") or ()) else JString(""))
     stubs.register("Lokhttp3/OkHttpClient;", "<init>", "()V", lambda a: None)
     stubs.register("Lokhttp3/OkHttpClient;", "newCall", "(Lokhttp3/Request;)Lokhttp3/Call;",
                    lambda a: JObject("Lokhttp3/RealCall;", {"$req": a[1] if len(a) > 1 else None}))
@@ -600,9 +669,26 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
         except Exception:
             pass
 
-    def _ia_init_host(addr):
-        h = addr.fields.get("$host") if isinstance(addr, JObject) else None
-        return str(h or "0.0.0.0")
+    def _ia_init_host(addr, default="0.0.0.0"):
+        if isinstance(addr, JObject):
+            for fk in ("$host", "host"):
+                raw = addr.fields.get(fk)
+                if raw is not None:
+                    hs = _s(raw)
+                    if hs:
+                        return hs
+        return default
+
+    def _ia_init_port(addr, default=0):
+        if isinstance(addr, JObject):
+            for fk in ("$port", "port"):
+                raw = addr.fields.get(fk)
+                if raw is not None:
+                    try:
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        pass
+        return default
 
     def _isa_init(a):
         if a and isinstance(a[0], JObject):
@@ -621,11 +707,19 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
                        "$host": _ia_init_host(a[1]),
                        "$port": int(a[2]) if len(a) > 2 and isinstance(a[2], int) else 0,
                    }), a[0])[1] if a and isinstance(a[0], JObject) else None)
+    stubs.register("Ljava/net/InetSocketAddress;", "getHostName", "()Ljava/lang/String;",
+                   lambda a: JString(_ia_init_host(a[0] if a else None)))
+    stubs.register("Ljava/net/InetSocketAddress;", "getHostString", "()Ljava/lang/String;",
+                   lambda a: JString(_ia_init_host(a[0] if a else None)))
+    stubs.register("Ljava/net/InetSocketAddress;", "getPort", "()I",
+                   lambda a: _ia_init_port(a[0] if a else None))
     stubs.register("Ljava/net/InetAddress;", "getByName", "(Ljava/lang/String;)Ljava/net/InetAddress;",
                    lambda a: JObject("Ljava/net/InetAddress;", {"$host": _s(a[0]) if a else "127.0.0.1"}))
     stubs.register("Ljava/net/InetAddress;", "getLocalHost", "()Ljava/net/InetAddress;",
                    lambda a: JObject("Ljava/net/InetAddress;", {"$host": "192.168.1.2"}))
     stubs.register("Ljava/net/InetAddress;", "getHostAddress", "()Ljava/lang/String;",
+                   lambda a: JString(_ia_init_host(a[0] if a else None)))
+    stubs.register("Ljava/net/InetAddress;", "getHostName", "()Ljava/lang/String;",
                    lambda a: JString(_ia_init_host(a[0] if a else None)))
 
     def _sock_init(a):
@@ -644,8 +738,8 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
 
     def _sock_connect(a):
         if len(a) > 1 and isinstance(a[1], JObject):
-            host = str(a[1].fields.get("$host") or "0.0.0.0")
-            port = int(a[1].fields.get("$port") or 0)
+            host = _ia_init_host(a[1])
+            port = _ia_init_port(a[1])
             if isinstance(a[0], JObject):
                 a[0].fields["$host"] = host; a[0].fields["$port"] = port
             _record_sock_ev("CONNECT", f"tcp://{host}:{port}")
@@ -664,7 +758,7 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
     stubs.register("Ljava/net/ServerSocket;", "bind", "(Ljava/net/SocketAddress;)V",
                    lambda a: _record_sock_ev(
                        "LISTEN",
-                       f"tcp://{a[1].fields.get('$host', '0.0.0.0')}:{int(a[1].fields.get('$port', 0))}"
+                       f"tcp://{_ia_init_host(a[1])}:{_ia_init_port(a[1])}"
                    ) if (len(a) > 1 and isinstance(a[1], JObject)) else None)
 
     def _dgram_pkt_init(a):
@@ -683,8 +777,8 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
         last = a[-1]
         second_last = a[-2] if len(a) >= 2 else None
         if isinstance(last, JObject):
-            pkt.fields["$host"] = str(last.fields.get("$host") or "255.255.255.255")
-            pkt.fields["$port"] = int(last.fields.get("$port") or 0)
+            pkt.fields["$host"] = _ia_init_host(last, "255.255.255.255")
+            pkt.fields["$port"] = _ia_init_port(last, 0)
         elif isinstance(last, int) and isinstance(second_last, JObject):
             pkt.fields["$host"] = _ia_init_host(second_last)
             pkt.fields["$port"] = int(last)
@@ -702,8 +796,8 @@ def install_net_stubs(stubs, responder=None, net_log=None, api_db=None, rules_pa
 
     def _dgram_send(a):
         if len(a) > 1 and isinstance(a[1], JObject):
-            host = str(a[1].fields.get("$host") or "255.255.255.255")
-            port = int(a[1].fields.get("$port") or 0)
+            host = _ia_init_host(a[1], "255.255.255.255")
+            port = _ia_init_port(a[1], 0)
             body = bytes(a[1].fields.get("$data") or b"")
             _record_sock_ev("UDP", f"udp://{host}:{port}", body=body[:512])
         return None
@@ -762,10 +856,11 @@ def _parse_retrofit_routes(smali_src):
         _re.DOTALL,
     )
     ann_pq_re = _re.compile(
-        r'\.annotation\s+runtime\s+Lretrofit2/http/(Path|Query|Header|Body);'
+        r'\.annotation\s+runtime\s+Lretrofit2/http/(Path|Query|QueryMap|Header|HeaderMap|Body|Field|FieldMap);'
         r'(?:(?:(?!\.end annotation).)*?value\s*=\s*"([^"]*)")?',
         _re.DOTALL,
     )
+    form_enc_re = _re.compile(r'\.annotation\s+runtime\s+Lretrofit2/http/FormUrlEncoded;')
     sig_re = _re.compile(r'\.annotation\s+system\s+Ldalvik/annotation/Signature;\s*\n\s*value\s*=\s*\{(.*?)\}', _re.DOTALL)
     for blk in blocks:
         m = hdr_re.match(blk)
@@ -816,6 +911,7 @@ def _parse_retrofit_routes(smali_src):
             "params": params,
             "type_chain": type_chain,
             "wraps_response": wraps_response,
+            "form_url_encoded": bool(form_enc_re.search(blk)),
         }
         routes[(mname, msig)] = route_info
         routes.setdefault(mname, route_info)
@@ -842,20 +938,10 @@ def _unwrap_generic_classes(smali_src):
     return out
 
 
-def _collect_dto_schema(prov, cls_desc):
-    """Sammelt (field_types, json_to_field) entlang der Superklassenkette inkl. Moshi/Gson-Annotationen."""
-    import re as _re
-    field_types = {}
-    json_map = {}
+def _iter_dto_chain_sources(prov, cls_desc):
+    """Durchlaeuft die Klassenhierarchie eines DTO (Superklasse -> Subklasse) und liefert Smali-Quellen."""
     if prov is None or not cls_desc or not hasattr(prov, "get_source"):
-        return field_types, json_map
-
-    def _snake_to_camel(s):
-        parts = str(s or "").split("_")
-        if len(parts) <= 1:
-            return s
-        return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:] if p)
-
+        return []
     cur = cls_desc
     seen = set()
     chain = []
@@ -883,8 +969,18 @@ def _collect_dto_schema(prov, cls_desc):
             except Exception:
                 sup = None
         cur = sup
+    return list(reversed(chain))
 
-    for src in reversed(chain):
+
+def _collect_dto_schema(prov, cls_desc):
+    """Sammelt (field_types, json_to_field) entlang der Superklassenkette inkl. Moshi/Gson-Annotationen."""
+    import re as _re
+    field_types = {}
+    json_map = {}
+    if prov is None or not cls_desc or not hasattr(prov, "get_source"):
+        return field_types, json_map
+
+    for src in _iter_dto_chain_sources(prov, cls_desc):
         lines = src.splitlines()
         i = 0
         while i < len(lines):
@@ -926,11 +1022,177 @@ def _collect_dto_schema(prov, cls_desc):
     return field_types, json_map
 
 
+def _collect_dto_not_null_fields(prov, cls_desc):
+    """Sammelt Feldnamen eines DTO, die mit @org.jetbrains.annotations.NotNull annotiert sind."""
+    nn = set()
+    for src in _iter_dto_chain_sources(prov, cls_desc):
+        lines = src.splitlines()
+        i = 0
+        while i < len(lines):
+            st = lines[i].strip()
+            if st.startswith(".field "):
+                head = st.split("=", 1)[0].strip()
+                parts = head.split()
+                if len(parts) >= 2 and "static" not in parts[1:-1] and ":" in parts[-1]:
+                    fn, _ = parts[-1].split(":", 1)
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip().startswith((".end field", ".field", ".method")):
+                        if "Lorg/jetbrains/annotations/NotNull;" in lines[j]:
+                            nn.add(fn)
+                            break
+                        j += 1
+            i += 1
+    return nn
+
+
+def _extract_generic_elem_desc(sig_block: str):
+    """Extrahiert Element- bzw. Value-Klassen-Deskriptor aus Dalvik-Signature-Annotationen."""
+    import re as _re
+    parts = _re.findall(r'"([^"]*)"', sig_block or "")
+    full = "".join(parts)
+    if ")" in full:
+        full = full.split(")", 1)[1]
+    lt = full.find("<")
+    gt = full.rfind(">")
+    if lt == -1 or gt <= lt:
+        return None
+    inner = full[lt + 1 : gt]
+    # Top-level generic type arguments inside <...> (for Map<K, V>, pick last arg V)
+    top_args = []
+    depth = 0
+    buf = []
+    i = 0
+    while i < len(inner):
+        ch = inner[i]
+        if ch == "<":
+            depth += 1
+            buf.append(ch)
+        elif ch == ">":
+            if depth > 0:
+                depth -= 1
+            buf.append(ch)
+        elif ch == ";" and depth == 0:
+            buf.append(ch)
+            arg = "".join(buf).strip()
+            if arg:
+                top_args.append(arg)
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    if not top_args:
+        descs = [d for d in _re.findall(r"L[A-Za-z0-9_/$]+;", inner) if "/" in d]
+        return descs[-1] if descs else None
+    last_arg = top_args[-1]
+    base_arg = _re.sub(r"<.*>", "", last_arg)
+    m = _re.search(r"L[A-Za-z0-9_/$]+;", base_arg)
+    if m and "/" in m.group(0):
+        return m.group(0)
+    descs = [d for d in _re.findall(r"L[A-Za-z0-9_/$]+;", inner) if "/" in d]
+    return descs[-1] if descs else None
+
+
+def _collect_dto_elem_types(prov, cls_desc):
+    """Sammelt generische Element-/Value-Deskriptoren fuer Collection/Map/Array-Felder aus Smali."""
+    import re as _re
+    elem_types = {}
+    if prov is None or not cls_desc or not hasattr(prov, "get_source"):
+        return elem_types
+
+    def _read_ann_block(lines, start_idx):
+        out = []
+        end_idx = min(len(lines), start_idx + 24)
+        for k in range(start_idx, end_idx):
+            s = lines[k].strip()
+            if k > start_idx and s.startswith((".end annotation", ".end field", ".end method", ".field", ".method")):
+                break
+            out.append(lines[k])
+        return "\n".join(out)
+
+    for src in _iter_dto_chain_sources(prov, cls_desc):
+        lines = src.splitlines()
+        i = 0
+        while i < len(lines):
+            st = lines[i].strip()
+            if st.startswith(".field "):
+                head = st.split("=", 1)[0].strip()
+                parts = head.split()
+                if len(parts) >= 2 and "static" not in parts[1:-1] and ":" in parts[-1]:
+                    fn, ft = parts[-1].split(":", 1)
+                    if ft.startswith("[") and len(ft) > 1:
+                        elem_types[fn] = ft[1:]
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip().startswith((".end field", ".field", ".method")):
+                        if "Ldalvik/annotation/Signature;" in lines[j]:
+                            g_t = _extract_generic_elem_desc(_read_ann_block(lines, j))
+                            if g_t:
+                                elem_types[fn] = g_t
+                            break
+                        j += 1
+            elif st.startswith(".method "):
+                m_get = _re.search(r'\bget([A-Za-z0-9_]+)\(\)Ljava/util/(?:List|Set|Collection|Map);', st)
+                if m_get:
+                    prop_raw = m_get.group(1)
+                    prop_cand = prop_raw[:1].lower() + prop_raw[1:]
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip().startswith((".end method", ".field", ".method")):
+                        if "Ldalvik/annotation/Signature;" in lines[j]:
+                            g_t = _extract_generic_elem_desc(_read_ann_block(lines, j))
+                            if g_t:
+                                elem_types.setdefault(prop_cand, g_t)
+                            break
+                        j += 1
+            i += 1
+    return elem_types
+
+
+_BOXED_WRAPPER_TYPES = (
+    "Ljava/lang/Boolean;",
+    "Ljava/lang/Integer;",
+    "Ljava/lang/Long;",
+    "Ljava/lang/Short;",
+    "Ljava/lang/Byte;",
+    "Ljava/lang/Float;",
+    "Ljava/lang/Double;",
+)
+
+
+def _box_scalar_hint(val, cls_hint):
+    """Verpackt primitive/JSON-Skalare in den passenden Java-Wrapper (z.B. Map<String, Boolean>, Float)."""
+    from core.java.objects import JObject, JString
+    if cls_hint not in _BOXED_WRAPPER_TYPES or val is None:
+        return val
+    if isinstance(val, JObject) and val.cls == cls_hint:
+        return val
+    if isinstance(val, JObject) and "value" in (val.fields or {}):
+        val = val.fields["value"]
+    raw = val.text if isinstance(val, JString) else val
+    if cls_hint == "Ljava/lang/Boolean;":
+        if isinstance(raw, str):
+            bval = 1 if raw.strip().lower() in ("true", "1") else 0
+        else:
+            bval = 1 if raw else 0
+        return JObject(cls_hint, {"value": bval})
+    if cls_hint in ("Ljava/lang/Float;", "Ljava/lang/Double;"):
+        try:
+            fval = float(raw.strip() if isinstance(raw, str) else raw)
+        except Exception:
+            fval = 0.0
+        return JObject(cls_hint, {"value": fval})
+    try:
+        ival = int(raw.strip() if isinstance(raw, str) else raw)
+    except Exception:
+        ival = 0
+    return JObject(cls_hint, {"value": ival})
+
+
 def _coerce_dto_field(val, fhint):
     """Koerziert deserialisierte JSON-Werte (Gson-artig) anhand der Smali-Felddeklaration."""
     from core.java.objects import JString
     if not fhint:
         return val
+    if fhint in _BOXED_WRAPPER_TYPES:
+        return None if val is None else _box_scalar_hint(val, fhint)
     if fhint in ("I", "S", "B", "J"):
         if val is None:
             return 0
@@ -979,48 +1241,79 @@ def _coerce_dto_field(val, fhint):
     return val
 
 
-def _json_to_jobj(data, cls_hint=None, type_chain=None, vm=None, _idx=0):
+def _json_to_jobj(data, cls_hint=None, type_chain=None, vm=None, _idx=0, _depth=0):
     """Konvertiert JSON (dict/list/Skalar) in passende JObject/ArrayList/JString-Struktur."""
-    from core.java.objects import JObject, JString
+    from core.java.objects import JArray, JObject, JString
     if data is None:
         return None
     if isinstance(data, bool):
+        if cls_hint in _BOXED_WRAPPER_TYPES:
+            return _box_scalar_hint(data, cls_hint)
         return 1 if data else 0
     if isinstance(data, int):
+        if cls_hint in _BOXED_WRAPPER_TYPES:
+            return _box_scalar_hint(data, cls_hint)
         return data
     if isinstance(data, float):
+        if cls_hint in _BOXED_WRAPPER_TYPES:
+            return _box_scalar_hint(data, cls_hint)
         return data
     if isinstance(data, str):
+        if cls_hint in _BOXED_WRAPPER_TYPES:
+            return _box_scalar_hint(data, cls_hint)
         return JString(data)
     if isinstance(data, list):
         items = []
-        next_cls = type_chain[_idx] if (type_chain and _idx < len(type_chain)) else None
+        next_cls = cls_hint or (type_chain[_idx] if (type_chain and _idx < len(type_chain)) else None)
         for el in data:
             if isinstance(el, bool):
                 items.append(JObject("Ljava/lang/Boolean;", {"value": 1 if el else 0}))
             elif isinstance(el, int):
-                items.append(JObject("Ljava/lang/Integer;", {"value": el}))
+                if next_cls == "Ljava/lang/Long;":
+                    items.append(JObject("Ljava/lang/Long;", {"value": int(el)}))
+                elif next_cls == "Ljava/lang/Double;":
+                    items.append(JObject("Ljava/lang/Double;", {"value": float(el)}))
+                elif next_cls == "Ljava/lang/Float;":
+                    items.append(JObject("Ljava/lang/Float;", {"value": float(el)}))
+                elif next_cls == "Ljava/lang/String;":
+                    items.append(JString(str(el)))
+                else:
+                    items.append(JObject("Ljava/lang/Integer;", {"value": el}))
+            elif isinstance(el, float):
+                if next_cls == "Ljava/lang/Float;":
+                    items.append(JObject("Ljava/lang/Float;", {"value": float(el)}))
+                else:
+                    items.append(JObject("Ljava/lang/Double;", {"value": float(el)}))
             else:
-                items.append(_json_to_jobj(el, next_cls, type_chain, vm, _idx + 1))
-        return JObject("Ljava/util/ArrayList;", {"__items": items})
+                items.append(_json_to_jobj(el, next_cls, type_chain, vm, _idx + 1, _depth + 1))
+        return JObject("Ljava/util/ArrayList;", {"__items": items, "$items": items})
     if isinstance(data, dict):
         tcls = cls_hint or (type_chain[_idx] if (type_chain and _idx < len(type_chain)) else "Ljava/util/HashMap;")
         if tcls == "Ljava/util/HashMap;":
-            return JObject("Ljava/util/HashMap;", {"map": {k: _json_to_jobj(v, None, type_chain, vm, _idx) for k, v in data.items()}})
+            return JObject("Ljava/util/HashMap;", {
+                "map": {k: _json_to_jobj(v, None, type_chain, vm, _idx, _depth + 1) for k, v in data.items()},
+                "__raw_keys": {k: JString(str(k)) for k in data.keys()},
+            })
         field_types = {}
         json_map = {}
+        elem_types = {}
+        not_null_fields = set()
         prov = getattr(vm, "class_provider", None) if vm is not None else None
         if prov is not None and hasattr(prov, "get_source"):
             try:
                 field_types, json_map = _collect_dto_schema(prov, tcls)
+                elem_types = _collect_dto_elem_types(prov, tcls)
+                not_null_fields = _collect_dto_not_null_fields(prov, tcls)
             except Exception:
-                field_types, json_map = {}, {}
+                field_types, json_map, elem_types, not_null_fields = {}, {}, {}, set()
         flds = {}
         for fn, ft in field_types.items():
             if ft == "Ljava/lang/String;":
                 flds[fn] = JString("")
             elif ft in ("Ljava/util/List;", "Ljava/util/ArrayList;", "Ljava/util/Collection;"):
-                flds[fn] = JObject("Ljava/util/ArrayList;", {"__items": []})
+                flds[fn] = JObject("Ljava/util/ArrayList;", {"__items": [], "$items": []})
+            elif ft in ("Ljava/util/Set;", "Ljava/util/HashSet;", "Ljava/util/LinkedHashSet;"):
+                flds[fn] = JObject("Ljava/util/LinkedHashSet;", {"__items": [], "$items": []})
         next_idx = _idx + 1
         for k, v in data.items():
             target_fn = json_map.get(k)
@@ -1028,15 +1321,45 @@ def _json_to_jobj(data, cls_hint=None, type_chain=None, vm=None, _idx=0):
                 camel = k.split("_")[0] + "".join(p[:1].upper() + p[1:] for p in k.split("_")[1:] if p) if "_" in k else k
                 target_fn = camel if camel in field_types else k
             fhint = field_types.get(target_fn) or field_types.get(k)
-            child_hint = fhint if (fhint and fhint.startswith("L") and not fhint.startswith(("Ljava/", "Lkotlin/"))) else None
-            if isinstance(v, dict) and child_hint is None and type_chain and next_idx < len(type_chain):
-                if not field_types or target_fn in field_types or k in field_types:
-                    child_hint = type_chain[next_idx]
-            val = _json_to_jobj(v, child_hint, type_chain, vm, next_idx)
-            coerced = _coerce_dto_field(val, fhint)
+            ehint = elem_types.get(target_fn) or elem_types.get(k)
+            if isinstance(v, list):
+                val = _json_to_jobj(v, ehint, type_chain, vm, next_idx, _depth + 1)
+                if fhint in ("Ljava/util/Set;", "Ljava/util/HashSet;", "Ljava/util/LinkedHashSet;") and isinstance(val, JObject):
+                    items_l = list(val.fields.get("__items", ()))
+                    val = JObject("Ljava/util/LinkedHashSet;", {"__items": items_l, "$items": items_l})
+                elif fhint and fhint.startswith("[") and isinstance(val, JObject):
+                    val = JArray(fhint, list(val.fields.get("__items", ())))
+                coerced = _coerce_dto_field(val, fhint)
+            elif isinstance(v, dict) and fhint in ("Ljava/util/Map;", "Ljava/util/HashMap;", "Ljava/util/LinkedHashMap;"):
+                coerced = JObject("Ljava/util/HashMap;", {
+                    "map": {mk: _json_to_jobj(mv, ehint, type_chain, vm, next_idx, _depth + 1) for mk, mv in v.items()},
+                    "__raw_keys": {mk: JString(str(mk)) for mk in v.keys()},
+                })
+            else:
+                child_hint = fhint if (fhint and fhint.startswith("L") and not fhint.startswith(("Ljava/", "Lkotlin/"))) else None
+                if isinstance(v, dict) and child_hint is None and type_chain and next_idx < len(type_chain):
+                    if not field_types or target_fn in field_types or k in field_types:
+                        child_hint = type_chain[next_idx]
+                val = _json_to_jobj(v, child_hint, type_chain, vm, next_idx, _depth + 1)
+                coerced = _coerce_dto_field(val, fhint)
             flds[target_fn] = coerced
             if target_fn != k and k not in flds:
                 flds[k] = coerced
+        if _depth < 4 and not_null_fields:
+            for fn in not_null_fields:
+                if flds.get(fn) is not None:
+                    continue
+                ft = field_types.get(fn, "")
+                if ft == "Ljava/lang/String;":
+                    flds[fn] = JString("")
+                elif ft in ("Ljava/util/List;", "Ljava/util/ArrayList;", "Ljava/util/Collection;"):
+                    flds[fn] = JObject("Ljava/util/ArrayList;", {"__items": [], "$items": []})
+                elif ft in ("Ljava/util/Map;", "Ljava/util/HashMap;", "Ljava/util/LinkedHashMap;"):
+                    flds[fn] = JObject("Ljava/util/LinkedHashMap;", {"map": {}, "__raw_keys": {}})
+                elif ft in ("Ljava/util/Set;", "Ljava/util/HashSet;", "Ljava/util/LinkedHashSet;"):
+                    flds[fn] = JObject("Ljava/util/LinkedHashSet;", {"__items": [], "$items": []})
+                elif ft.startswith("L") and not ft.startswith(("Ljava/", "Lkotlin/", "Landroid/", "Landroidx/")):
+                    flds[fn] = _json_to_jobj({}, cls_hint=ft, type_chain=None, vm=vm, _idx=next_idx, _depth=_depth + 1)
         return JObject(tcls, flds)
     return data
 
@@ -1049,6 +1372,7 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
     from core.java.objects import JObject, JString, JArray
     from urllib.parse import (
         quote as _q,
+        quote_plus as _qp,
         urlsplit as _urlsplit,
         urlunsplit as _urlunsplit,
         parse_qs as _parse_qs,
@@ -1271,9 +1595,10 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
             sub_chain = _make_chain(active_vm, req_cur, ic_list, idx)
             imeth, isig = _find_intercept_method(active_vm, ccls)
             prev_budget = getattr(active_vm, "step_budget", None) if active_vm is not None else None
+            from core.java.deviation_journal import DebugStop
             try:
                 if active_vm is not None:
-                    cap = active_vm.steps + 25_000
+                    cap = active_vm.steps + 250_000
                     active_vm.step_budget = min(prev_budget, cap) if prev_budget is not None else cap
                 resp = active_vm.invoke(ccls, imeth, isig, (ic, sub_chain))
                 if isinstance(resp, JObject) and resp.cls == "Lokhttp3/Response;":
@@ -1282,7 +1607,19 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                     return sub_chain.fields["$resp"]
                 if isinstance(sub_chain.fields.get("$req"), JObject):
                     req_cur = sub_chain.fields["$req"]
-            except Exception:
+            except DebugStop:
+                raise
+            except Exception as _ie:
+                if isinstance(_ie, DebugStop) or type(_ie).__name__ == "DebugStop":
+                    raise
+                devs = getattr(active_vm, "deviations", None) if active_vm is not None else None
+                if callable(getattr(devs, "record", None)):
+                    devs.record(
+                        "okhttp_interceptor_error",
+                        f"{ccls}->{imeth}{isig}",
+                        repr(_ie),
+                        step=getattr(active_vm, "steps", 0),
+                    )
                 if sub_chain.fields.get("$resp") is not None:
                     return sub_chain.fields["$resp"]
                 if isinstance(sub_chain.fields.get("$req"), JObject):
@@ -1502,6 +1839,73 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                 hv = _hdr_get(rf.get("$headers"), s_fn(args[1]))
                 return True, JString(hv) if hv is not None else None
 
+        if cls == "Lokhttp3/FormBody$Builder;" and args and isinstance(args[0], JObject):
+            fb = args[0]
+            if name == "<init>":
+                fb.fields["$form_pairs"] = []
+                return True, None if sig.endswith(")V") else fb
+            if (name in ("add", "addEncoded") or sig == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/FormBody$Builder;") and len(args) > 2:
+                fb.fields.setdefault("$form_pairs", []).append((s_fn(args[1]), s_fn(args[2]), name == "addEncoded"))
+                return True, None if sig.endswith(")V") else fb
+            if name == "build" or sig == "()Lokhttp3/FormBody;":
+                pairs = list(fb.fields.get("$form_pairs") or ())
+                raw = "&".join(
+                    f"{k}={v}" if is_enc else f"{_qp(str(k or ''))}={_qp(str(v or ''))}"
+                    for k, v, is_enc in pairs
+                ).encode("utf-8")
+                return True, JObject("Lokhttp3/FormBody;", {
+                    "$form_pairs": pairs,
+                    "$body": raw,
+                    "$content_type": "application/x-www-form-urlencoded",
+                })
+
+        if cls == "Lokhttp3/FormBody;" and not static and args and isinstance(args[0], JObject):
+            pairs = args[0].fields.get("$form_pairs") or []
+            if name == "size" or sig == "()I":
+                return True, len(pairs)
+            if sig == "(I)Ljava/lang/String;" and len(args) > 1:
+                idx = int(args[1] or 0)
+                if 0 <= idx < len(pairs):
+                    raw_k, raw_v, is_enc = pairs[idx]
+                    want_key = name in ("name", "encodedName")
+                    val_s = raw_k if want_key else raw_v
+                    if "encoded" in name.lower() and not is_enc:
+                        val_s = _qp(str(val_s or ""))
+                    return True, JString(str(val_s or ""))
+                return True, JString("")
+
+        if cls in ("Lokhttp3/MediaType;", "Lokhttp3/MediaType$Companion;"):
+            if name in ("get", "parse", "toMediaType", "toMediaTypeOrNull"):
+                mt_arg = args[0] if static else (args[1] if len(args) > 1 else None)
+                mt_s = s_fn(mt_arg) if mt_arg is not None else "application/json"
+                return True, JObject("Lokhttp3/MediaType;", {"$media_type": mt_s or "application/json"})
+            if not static and args and isinstance(args[0], JObject) and (name == "toString" or sig == "()Ljava/lang/String;"):
+                return True, JString(str(args[0].fields.get("$media_type", "application/json")))
+
+        if cls in ("Lokhttp3/RequestBody;", "Lokhttp3/RequestBody$Companion;"):
+            if name == "create":
+                pargs = args if static else args[1:]
+                raw_bytes = b""
+                ct_str = ""
+                int_args = []
+                for pa in pargs:
+                    if isinstance(pa, JObject) and pa.cls == "Lokhttp3/MediaType;":
+                        ct_str = str(pa.fields.get("$media_type", ""))
+                    elif isinstance(pa, JArray):
+                        raw_bytes = bytes((int(x) & 0xFF) for x in (pa.data or ()))
+                    elif isinstance(pa, (JString, str)):
+                        raw_bytes = s_fn(pa).encode("utf-8", "replace")
+                    elif isinstance(pa, int) and not isinstance(pa, bool):
+                        int_args.append(int(pa))
+                if int_args and raw_bytes:
+                    off = max(0, int_args[0])
+                    cnt = max(0, int_args[1]) if len(int_args) > 1 else len(raw_bytes) - off
+                    raw_bytes = raw_bytes[off:off + cnt]
+                return True, JObject("Lokhttp3/RequestBody;", {
+                    "$body": raw_bytes,
+                    "$content_type": ct_str or "application/json; charset=utf-8",
+                })
+
         if cls == "Lokhttp3/Request$Builder;" and args and isinstance(args[0], JObject):
             b = args[0]
             if name == "<init>":
@@ -1525,16 +1929,37 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
             if (name in ("header", "addHeader") or sig == "(Ljava/lang/String;Ljava/lang/String;)Lokhttp3/Request$Builder;") and len(args) > 2:
                 b.fields.setdefault("$headers", {})[s_fn(args[1])] = s_fn(args[2])
                 return True, None if sig.endswith(")V") else b
+            if name in ("get", "head") or (name == "delete" and len(args) == 1):
+                b.fields["$method"] = name.upper()
+                b.fields["$body"] = b""
+                return True, None if sig.endswith(")V") else b
+            if name in ("post", "put", "patch", "delete") and sig.startswith("(Lokhttp3/RequestBody;)") and len(args) > 1:
+                b.fields["$method"] = name.upper()
+                if isinstance(args[1], JObject):
+                    b.fields["$body"] = bytes(args[1].fields.get("$body", b"") or b"")
+                    ct = args[1].fields.get("$content_type")
+                    if ct and _hdr_get(b.fields.get("$headers"), "Content-Type") is None:
+                        b.fields.setdefault("$headers", {})["Content-Type"] = ct
+                else:
+                    b.fields["$body"] = b""
+                return True, None if sig.endswith(")V") else b
             if (name == "method" or sig.startswith("(Ljava/lang/String;Lokhttp3/RequestBody;)")) and len(args) > 2:
                 b.fields["$method"] = s_fn(args[1]).upper() or "GET"
                 if isinstance(args[2], JObject):
-                    b.fields["$body"] = args[2].fields.get("$body", b"")
+                    b.fields["$body"] = bytes(args[2].fields.get("$body", b"") or b"")
+                    ct = args[2].fields.get("$content_type")
+                    if ct and _hdr_get(b.fields.get("$headers"), "Content-Type") is None:
+                        b.fields.setdefault("$headers", {})["Content-Type"] = ct
                 return True, None if sig.endswith(")V") else b
             if name == "build" or sig == "()Lokhttp3/Request;":
                 return True, _make_ok_request(_vm, b.fields.get("$method", "GET"), b.fields.get("$url", ""), b.fields.get("$headers", {}), b.fields.get("$body", b""))
+            if sig.endswith(")Lokhttp3/Request$Builder;"):
+                return True, b
 
         if cls == "Lokhttp3/Response;" and args and isinstance(args[0], JObject):
             rf = args[0].fields
+            if name == "close":
+                return True, None
             if name == "code" or (not static and sig == "()I"):
                 return True, int(rf.get("$code", 200))
             if name == "isSuccessful" or (not static and sig == "()Z"):
@@ -1543,6 +1968,20 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                 return True, JString(str(rf.get("$msg", "OK")))
             if name == "body" or (not static and sig == "()Lokhttp3/ResponseBody;"):
                 return True, rf.get("$body")
+            if name == "headers" or (not static and sig == "()Lokhttp3/Headers;"):
+                return True, JObject("Lokhttp3/Headers;", {"$headers": dict(rf.get("$headers") or {})})
+            if name == "header" and len(args) > 1:
+                hv = _hdr_get(rf.get("$headers"), s_fn(args[1]))
+                if hv is None:
+                    return True, (args[2] if (len(args) > 2 and args[2] not in (None, 0)) else None)
+                return True, JString(str(hv))
+            if name == "header$default" and len(args) > 1:
+                hv = _hdr_get(rf.get("$headers"), s_fn(args[1]))
+                if hv is None:
+                    mask = int(args[3]) if len(args) > 3 and isinstance(args[3], int) else 2
+                    dv = None if (mask & 2) else (args[2] if len(args) > 2 else None)
+                    return True, dv
+                return True, JString(str(hv))
             if name == "request" or (not static and sig == "()Lokhttp3/Request;"):
                 return True, rf.get("$req")
 
@@ -1647,6 +2086,7 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                 path = (rt["path"] or "").lstrip("/")
                 queries = []
                 headers = {}
+                form_fields = []
                 body_bytes = b""
 
                 def _param_str(aval):
@@ -1654,10 +2094,23 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                         return s_fn(aval)
                     if isinstance(aval, JObject) and "value" in (aval.fields or {}):
                         v = aval.fields["value"]
+                        if isinstance(v, JString):
+                            return s_fn(v)
                         if aval.cls == "Ljava/lang/Boolean;":
                             return "true" if v else "false"
                         return str(v)
-                    return str(aval)
+                    return s_fn(aval) if isinstance(aval, JObject) else str(aval)
+
+                def _is_null_param(aval, ptype):
+                    if aval is None:
+                        return True
+                    return aval == 0 and (not ptype or ptype.startswith(("L", "[")))
+
+                def _map_items(aval):
+                    if not isinstance(aval, JObject):
+                        return []
+                    raw_map = aval.fields.get("map")
+                    return list(raw_map.items()) if isinstance(raw_map, dict) else []
 
                 for pidx, pinfo in sorted(rt["params"].items()):
                     if 1 + pidx >= len(args):
@@ -1665,18 +2118,31 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                     kind, pname = pinfo[0], pinfo[1]
                     ptype = pinfo[2] if len(pinfo) > 2 else ""
                     aval = args[1 + pidx]
-                    if kind in ("Query", "Header"):
-                        if aval is None:
-                            continue
-                        if aval == 0 and (not ptype or ptype.startswith(("L", "["))):
+                    if kind in ("Query", "Header", "Field", "QueryMap", "HeaderMap", "FieldMap"):
+                        if _is_null_param(aval, ptype):
                             continue
                     if kind == "Path":
                         path = path.replace("{" + pname + "}", _q(_param_str(aval), safe=""))
                     elif kind == "Query":
                         sv = _param_str(aval)
                         queries.append("%s=%s" % (_q(pname, safe=""), _q(sv, safe="")))
+                    elif kind == "QueryMap":
+                        for mk, mv in _map_items(aval):
+                            if mv is not None:
+                                queries.append("%s=%s" % (_q(s_fn(mk), safe=""), _q(_param_str(mv), safe="")))
                     elif kind == "Header":
                         headers[pname] = _param_str(aval)
+                    elif kind == "HeaderMap":
+                        for mk, mv in _map_items(aval):
+                            if mv is not None:
+                                headers[s_fn(mk)] = _param_str(mv)
+                    elif kind == "Field":
+                        sv = _param_str(aval)
+                        form_fields.append("%s=%s" % (_qp(pname), _qp(sv)))
+                    elif kind == "FieldMap":
+                        for mk, mv in _map_items(aval):
+                            if mv is not None:
+                                form_fields.append("%s=%s" % (_qp(s_fn(mk)), _qp(_param_str(mv))))
                     elif kind == "Body" and isinstance(aval, JObject):
                         try:
                             d = {k: (v.text if isinstance(v, JString) else v) for k, v in aval.fields.items() if not k.startswith("$")}
@@ -1684,6 +2150,10 @@ def _install_okhttp_retrofit_hook(stubs, fire_direct, s_fn):
                             headers.setdefault("Content-Type", "application/json")
                         except Exception:
                             pass
+                if (form_fields or rt.get("form_url_encoded")) and not body_bytes:
+                    body_bytes = "&".join(form_fields).encode("utf-8")
+                    if _hdr_get(headers, "Content-Type") is None:
+                        headers["Content-Type"] = "application/x-www-form-urlencoded"
                 url = (base + "/" + path) if base else path
                 if queries:
                     url += ("&" if "?" in url else "?") + "&".join(queries)

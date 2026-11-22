@@ -68,7 +68,7 @@ class FlutterApiExtractDialog(tk.Toplevel):
         self.tree.column("Cat", width=72, stretch=False)
         self.tree.column("Method", width=55, stretch=False)
         self.tree.column("URL", width=290)
-        self.tree.column("Hint", width=130)
+        self.tree.column("Hint", width=180)
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -116,9 +116,14 @@ class FlutterApiExtractDialog(tk.Toplevel):
             if cat_f != "Alle" and t.get("category") != cat_f:
                 continue
             mark = "☑" if self._checked.get(t["id"], False) else "☐"
+            url_col = (
+                f"[{t.get('source_hint', 'GraphQL')}] {t['url']}"
+                if t.get("category") == "GraphQL" and t.get("source_hint")
+                else t["url"]
+            )
             self.tree.insert(
                 "", "end", iid=t["id"],
-                values=(mark, t["category"], t["method"], t["url"], t.get("source_hint", "")),
+                values=(mark, t["category"], t["method"], url_col, t.get("source_hint", "")),
             )
         kids = self.tree.get_children()
         if kids:
@@ -152,10 +157,23 @@ class FlutterApiExtractDialog(tk.Toplevel):
         tpl = next((t for t in self._templates if t["id"] == tid), None)
         if not tpl:
             return
+        gql_sec = ""
+        if tpl.get("category") == "GraphQL" and tpl.get("body"):
+            try:
+                body_obj = json.loads(tpl["body"])
+                if isinstance(body_obj, dict) and body_obj.get("query"):
+                    gql_sec = (
+                        f"GraphQL Query ({body_obj.get('operationName') or 'Operation'}):\n"
+                        f"{body_obj['query']}\n\n"
+                        f"Variablen:\n{json.dumps(body_obj.get('variables') or {}, indent=2, ensure_ascii=False)}\n\n"
+                    )
+            except Exception:
+                gql_sec = ""
         txt = (
             f"# {tpl.get('description', '')}\n"
             f"{tpl['method']} {tpl['url']}\n\n"
             f"Headers:\n{json.dumps(tpl.get('headers') or {}, indent=2, ensure_ascii=False)}\n\n"
+            f"{gql_sec}"
             f"Body:\n{tpl.get('body') or '(leer)'}\n"
         )
         self.txt_preview.delete("1.0", tk.END)

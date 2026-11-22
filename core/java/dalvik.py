@@ -23,6 +23,7 @@ Tupel-IR (Auszug):
 from __future__ import annotations
 
 import time
+from core.java.deviation_journal import DebugStop, DeviationJournal
 from core.java.objects import JString, JObject, JArray, default_for
 
 _U32 = (1 << 32) - 1
@@ -281,6 +282,10 @@ class DalvikException(Exception):
         super().__init__(msg)
 
 
+class VmBudgetExceeded(DalvikException):
+    """VM-Ressourcen-/Budgetgrenze (StepBudget, WallBudget, StackOverflow) — nicht durch .catch/lenient fangbar."""
+
+
 class DalvikUnknownOpcode(Exception):
     """Ein (noch) nicht implementierter Dalvik-Opcode — speist den Opcode-Coverage-Loop (J1)."""
     def __init__(self, op, pc):
@@ -337,6 +342,8 @@ class DalvikVM:
         self.registry = {}
         self.statics = {}
         self.missing = []
+        self._missing_idx = {}
+        self.deviations = DeviationJournal()
         self.method_overrides = {}     # AP1.3: (cls,name,sig)->Wert/Callable: Smali umgehen (Glass-Box-Override)
         self._method_hooks = []        # Generische Prefixes/Interfaces vor Smali-Resolution (z.B. Compose-UI-Bruecke)
         self.max_depth = int(max_depth)
@@ -358,6 +365,35 @@ class DalvikVM:
         self._di_depth = 0
         self.last_trap = None
         self.on_trap = None
+        self._type_cache_sig = None
+        self._lazy_done = set()
+        self._super_cache = {}
+        self._iface_cache = {}
+        self._subclass_cache = {}
+        self._class_kind_cache = {}
+
+    def _sync_type_caches(self):
+        """Leert abgeleitete Typ-/Hierarchie-Caches bei Wechsel von Provider, Patches oder Loader."""
+        prov = self.class_provider
+        patches = getattr(prov, "patches", None) if prov is not None else None
+        patch_sig = (
+            tuple((k, id(v)) for k, v in sorted(patches.items()))
+            if isinstance(patches, dict) and patches else ()
+        )
+        sig = (
+            id(prov),
+            getattr(prov, "_patch_version", 0) if prov is not None else 0,
+            patch_sig,
+            tuple(id(d) for d in self._iter_dynamic_dcls()),
+            id(getattr(self.runtime, "loader", None)),
+        )
+        if sig != self._type_cache_sig:
+            self._type_cache_sig = sig
+            self._lazy_done.clear()
+            self._super_cache.clear()
+            self._iface_cache.clear()
+            self._subclass_cache.clear()
+            self._class_kind_cache.clear()
 
     def intern_class(self, desc_or_name):
         """Liefert ein normalisiertes Class-Singleton fuer Identitaetsvergleiche (if-eq Class)."""
@@ -374,10 +410,16 @@ class DalvikVM:
     def register_method(self, cls, name, sig, insns, nregs, nargs, static=False) -> MethodDef:
         md = MethodDef(cls, name, sig, insns, nregs, nargs, static)
         self.registry[(cls, name, sig)] = md
+        self._class_kind_cache.pop(cls, None)
+        if self._subclass_cache:
+            self._subclass_cache.clear()
         return md
 
     def register(self, md: MethodDef) -> MethodDef:
         self.registry[(md.cls, md.name, md.sig)] = md
+        self._class_kind_cache.pop(md.cls, None)
+        if self._subclass_cache:
+            self._subclass_cache.clear()
         return md
 
     def run_method(self, insns, nregs: int, args=()):
@@ -418,25 +460,11 @@ class DalvikVM:
         md = self._resolve_method(rcls, rcls, name, sig)
         if md is not None:
             return self._run_mdef(md, self._slots_from_logical(sig, md.static, logical))
-        res_fn = getattr(self.runtime, "resolve_invoke", None) if self.runtime is not None else None
-        if not callable(res_fn) and getattr(self.runtime, "stubs", None) is not None:
-            res_fn = self.runtime.stubs.resolve
-        if callable(res_fn):
-            wants = []
-            cur = rcls
-            for _ in range(64):
-                if not cur or cur in wants:
-                    break
-                wants.append(cur)
-                if cur == "Ljava/lang/Object;":
-                    break
-                cur = self._superclass(cur)
-            if "Ljava/lang/Object;" not in wants:
-                wants.append("Ljava/lang/Object;")
-            for want in wants:
-                handled, ret = res_fn(want, name, sig, logical, False)
-                if handled:
-                    return ret
+        if self.runtime is not None:
+            wants = self._build_wants(rcls, rcls)
+            handled, ret = self._resolve_runtime_invoke(wants, rcls, rcls, name, sig, logical, False)
+            if handled:
+                return ret
         return None
 
     # ---- Klasseninitialisierung (Dalvik: <clinit> bei Erstnutzung) --------
@@ -465,10 +493,7 @@ class DalvikVM:
         try:
             self._run_mdef(md, [])
         except Exception as e:
-            if type(e).__name__ in ("DebugStop", "DalvikUnknownOpcode"):
-                raise
-            emsg = str(e)
-            if "StepBudget" in emsg or "WallBudget" in emsg or "StackOverflow" in emsg or "max_depth" in emsg:
+            if isinstance(e, (VmBudgetExceeded, DalvikUnknownOpcode, DebugStop)):
                 raise
             self._clinit_errors.append({"cls": cls, "error": repr(e)})
 
@@ -496,7 +521,7 @@ class DalvikVM:
             else:
                 self._ensure_class_init(md.cls)
         if self._depth >= self.max_depth:
-            raise DalvikException("StackOverflow (max_depth)")
+            raise VmBudgetExceeded("StackOverflow (max_depth)")
         self._depth += 1
         fr = Frame(md.nregs, args, param_base=md.param_base)
         fr.md = md
@@ -533,10 +558,10 @@ class DalvikVM:
                     fr.pc += 1
                     self.steps += 1
                     if self.step_budget is not None and self.steps > self.step_budget:
-                        raise DalvikException("StepBudget ueberschritten (%d Schritte)" % self.step_budget)
+                        raise VmBudgetExceeded("StepBudget ueberschritten (%d Schritte)" % self.step_budget)
                     if (self.steps & 4095) == 0 and self.wall_deadline is not None:
                         if time.monotonic() >= self.wall_deadline:
-                            raise DalvikException("WallBudget ueberschritten")
+                            raise VmBudgetExceeded("WallBudget ueberschritten")
                     cov[op] = cov.get(op, 0) + 1
                     if self._dbg is not None:
                         self._dbg.on_step(self, fr, insns, ins, op, fr.pc - 1)
@@ -771,7 +796,7 @@ class DalvikVM:
                     elif op == "instance-of":
                         v[a[0]] = self._instance_of(v[a[1]], a[2])
                     elif op == "check-cast":
-                        pass
+                        self._check_cast(v[a[0]], a[1])
                     # ---- Invokes -------------------------------------------------
                     elif op in ("invoke-static", "invoke-direct", "invoke-virtual", "invoke-super",
                                 "invoke-interface", "invoke-static/range", "invoke-direct/range",
@@ -788,23 +813,35 @@ class DalvikVM:
                         raise DalvikUnknownOpcode(op, fr.pc - 1)
                 return None
             except DalvikException as e:
-                msg = str(e)
-                if ("StepBudget" in msg) or ("WallBudget" in msg) or ("StackOverflow" in msg) or ("max_depth" in msg):
+                if isinstance(e, (VmBudgetExceeded, DalvikUnknownOpcode, DebugStop)):
                     raise
+                msg = str(e)
                 _pl = getattr(e, "payload", None)
                 exc_obj = _pl if isinstance(_pl, JObject) else self._mk_exc(msg)
+                if isinstance(exc_obj, JObject) and not isinstance(_pl, JObject):
+                    e.payload = exc_obj
                 h = self._find_handler(getattr(fr, "md", None), fr.cur, exc_obj)
                 if self._dbg is not None:
-                    on_exc = getattr(self._dbg, "on_exception", None)
-                    if callable(on_exc):
-                        try:
-                            _md = getattr(fr, "md", None)
-                            on_exc(self, fr, getattr(_md, "insns", None), int(getattr(fr, "cur", 0)), exc_obj, handled=(h is not None))
-                        except Exception as dbg_e:
-                            if dbg_e.__class__.__name__ == "DebugStop":
-                                raise
+                    already_reported = isinstance(exc_obj, JObject) and bool(exc_obj.fields.get("_dbg_reported"))
+                    if not already_reported:
+                        is_handled = (h is not None) or any(
+                            self._find_handler(getattr(_fr, "md", None), getattr(_fr, "cur", 0), exc_obj) is not None
+                            for _fr in reversed(self._frames[:-1])
+                        )
+                        if isinstance(exc_obj, JObject):
+                            exc_obj.fields["_dbg_reported"] = True
+                        on_exc = getattr(self._dbg, "on_exception", None)
+                        if callable(on_exc):
+                            try:
+                                _md = getattr(fr, "md", None)
+                                on_exc(self, fr, getattr(_md, "insns", None), int(getattr(fr, "cur", 0)), exc_obj, handled=is_handled)
+                            except Exception as dbg_e:
+                                if isinstance(dbg_e, DebugStop) or dbg_e.__class__.__name__ == "DebugStop":
+                                    raise
                 if h is None:
                     raise
+                if isinstance(exc_obj, JObject):
+                    exc_obj.fields.pop("_dbg_reported", None)
                 fr.pc = h
                 fr.exc = exc_obj
 
@@ -847,6 +884,11 @@ class DalvikVM:
     def _maybe_lazy_inject(self, obj, owner_cls, field_name, fallback):
         """Erzeugt fehlende @Inject-Collaborators bei Erstzugriff (DI-Emulation fuer Presenters/Repos)."""
         if self._di_depth >= 3:
+            return fallback
+        if not obj.fields.get("$frag_created") and (
+            obj.fields.get("$is_fragment")
+            or self._is_subclass(getattr(obj, "cls", None), "Landroidx/fragment/app/Fragment;")
+        ):
             return fallback
         ft = None
         for cand_cls in (owner_cls, getattr(obj, "cls", None)):
@@ -927,12 +969,36 @@ class DalvikVM:
         "Landroid/widget/ImageView;": "Landroid/view/View;",
         "Landroid/widget/Button;": "Landroid/widget/TextView;",
         "Landroid/widget/EditText;": "Landroid/widget/TextView;",
-        "Landroid/widget/CompoundButton;": "Landroid/widget/TextView;",
+        "Landroid/widget/CompoundButton;": "Landroid/widget/Button;",
         "Landroid/widget/CheckBox;": "Landroid/widget/CompoundButton;",
         "Landroid/widget/Switch;": "Landroid/widget/CompoundButton;",
         "Landroid/widget/RadioButton;": "Landroid/widget/CompoundButton;",
         "Landroid/widget/ToggleButton;": "Landroid/widget/CompoundButton;",
         "Landroid/widget/ImageButton;": "Landroid/widget/ImageView;",
+        "Landroidx/appcompat/app/AppCompatActivity;": "Landroidx/fragment/app/FragmentActivity;",
+        "Landroidx/fragment/app/FragmentActivity;": "Landroidx/activity/ComponentActivity;",
+        "Landroidx/activity/ComponentActivity;": "Landroid/app/Activity;",
+        "Landroid/app/Activity;": "Landroid/view/ContextThemeWrapper;",
+        "Landroid/view/ContextThemeWrapper;": "Landroid/content/ContextWrapper;",
+        "Landroid/app/Service;": "Landroid/content/ContextWrapper;",
+        "Landroid/app/IntentService;": "Landroid/app/Service;",
+        "Landroid/app/Application;": "Landroid/content/ContextWrapper;",
+        "Landroid/content/ContextWrapper;": "Landroid/content/Context;",
+        "Landroid/content/Context;": "Ljava/lang/Object;",
+        "Ljava/lang/Integer;": "Ljava/lang/Number;",
+        "Ljava/lang/Long;": "Ljava/lang/Number;",
+        "Ljava/lang/Double;": "Ljava/lang/Number;",
+        "Ljava/lang/Float;": "Ljava/lang/Number;",
+        "Ljava/lang/Short;": "Ljava/lang/Number;",
+        "Ljava/lang/Byte;": "Ljava/lang/Number;",
+        "Ljava/lang/Number;": "Ljava/lang/Object;",
+        "Ljava/lang/Boolean;": "Ljava/lang/Object;",
+        "Ljava/lang/Character;": "Ljava/lang/Object;",
+        "Ljava/lang/String;": "Ljava/lang/Object;",
+        "Ljava/lang/StringBuilder;": "Ljava/lang/Object;",
+        "Ljava/lang/StringBuffer;": "Ljava/lang/Object;",
+        "Ljava/util/ArrayList;": "Ljava/lang/Object;",
+        "Ljava/util/HashMap;": "Ljava/lang/Object;",
         "Landroidx/constraintlayout/widget/ConstraintLayout$LayoutParams;": "Landroid/view/ViewGroup$MarginLayoutParams;",
         "Landroid/widget/LinearLayout$LayoutParams;": "Landroid/view/ViewGroup$MarginLayoutParams;",
         "Landroid/widget/FrameLayout$LayoutParams;": "Landroid/view/ViewGroup$MarginLayoutParams;",
@@ -947,26 +1013,223 @@ class DalvikVM:
         "Landroid/text/Spanned;": "Ljava/lang/CharSequence;",
         "Landroid/text/SpannableStringBuilder;": "Landroid/text/Editable;",
         "Landroid/text/Editable;": "Ljava/lang/CharSequence;",
+        "Landroid/text/TextPaint;": "Landroid/graphics/Paint;",
+        "Landroid/text/StaticLayout;": "Landroid/text/Layout;",
+        "Landroid/text/BoringLayout;": "Landroid/text/Layout;",
+        "Landroid/text/DynamicLayout;": "Landroid/text/Layout;",
+        "Landroid/text/Layout;": "Ljava/lang/Object;",
+        "Landroid/text/style/ClickableSpan;": "Landroid/text/style/CharacterStyle;",
+        "Landroid/graphics/drawable/LayerDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/StateListDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/AnimationDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/InsetDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/RippleDrawable;": "Landroid/graphics/drawable/LayerDrawable;",
+        "Landroid/graphics/drawable/GradientDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/ShapeDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/ClipDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/drawable/AnimatedVectorDrawable;": "Landroid/graphics/drawable/Drawable;",
+        "Landroid/graphics/BitmapShader;": "Landroid/graphics/Shader;",
+        "Landroid/graphics/LinearGradient;": "Landroid/graphics/Shader;",
+        "Landroid/graphics/RadialGradient;": "Landroid/graphics/Shader;",
+        "Landroid/graphics/SweepGradient;": "Landroid/graphics/Shader;",
+        "Landroid/graphics/ColorMatrixColorFilter;": "Landroid/graphics/ColorFilter;",
+        "Landroid/graphics/PorterDuffXfermode;": "Landroid/graphics/Xfermode;",
+        "Landroid/graphics/BlurMaskFilter;": "Landroid/graphics/MaskFilter;",
+        "Landroid/widget/AbsListView;": "Landroid/widget/AdapterView;",
+        "Landroid/widget/ListView;": "Landroid/widget/AbsListView;",
+        "Landroid/widget/Spinner;": "Landroid/widget/AbsSpinner;",
+        "Landroid/widget/AbsSpinner;": "Landroid/widget/AdapterView;",
+        "Landroid/widget/AdapterView;": "Landroid/view/ViewGroup;",
+        "Landroid/widget/ProgressBar;": "Landroid/view/View;",
+        "Landroid/widget/SeekBar;": "Landroid/widget/AbsSeekBar;",
+        "Landroid/widget/AbsSeekBar;": "Landroid/widget/ProgressBar;",
+        "Landroid/widget/RatingBar;": "Landroid/widget/AbsSeekBar;",
+        "Landroid/widget/HorizontalScrollView;": "Landroid/widget/FrameLayout;",
+        "Landroid/widget/CheckedTextView;": "Landroid/widget/TextView;",
+        "Landroid/widget/AutoCompleteTextView;": "Landroid/widget/EditText;",
+        "Landroid/widget/MultiAutoCompleteTextView;": "Landroid/widget/AutoCompleteTextView;",
+        "Landroid/widget/RadioGroup;": "Landroid/widget/LinearLayout;",
+        "Landroid/widget/ArrayAdapter;": "Landroid/widget/BaseAdapter;",
+        "Landroid/view/TextureView;": "Landroid/view/View;",
+        "Landroid/view/ViewStub;": "Landroid/view/View;",
+        "Landroid/animation/ValueAnimator;": "Landroid/animation/Animator;",
+        "Landroid/animation/ObjectAnimator;": "Landroid/animation/ValueAnimator;",
+        "Landroid/animation/AnimatorSet;": "Landroid/animation/Animator;",
+        "Landroid/view/animation/AnimationSet;": "Landroid/view/animation/Animation;",
+        "Landroid/view/accessibility/AccessibilityEvent;": "Landroid/view/accessibility/AccessibilityRecord;",
+        "Landroid/app/AlertDialog;": "Landroid/app/Dialog;",
+        "Landroidx/appcompat/app/AlertDialog;": "Landroidx/appcompat/app/AppCompatDialog;",
+        "Landroidx/appcompat/app/AppCompatDialog;": "Landroid/app/Dialog;",
+        "Ljava/util/GregorianCalendar;": "Ljava/util/Calendar;",
+        "Ljava/text/SimpleDateFormat;": "Ljava/text/DateFormat;",
+        "Ljava/lang/Enum;": "Ljava/lang/Object;",
+        "Ljava/util/ArrayList;": "Ljava/util/AbstractList;",
+        "Ljava/util/LinkedList;": "Ljava/util/AbstractSequentialList;",
+        "Ljava/util/AbstractSequentialList;": "Ljava/util/AbstractList;",
+        "Ljava/util/Vector;": "Ljava/util/AbstractList;",
+        "Ljava/util/Stack;": "Ljava/util/Vector;",
+        "Ljava/util/AbstractList;": "Ljava/util/AbstractCollection;",
+        "Ljava/util/HashSet;": "Ljava/util/AbstractSet;",
+        "Ljava/util/LinkedHashSet;": "Ljava/util/HashSet;",
+        "Ljava/util/TreeSet;": "Ljava/util/AbstractSet;",
+        "Ljava/util/AbstractSet;": "Ljava/util/AbstractCollection;",
+        "Ljava/util/AbstractCollection;": "Ljava/lang/Object;",
+        "Ljava/util/HashMap;": "Ljava/util/AbstractMap;",
+        "Ljava/util/LinkedHashMap;": "Ljava/util/HashMap;",
+        "Ljava/util/TreeMap;": "Ljava/util/AbstractMap;",
+        "Ljava/util/AbstractMap;": "Ljava/lang/Object;",
     }
+
+    _CLOSED_JDK_CLASSES = frozenset({
+        "Ljava/lang/String;",
+        "Ljava/lang/Integer;",
+        "Ljava/lang/Long;",
+        "Ljava/lang/Double;",
+        "Ljava/lang/Float;",
+        "Ljava/lang/Short;",
+        "Ljava/lang/Byte;",
+        "Ljava/lang/Character;",
+        "Ljava/lang/Boolean;",
+        "Ljava/lang/Number;",
+        "Ljava/lang/StringBuilder;",
+        "Ljava/lang/StringBuffer;",
+        "Ljava/util/ArrayList;",
+        "Ljava/util/HashMap;",
+    })
 
     def _superclass(self, desc):
         """Direkte Superklasse: JDK-Throwable-Tabelle, sonst class_provider (.super), dyn. DEX oder AOSP-View."""
+        self._sync_type_caches()
+        if desc in self._super_cache:
+            return self._super_cache[desc]
         sup = _JDK_THROWABLE_SUPER.get(desc)
         if sup is not None:
+            self._super_cache[desc] = sup
             return sup
+        self._lazy_class(desc)
         prov = self.class_provider
         if prov is not None and hasattr(prov, "get_super"):
             try:
                 res = prov.get_super(desc)
                 if res is not None:
+                    self._super_cache[desc] = res
                     return res
             except Exception:
                 pass
         for dyn_dcl in self._iter_dynamic_dcls():
             smap = getattr(dyn_dcl, "_supers", None)
             if smap and desc in smap:
-                return smap[desc]
-        return self._AOSP_VIEW_SUPER.get(desc)
+                res = smap[desc]
+                self._super_cache[desc] = res
+                return res
+        res = self._AOSP_VIEW_SUPER.get(desc)
+        self._super_cache[desc] = res
+        return res
+
+    def _compute_class_kind_info(self, desc):
+        dcls = self._iter_dynamic_dcls()
+        ldr = getattr(self.runtime, "loader", None)
+        if ldr is not None and ldr not in dcls:
+            dcls.append(ldr)
+        for dcl in dcls:
+            try:
+                idx = dcl._ensure_index() if hasattr(dcl, "_ensure_index") else None
+                if idx and desc in idx:
+                    acc = int(idx[desc].get("access", 0) or 0)
+                    return True, bool(acc & 0x0200)
+            except Exception:
+                pass
+        prov = self.class_provider
+        if prov is not None:
+            if hasattr(prov, "get_source"):
+                try:
+                    src = prov.get_source(desc)
+                except Exception:
+                    src = None
+                if src:
+                    for ln in src.splitlines():
+                        st = ln.strip()
+                        if st.startswith(".class"):
+                            toks = st.split()
+                            return True, ("interface" in toks[:-1])
+            try:
+                mds = prov.get_class(desc)
+            except Exception:
+                mds = None
+            if mds:
+                has_concrete = any(getattr(m, "insns", None) or m.name == "<init>" for m in mds)
+                return True, (not has_concrete)
+            if hasattr(prov, "get_super"):
+                try:
+                    if prov.get_super(desc) is not None:
+                        return True, True
+                except Exception:
+                    pass
+        for k, md in self.registry.items():
+            if k[0] == desc and (getattr(md, "insns", None) or k[1] == "<init>"):
+                return True, False
+        return False, False
+
+    def _class_kind_info(self, desc):
+        """Liefert (is_loaded_dex_or_provider, is_interface) fuer einen Klassendeskriptor."""
+        if not desc:
+            return False, False
+        self._sync_type_caches()
+        cached = self._class_kind_cache.get(desc)
+        if cached is not None:
+            return cached
+        res = self._compute_class_kind_info(desc)
+        self._class_kind_cache[desc] = res
+        return res
+
+    def _has_closed_object_chain(self, desc):
+        """True wenn desc eine vollstaendig bekannte Superklassen-Kette bis Ljava/lang/Object; besitzt."""
+        cur = desc
+        for _ in range(64):
+            if cur == "Ljava/lang/Object;":
+                return True
+            nxt = self._superclass(cur)
+            if nxt is None or nxt == cur:
+                return False
+            cur = nxt
+        return False
+
+    def _check_cast(self, obj, typ):
+        """Konservativer Closed-World check-cast: prueft Strings, Arrays und geschlossene konkrete Klassen."""
+        if obj is None or obj == 0 or obj is False or not typ:
+            return
+        if typ == "Ljava/lang/Object;":
+            return
+        if isinstance(obj, JString):
+            if typ not in self._STR_IFACES:
+                raise DalvikException(f"java.lang.ClassCastException: Ljava/lang/String; cannot be cast to {typ}")
+            return
+        if isinstance(obj, JObject) and obj.cls == "Ljava/lang/String;":
+            if typ not in self._STR_IFACES:
+                raise DalvikException(f"java.lang.ClassCastException: {obj.cls} cannot be cast to {typ}")
+            return
+        if typ in ("Ljava/io/Serializable;", "Ljava/lang/Cloneable;"):
+            return
+        if isinstance(obj, JArray):
+            if self._instance_of(obj, typ) == 0:
+                raise DalvikException(f"java.lang.ClassCastException: {obj.eltype} cannot be cast to {typ}")
+            return
+        if not isinstance(obj, JObject):
+            return
+        if obj.cls in ("Landroid/os/SystemService;", "Landroid/view/View;") or obj.fields.get("$synth_fm"):
+            return
+        self._lazy_class(obj.cls)
+        self._lazy_class(typ)
+        if self._instance_of(obj, typ) != 0:
+            return
+        src_loaded, _ = self._class_kind_info(obj.cls)
+        src_closed = (obj.cls in self._CLOSED_JDK_CLASSES) or (src_loaded and self._has_closed_object_chain(obj.cls))
+        if not src_closed:
+            return
+        tgt_loaded, tgt_iface = self._class_kind_info(typ)
+        tgt_closed = (typ in self._CLOSED_JDK_CLASSES) or (tgt_loaded and not tgt_iface)
+        if tgt_closed:
+            raise DalvikException(f"java.lang.ClassCastException: {obj.cls} cannot be cast to {typ}")
 
     def _throwable_isa(self, sub, sup):
         """Ist sub (Klassen-Deskriptor der geworfenen Exception) ein sup? Superklassen-Walk.
@@ -1144,12 +1407,23 @@ class DalvikVM:
         "Landroid/widget/CheckedTextView;": ("Landroid/widget/Checkable;",),
         "Landroidx/appcompat/widget/SwitchCompat;": ("Landroid/widget/Checkable;",),
         "Lcom/google/android/material/materialswitch/MaterialSwitch;": ("Landroid/widget/Checkable;",),
+        "Landroid/view/ViewGroup;": ("Landroid/view/ViewParent;", "Landroid/view/ViewManager;"),
+        "Landroid/text/SpannableStringBuilder;": (
+            "Landroid/text/Editable;", "Landroid/text/Spannable;",
+            "Landroid/text/Spanned;", "Ljava/lang/CharSequence;", "Ljava/lang/Appendable;",
+        ),
+        "Landroid/view/SubMenu;": ("Landroid/view/Menu;",),
+        "Landroid/widget/BaseAdapter;": ("Landroid/widget/ListAdapter;", "Landroid/widget/SpinnerAdapter;"),
+        "Landroid/widget/ArrayAdapter;": ("Landroid/widget/ListAdapter;", "Landroid/widget/SpinnerAdapter;"),
     }
 
     def _interfaces(self, desc):
         """Direkt implementierte Interfaces ueber class_provider (.implements), dyn. DEX oder AOSP-View."""
         if not desc:
             return []
+        self._sync_type_caches()
+        if desc in self._iface_cache:
+            return list(self._iface_cache[desc])
         self._lazy_class(desc)
         out: list[str] = []
         prov = self.class_provider
@@ -1167,12 +1441,17 @@ class DalvikVM:
         for aif in self._AOSP_VIEW_IFACES.get(desc, ()):
             if aif not in out:
                 out.append(aif)
+        self._iface_cache[desc] = tuple(out)
         return out
 
     def _lazy_class(self, desc):
         """App-Klasse ueber den Provider (oder dynamische DexClassLoader) in die Registry laden."""
         if desc is None:
             return
+        self._sync_type_caches()
+        if desc in self._lazy_done:
+            return
+        self._lazy_done.add(desc)
         if self.class_provider is not None:
             try:
                 prov = self.class_provider.get_class(desc)
@@ -1225,6 +1504,14 @@ class DalvikVM:
         """Subklassen- und Interface-Test ueber Superklassen- und .implements-Graph."""
         if sub is None or sup is None:
             return False
+        if sub == sup:
+            return True
+        self._sync_type_caches()
+        key = (sub, sup)
+        cached = self._subclass_cache.get(key)
+        if cached is not None:
+            return cached
+        res = False
         queue = [sub]
         seen: set[str] = set()
         while queue and len(seen) < 96:
@@ -1232,7 +1519,8 @@ class DalvikVM:
             if not cur or cur in seen:
                 continue
             if cur == sup:
-                return True
+                res = True
+                break
             seen.add(cur)
             if cur != "Ljava/lang/Object;":
                 nxt = self._superclass(cur)
@@ -1240,10 +1528,14 @@ class DalvikVM:
                     queue.append(nxt)
             for iface in self._interfaces(cur):
                 if iface == sup:
-                    return True
+                    res = True
+                    break
                 if iface and iface not in seen:
                     queue.append(iface)
-        return False
+            if res:
+                break
+        self._subclass_cache[key] = res
+        return res
 
     _STR_IFACES = ("Ljava/lang/String;", "Ljava/lang/CharSequence;",
                    "Ljava/lang/Comparable;", "Ljava/io/Serializable;",
@@ -1261,6 +1553,8 @@ class DalvikVM:
             if typ in ("Ljava/lang/Object;", "Ljava/io/Serializable;", "Ljava/lang/Cloneable;"):
                 return 1
             if ad == typ:                         # exakt: int[] matcht nur int[], nicht byte[]
+                return 1
+            if typ == "[Ljava/lang/Object;" and len(ad) >= 2 and ad[1] in ("L", "["):
                 return 1
             if ad.startswith("[L") and ad.endswith(";") and typ.startswith("[L") and typ.endswith(";"):
                 return 1 if self._is_subclass(ad[1:], typ[1:]) else 0   # Kovarianz nur Referenz-Arrays
@@ -1306,11 +1600,9 @@ class DalvikVM:
                         return 0
                     return self._run_mdef(md, args)
                 except Exception as e:
-                    if type(e).__name__ in ("DebugStop", "DalvikUnknownOpcode"):
+                    if isinstance(e, (VmBudgetExceeded, DalvikUnknownOpcode, DebugStop)):
                         raise
                     emsg = str(e)
-                    if "StepBudget" in emsg or "StackOverflow" in emsg or "max_depth" in emsg:
-                        raise
                     # Aktive Java-.catch-Bloecke auf dem Call-Stack haben Vorrang vor dem lenient-Fallback:
                     # wuerde irgendein Frame die Exception fangen, normal propagieren (-> _exec/_find_handler),
                     # statt sie hier auf 0 zu absorbieren. Nur Emulations-Luecken (kein aktiver Handler) schlucken.
@@ -1320,17 +1612,33 @@ class DalvikVM:
                         for _fr in reversed(self._frames):
                             if self._find_handler(getattr(_fr, "md", None), getattr(_fr, "cur", 0), _exc) is not None:
                                 raise
+                    if self._dbg is not None and isinstance(getattr(self._dbg, "last_exception", None), dict):
+                        self._dbg.last_exception["lenient"] = True
                     self.lenient_errors.append({"cls": cls, "name": name, "sig": sig, "error": repr(e)})
+                    self.deviations.record("lenient_vm", f"{cls}->{name}{sig}", repr(e), step=self.steps)
                     return 0
             return self._run_mdef(md, args)
         # Runtime (Stubs/native): logische Args (J/D-Paare kollabiert), rcls dann cls.
-        if self.runtime is not None and hasattr(self.runtime, "resolve_invoke"):
+        if self.runtime is not None:
             logical = self._logical_args(sig, static, regs, v)
-            wants = []
-            for _w in (rcls, cls):
-                if _w not in wants:
-                    wants.append(_w)
-            _cur = rcls                       # geerbte Stubs (Activity/Context) ueber Superklassen
+            wants = self._build_wants(rcls, cls)
+            handled, ret = self._resolve_runtime_invoke(wants, rcls, cls, name, sig, logical, static)
+            if handled:
+                return ret
+        if name == "<init>":
+            return None
+        self._record_missing(cls, name, sig)
+        return 0
+
+    def _build_wants(self, rcls, cls):
+        wants = []
+        for _w in (rcls, cls):
+            if _w and _w not in wants:
+                wants.append(_w)
+        for start in (rcls, cls):
+            if not start:
+                continue
+            _cur = start
             for _ in range(64):
                 _sup = self._superclass(_cur)
                 if _sup is None or _sup == "Ljava/lang/Object;":
@@ -1338,17 +1646,93 @@ class DalvikVM:
                 if _sup not in wants:
                     wants.append(_sup)
                 _cur = _sup
-            if "Ljava/lang/Object;" not in wants:
-                wants.append("Ljava/lang/Object;")
+        if "Ljava/lang/Object;" not in wants:
+            wants.append("Ljava/lang/Object;")
+        return wants
+
+    def _find_runtime_stubs(self):
+        rt = self.runtime
+        seen = set()
+        while rt is not None and id(rt) not in seen:
+            seen.add(id(rt))
+            st = getattr(rt, "stubs", None)
+            if st is not None:
+                return st
+            rt = getattr(rt, "inner", None) or getattr(rt, "prev", None)
+        return None
+
+    def _resolve_runtime_invoke(self, wants, rcls, cls, name, sig, logical, static):
+        rt = self.runtime
+        if rt is None:
+            return False, 0
+        if (cls in ("Ljava/lang/System;", "Ljava/lang/Runtime;")
+                and name in ("loadLibrary", "loadLibrary0", "load", "load0", "nativeLoad")
+                and (getattr(self, "_fusion_load_library", None) is not None
+                     or getattr(self, "_fusion_load_path", None) is not None)
+                and hasattr(rt, "resolve_invoke")):
+            handled, ret = rt.resolve_invoke(cls, name, sig, logical, static)
+            if handled:
+                return True, ret
+        nt = getattr(self, "native_table", None)
+        if nt is None:
+            cur_rt = rt
+            seen_rt = set()
+            while cur_rt is not None and id(cur_rt) not in seen_rt:
+                seen_rt.add(id(cur_rt))
+                nt = getattr(cur_rt, "table", None)
+                if nt is not None:
+                    break
+                cur_rt = getattr(cur_rt, "inner", None) or getattr(cur_rt, "prev", None)
+        if nt is not None and hasattr(rt, "resolve_invoke"):
             for want in wants:
-                handled, ret = self.runtime.resolve_invoke(want, name, sig, logical, static)
+                if nt.lookup(want, name, sig) is not None:
+                    handled, ret = rt.resolve_invoke(want, name, sig, logical, static)
+                    if handled:
+                        return True, ret
+        ldr = getattr(rt, "loader", None)
+        if ldr is not None and hasattr(rt, "resolve_invoke"):
+            for want in wants:
+                if ldr.has_class(want) and want not in ldr.loaded:
+                    handled, ret = rt.resolve_invoke(want, name, sig, logical, static)
+                    if handled:
+                        return True, ret
+        stubs_obj = self._find_runtime_stubs()
+        if stubs_obj is not None and hasattr(stubs_obj, "resolve_phased"):
+            return stubs_obj.resolve_phased(wants, rcls, cls, name, sig, logical, static)
+        if hasattr(rt, "resolve_invoke"):
+            for want in wants:
+                handled, ret = rt.resolve_invoke(want, name, sig, logical, static)
                 if handled:
-                    return ret
-        if name == "<init>":
-            return None
-        self.missing.append({"cls": cls, "name": name, "sig": sig})
+                    return True, ret
+        elif stubs_obj is not None and hasattr(stubs_obj, "resolve"):
+            for want in wants:
+                handled, ret = stubs_obj.resolve(want, name, sig, logical, static)
+                if handled:
+                    return True, ret
+        return False, 0
+
+    def _record_missing(self, cls, name, sig):
+        if len(self.missing) == 0 and self._missing_idx:
+            self._missing_idx.clear()
+        key = (cls, name, sig)
+        idx = self._missing_idx.get(key)
+        if idx is not None and (
+            idx >= len(self.missing)
+            or (self.missing[idx].get("cls"), self.missing[idx].get("name"), self.missing[idx].get("sig")) != key
+        ):
+            self._missing_idx = {
+                (m.get("cls"), m.get("name"), m.get("sig")): i
+                for i, m in enumerate(self.missing)
+                if isinstance(m, dict)
+            }
+            idx = self._missing_idx.get(key)
+        if idx is not None:
+            self.missing[idx]["count"] = int(self.missing[idx].get("count", 1)) + 1
+        elif len(self.missing) < 5000:
+            self._missing_idx[key] = len(self.missing)
+            self.missing.append({"cls": cls, "name": name, "sig": sig, "count": 1})
         self.coverage["__missing__"] = self.coverage.get("__missing__", 0) + 1
-        return 0
+        self.deviations.record("missing_method", f"{cls}->{name}{sig}", step=self.steps)
 
 def _branch1(op, x):
     xi = _as_i(x)

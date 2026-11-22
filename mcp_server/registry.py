@@ -35,7 +35,10 @@ TOOL_CATALOG = [
     # --- A: Workspace & Config ---
     ToolSpec("workspace.status",       "A", "Workspace & Config", "O", (), "Config-Kurzfassung + adb-State"),
     ToolSpec("workspace.set_config",   "A", "Workspace & Config", "P", (), "Config-Keys/Flags/Pipelines setzen"),
+    ToolSpec("workspace.renew_id",     "A", "Workspace & Config", "P", (), "Neue Patch-Session-ID (PID-YYYYmmdd-HHMMSS) + Archiv-Ordner generieren"),
+    ToolSpec("app.list_local",         "A", "Workspace & Config", "O", (), "Lokal importierte Apps in source/ samt Unpacked-/Runtime-Status auflisten"),
     ToolSpec("app.import",             "A", "Workspace & Config", "P", (), "APK/Split importieren -> Auto-Config"),
+    ToolSpec("app.pull_apk",           "A", "Workspace & Config", "G", ("file_manager",), "Installierte App (inkl. Splits) vom ADB-Geraet nach source/<pkg>/ ziehen (gated)"),
     ToolSpec("workspace.prepare_hint", "A", "Workspace & Config", "O", (), "GUI-Anleitung fuer PREPARE_WORKSPACE"),
 
     # --- B: Analyse / Smali Studio ---
@@ -46,7 +49,8 @@ TOOL_CATALOG = [
     ToolSpec("smali.methods",          "B", "Analyse / Smali", "O", (), "Methoden/Felder einer Klasse auflisten (wie 'Datei'-Reiter)"),
     ToolSpec("smali.method",           "B", "Analyse / Smali", "O", (), "Eine Methode exakt extrahieren (.method..end) -> orig fuer Favorit"),
     ToolSpec("smali.create_class",     "B", "Analyse / Smali", "P", (), "Neue Smali-Klasse/-Datei anlegen (z. B. GHOST_NET)"),
-    ToolSpec("smali.callgraph",        "B", "Analyse / Smali", "O", (), "Callgraph/Graphviz (spaeter)"),
+    ToolSpec("smali.callgraph",        "B", "Analyse / Smali", "O", (), "Ausgehende Callees & eingehende Caller einer Smali-Methode (depth=1..3)"),
+    ToolSpec("app.manifest_info",      "B", "Analyse / Smali", "O", (), "AndroidManifest.xml (Activities, Launcher, Permissions, Exported, Deep-Links) & APK-Signaturinfo lesen"),
 
     # --- C: LibForge vorbereiten ---
     ToolSpec("lib.list",               "C", "LibForge", "P", (), "Alle NativeLibs auflisten"),
@@ -70,6 +74,7 @@ TOOL_CATALOG = [
     ToolSpec("patch.apply_favorite",   "D", "Patches / Favoriten", "P", (), "Kompletten Favoriten/Bundle auf die aktive Session anwenden"),
     ToolSpec("patch.remove",           "D", "Patches / Favoriten", "P", (), "Angewendeten Patch aus der aktiven Liste streichen (nicht aus Favoriten)"),
     ToolSpec("patch.clear_active",     "D", "Patches / Favoriten", "P", (), "Alle aktiven Session-Patches verwerfen"),
+    ToolSpec("patch.fuzzy_match",      "D", "Patches / Favoriten", "O", (), "Verschobene Smali-Patches nach App-Update per FuzzingEngine wiederfinden (orig/file oder favorite_ref)"),
     ToolSpec("favorites.delete",       "D", "Patches / Favoriten", "G", ("delete_ops",), "Favorit loeschen (nur auf Anfrage)"),
 
     # --- E: Bauen & Flashen ---
@@ -99,13 +104,19 @@ TOOL_CATALOG = [
     ToolSpec("log.export",             "H", "Capture & Logs", "O", (), "Logs in log_export_dir exportieren"),
     ToolSpec("console.main_tail",      "H", "Capture & Logs", "O", (), "Main-Console-Spiegel lesen (Include/Exclude-Filter)"),
     ToolSpec("console.live_tail",      "H", "Capture & Logs", "O", (), "Live-Log-Console-Spiegel lesen (Include/Exclude-Filter)"),
+    ToolSpec("app.start",              "H", "Capture & Logs", "G", ("app_start",), "App/Intent auf dem verbundenen ADB-Geraet starten (gated: app_start)"),
+    ToolSpec("app.stop",               "H", "Capture & Logs", "G", ("app_start",), "App auf dem verbundenen ADB-Geraet per force-stop beenden (gated: app_start)"),
 
     # --- I: DAST / API-Inspector ---
     ToolSpec("api.query",              "I", "DAST / API", "O", (), "Traffic-DB abfragen (URL/Method-Filter)"),
     ToolSpec("api.get",                "I", "DAST / API", "O", (), "Einen Traffic-Datensatz komplett holen (per ID)"),
+    ToolSpec("api.update",             "I", "DAST / API", "P", (), "Traffic-Datensatz (Kommentar, Request-/Response-Body) in api_traffic.db aktualisieren"),
+    ToolSpec("api.replay",             "I", "DAST / API", "P", (), "Request aus api_traffic.db (req_id) oder frei per HTTP erneut senden und optional aufzeichnen"),
+    ToolSpec("api.clear",              "I", "DAST / API", "G", ("delete_ops",), "Alle Eintraege in api_traffic.db loeschen (gated: delete_ops)"),
     ToolSpec("api.rules_list",         "I", "DAST / API", "O", (), "Aktive Intercept-Regeln (intercept_rules.json) auflisten"),
     ToolSpec("api.rules_set",          "I", "DAST / API", "P", (), "Intercept-Regeln setzen/ergaenzen (PFLICHT fuer GUI+MCP Paritaet)"),
     ToolSpec("api.extract_flutter_static", "I", "DAST / API", "O", (), "Statische Cognito-/GraphQL-/REST-Vorlagen aus flutter_assets & libapp.so scannen"),
+    ToolSpec("api.extract_engine_static",  "I", "DAST / API", "O", (), "Statische API-/Web-Endpunkte fuer Hybrid-Web, React Native/Hermes, Flutter & Web-Assets scannen"),
     ToolSpec("api.import_templates",   "I", "DAST / API", "P", (), "Ausgewaehlte statische API-Vorlagen in den API Inspector (api_traffic.db) uebernehmen"),
     ToolSpec("net.push_cert",          "I", "DAST / API", "G", ("file_manager",), "mitmproxy-CA aufs Geraet"),
     ToolSpec("net.route",              "I", "DAST / API", "G", ("file_manager",), "Proxy-Routing setzen"),
@@ -183,13 +194,17 @@ TOOL_CATALOG = [
     ToolSpec("native.dex_run",          "M", "Native Studio", "O", (), "J3/MS-4: DEX laden + eine Methode ausfuehren (DalvikVM + lazy Klassen-Loader/<clinit> + android.*-Stubs) -> Ergebnis + Opcode-Coverage + nicht aufgeloeste Dalvik-/Framework-Aufrufe"),
     ToolSpec("native.jdbg_run",         "M", "Native Studio", "O", (), "X1/MS-6: Smali-Methode unter dem glaesernen Java-Debugger ausfuehren (skriptbasiert): Breakpoints (pc) beobachten + optional Register am 1. Treffer mutieren -> Beobachtungen + Timeline-Laenge + Ergebnis (Mutationseffekt sichtbar)"),
     ToolSpec("native.app_lifecycle_run", "M", "Native Studio", "O", (), "Ganze App am Lifecycle-Einstieg starten (Zone original|patched, lazy Callees)"),
-    ToolSpec("native.glass_run",         "M", "Native Studio", "O", (), "Glaeserner App-Lauf: ganzer Lifecycle durch den Java-Debugger mit View-Recorder + Netz-Recorder; action_points + net_replay + seam_profile + cutoffs + net_condition + instance_id -> View-Summary, NetLog, Pausen-Beobachtungen"),
-    ToolSpec("native.glass_state",       "M", "Native Studio", "O", (), "Read-only: aktuellen Live-Zustand des Glass-Debuggers (Mode, Call-Stack, Seam/Net-Config, Instanz) lesen"),
-    ToolSpec("native.glass_control",     "M", "Native Studio", "P", (), "Steuerkommando an die GUI/Debugger-Warteschlange senden (open_debugger, set_bp, set_net_condition, load_fork)"),
+    ToolSpec("native.glass_run",         "M", "Native Studio", "O", (), "Glaeserner App-Lauf: Lifecycle durch Java-Debugger mit View-/Netz-/Clock-Recorder; virtual_clock, net_mode, record_timeline, persist_session (Opt-In), action_points, net_replay, seam_profile -> View, NetLog, AppState"),
+    ToolSpec("native.glass_state",       "M", "Native Studio", "O", (), "Read-only: aktuellen Live-Zustand des Glass-Debuggers (Mode, Call-Stack, Seam/Net/Clock-Config, AppState, Timeline, Missing) lesen"),
+    ToolSpec("native.glass_clock",       "M", "Native Studio", "P", (), "Virtuelle Uhrzeit & Datumsvorgabe (ISO/Epoch/Zeitzone/Freeze/Shift/Reset) lesen oder setzen (Headless + Live-GUI)"),
+    ToolSpec("native.glass_inspect",     "M", "Native Studio", "O", (), "Tiefen-Inspektion des Glass-Laufs: App-State (SharedPrefs/SQLite/VFS), Missing, Seams, Timeline, Statics/Heap & Befund"),
+    ToolSpec("native.glass_control",     "M", "Native Studio", "P", (), "Steuerkommando an Live-GUI oder Headless-Session senden (start_app, reset_appdata, clear_appdata, set_persist_session, pause, stop, cont, step, step_over, step_out, reverse_step, goto, set_virtual_clock, set_net_mode, add_net_mock, set_options, add_action_point, generate_befund, open_browser, toggle_pw_mask)"),
     ToolSpec("native.glass_fork",        "M", "Native Studio", "P", (), "Parallele Glass-Instanzen (Forks) und Projekt-Snapshots verwalten (list|fork|merge|discard|save_project|load_project)"),
     ToolSpec("native.net_log",          "M", "Native Studio", "O", (), "Read-only: NetLog (HTTP-Requests/Responses) des letzten native.glass_run lesen"),
+    ToolSpec("native.webview_inspect",  "M", "Native Studio", "O", (), "In-Phone-Browser / WebView-DOM-Inspektor: App-URLs entdecken oder URL/HTML-Asset abrufen & parsen"),
     ToolSpec("native.ui_snapshot",      "M", "Native Studio", "O", (), "Read-only (gläsern): UI-Momentaufnahme des letzten native.glass_run - Paint-Masse, sichtbare Texte, Szenegraph-Knoten (cls/text/bounds/clickable)"),
-    ToolSpec("native.ui_detect",        "M", "Native Studio", "O", (), "Gläsern/read-only: erkennt das UI-Toolkit einer entpackten App (klassisch/Compose/React Native/Flutter) und nennt den passenden Render-Produzenten. Args: studio_root?"),
+    ToolSpec("native.ui_view",          "M", "Native Studio", "O", (), "Gläsern/multimodal: zeigt der KI die aktuelle simulierte App-GUI als echtes PNG-Bild (ImageContent) samt sichtbaren Texten & nummerierten Tap-Koordinaten (Live-GUI + Glass-Run). Args: annotate?, scroll_y?, source?"),
+    ToolSpec("native.ui_detect",        "M", "Native Studio", "O", (), "Gläsern/read-only: erkennt das UI-Toolkit einer entpackten App (klassisch/Compose/React Native/Hybrid Web/NativeScript/Flutter) und nennt den passenden Render-Produzenten. Args: studio_root?"),
     ToolSpec("native.ui_render",        "M", "Native Studio", "O", (), "Gläsern: rendert die zuletzt gläserne UI (lebende Surface oder last_ui.json) zu PNG - am Ende kommt echte Grafik raus. Args: path?, title?"),
     ToolSpec("native.ui_tap",           "M", "Native Studio", "O", (), "Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen, persistiert neue Momentaufnahme. Args: x, y"),
     ToolSpec("native.ui_key",           "M", "Native Studio", "O", (), "Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben. Args: text"),

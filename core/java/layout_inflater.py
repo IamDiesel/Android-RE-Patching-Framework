@@ -56,12 +56,14 @@ def _short_tag(tag):
         return "FrameLayout"
     if short in _NON_VISUAL_HELPER:
         return short
+    if short.endswith(("EditText", "AutoCompleteTextView", "AutoCompleteEdit")):
+        return "EditText"
     if short.endswith("TextView"):
         return "TextView"
-    if short.endswith("EditText"):
-        return "EditText"
     if short.endswith("ImageButton"):
         return "ImageButton"
+    if short.endswith("FilterButton"):
+        return short
     if short.endswith("Button"):
         return "Button"
     if short.endswith("ImageView"):
@@ -86,6 +88,17 @@ def _node_from_el(el):
     if cls in _NON_VISUAL_HELPER:
         n.props["non_visual"] = True
         n.visible = False
+    elif cls in ("BottomNavigationView", "NavigationBarView"):
+        cls = "BottomNavigationView"
+        n = ViewNode(cls=cls)
+        n.props["role"] = "navbar"
+        n.props["orientation"] = "horizontal"
+        n.props.setdefault("h", 56)
+        _menu_ref = _attr_any(el, "menu")
+        if _menu_ref:
+            n.props["menu_ref"] = _menu_ref
+    elif cls in ("Toolbar", "MaterialToolbar"):
+        n.props["orientation"] = "horizontal"
     if raw_tag == "fragment" or raw_tag.endswith(".fragment") or raw_tag.endswith("FragmentContainerView"):
         fname = _attr_any(el, "name") or el.get("class")
         if fname:
@@ -123,6 +136,13 @@ def _node_from_el(el):
     bg_ref = _attr_any(el, "background") or _attr_any(el, "input_backgroundColor")
     if bg_ref and bg_ref.strip().lower() not in ("@null", "@empty"):
         n.props["bg_ref"] = bg_ref
+    if cls in ("CardView", "MaterialCardView"):
+        card_bg = _attr_any(el, "cardBackgroundColor")
+        if card_bg and card_bg.strip().lower() not in ("@null", "@empty"):
+            n.props["card_bg_ref"] = card_bg
+        card_rad = (_attr_any(el, "cardCornerRadius") or "").strip()
+        if card_rad:
+            n.props["card_radius_ref"] = card_rad
     tint_ref = _attr_any(el, "tint")
     if tint_ref and tint_ref.strip().lower() not in ("@null", "@empty"):
         n.props["tint_ref"] = tint_ref
@@ -164,7 +184,7 @@ def _node_from_el(el):
     col_ref = _attr_any(el, "textColor")
     if col_ref:
         n.props["color_ref"] = col_ref
-    for cd_attr in ("drawableLeft", "drawableStart", "drawableTop", "drawableRight", "drawableEnd"):
+    for cd_attr in ("drawableLeft", "drawableLeftCompat", "drawableStart", "drawableStartCompat", "drawableTop", "drawableRight", "drawableEnd"):
         cd_val = _attr_any(el, cd_attr)
         if cd_val:
             n.props["compound_drawable_ref"] = cd_val
@@ -209,6 +229,37 @@ def _node_from_el(el):
                     return None
         return None
 
+    _m_all = (_attr(el, "layout_margin") or "").strip()
+    if _m_all:
+        if _m_all.startswith(("@dimen/", "@android:dimen/", "?")):
+            n.props["xml_margin_ref"] = _m_all
+        else:
+            _mv = _parse_dp_val(_m_all)
+            if _mv is not None and _mv > 0:
+                n.props["xml_margin"] = _mv
+    if "card_radius_ref" in n.props:
+        _cr_dp = _parse_dp_val(n.props["card_radius_ref"])
+        if _cr_dp is not None and _cr_dp >= 0:
+            n.props["card_radius"] = _cr_dp
+            n.props.pop("card_radius_ref", None)
+    if "card_bg_ref" in n.props and "bg_drawable" not in n.props:
+        _cb_s = str(n.props["card_bg_ref"]).strip().lower()
+        _lit_c = None
+        if _cb_s in ("@color/white", "@android:color/white"):
+            _lit_c = "#ffffff"
+        elif _cb_s in ("@color/black", "@android:color/black"):
+            _lit_c = "#000000"
+        elif _cb_s.startswith("#") and len(_cb_s) in (7, 9):
+            if len(_cb_s) == 7 or int(_cb_s[1:3], 16) > 12:
+                _lit_c = "#" + _cb_s[-6:]
+        if _lit_c is not None:
+            n.props["bg_drawable"] = {
+                "kind": "shape",
+                "shape": "rectangle",
+                "fill": _lit_c,
+                "outline": _lit_c,
+                "radius": float(n.props.get("card_radius", 8) or 8),
+            }
     _pad_all = (_attr(el, "padding") or "").strip()
     _pad_h = (_attr(el, "paddingHorizontal") or _attr(el, "paddingStart") or _attr(el, "paddingLeft") or _pad_all).strip()
     _pad_v = (_attr(el, "paddingVertical") or _attr(el, "paddingTop") or _pad_all).strip()
@@ -328,8 +379,11 @@ def _node_from_el(el):
         n.props["$cl_end_to_start"] = str(_end_start).split("/")[-1]
     if _top_p and _top_p != "parent" and _top_p == _bot_p:
         n.props["$cl_same_v_target"] = str(_top_p).split("/")[-1]
-    elif _top_p and _top_p != "parent":
-        n.props["$cl_top_to_top"] = str(_top_p).split("/")[-1]
+    else:
+        if _top_p and _top_p != "parent":
+            n.props["$cl_top_to_top"] = str(_top_p).split("/")[-1]
+        if _bot_p and _bot_p != "parent":
+            n.props["$cl_bot_to_bot"] = str(_bot_p).split("/")[-1]
     if _start_p and _start_p != "parent" and _start_p == _end_p:
         n.props["$cl_same_h_target"] = str(_start_p).split("/")[-1]
     if _bot_top:
@@ -624,6 +678,136 @@ def build_string_map(app_root):
     return id2text, name2text
 
 
+def build_menu_map(app_root):
+    """menu res_id(int) -> menu XML name via res/values/public.xml (type='menu')."""
+    _, id2name = _public_type_map(app_root, "menu")
+    return id2name
+
+
+def parse_menu_xml(app_root, menu_ref_or_id, name2text=None, rev_idmap=None, menu_idmap=None):
+    """Parst `res/menu/<name>.xml` -> Liste von Item-Dicts (vid, res_id, title, icon_ref, visible, ...)."""
+    if not app_root or menu_ref_or_id in (None, "", 0):
+        return []
+    mname = None
+    if isinstance(menu_ref_or_id, int):
+        mmap = menu_idmap if menu_idmap is not None else build_menu_map(app_root)
+        mname = mmap.get(int(menu_ref_or_id))
+    else:
+        s = str(menu_ref_or_id).strip()
+        if s.startswith("@menu/"):
+            mname = s[len("@menu/"):]
+        elif s.isdigit():
+            mmap = menu_idmap if menu_idmap is not None else build_menu_map(app_root)
+            mname = mmap.get(int(s))
+        elif s:
+            mname = s.split("/", 1)[-1]
+    if not mname:
+        return []
+    mpath = os.path.join(_res_dir(app_root), "menu", f"{mname}.xml")
+    if not os.path.isfile(mpath):
+        return []
+    if name2text is None:
+        try:
+            _, name2text = build_string_map(app_root)
+        except Exception:
+            name2text = {}
+    if rev_idmap is None:
+        try:
+            rev_idmap = {nm: rid for rid, nm in build_id_map(app_root).items()}
+        except Exception:
+            rev_idmap = {}
+    try:
+        root = ET.parse(mpath).getroot()
+    except Exception:
+        return []
+    items = []
+
+    def _collect(parent_el):
+        for el in parent_el:
+            if not isinstance(el.tag, str):
+                continue
+            tag = el.tag.rsplit(".", 1)[-1]
+            if tag == "item":
+                raw_id = (_attr(el, "id") or "").strip()
+                vid = raw_id.split("/")[-1] if raw_id else ""
+                try:
+                    res_id = int(rev_idmap.get(vid, 0) or 0) if vid else 0
+                except Exception:
+                    res_id = 0
+                raw_title = (_attr(el, "title") or "").strip()
+                title = _resolve_string_chain(raw_title, name2text) if raw_title.startswith("@string/") else raw_title
+                icon_ref = (_attr_any(el, "icon") or "").strip()
+                if icon_ref.lower() in ("@null", "@empty"):
+                    icon_ref = ""
+                icon_name = icon_ref.split("/", 1)[-1] if "/" in icon_ref else ""
+                visible = (_attr(el, "visible") or "true").strip().lower() != "false"
+                enabled = (_attr(el, "enabled") or "true").strip().lower() != "false"
+                show_as = (_attr_any(el, "showAsAction") or "").strip()
+                try:
+                    order = int((_attr(el, "orderInCategory") or "0").strip())
+                except Exception:
+                    order = 0
+                items.append({
+                    "vid": vid,
+                    "res_id": res_id,
+                    "title": str(title or ""),
+                    "icon_ref": icon_ref,
+                    "icon_name": icon_name,
+                    "visible": visible,
+                    "enabled": enabled,
+                    "show_as_action": show_as,
+                    "order": order,
+                })
+                for sub in el:
+                    if isinstance(sub.tag, str) and sub.tag.rsplit(".", 1)[-1] in ("menu", "group"):
+                        _collect(sub)
+            elif tag in ("menu", "group"):
+                _collect(el)
+
+    _collect(root)
+    return items
+
+
+def _expand_menus(app_root, node, name2text=None, rev_idmap=None, menu_idmap=None):
+    """Expandiert `@menu/...` auf BottomNavigationView/NavigationBarView zu klickbaren Tab-Kindern."""
+    if node is None or not app_root:
+        return
+    if node.props.get("menu_ref") and not node.children:
+        items = parse_menu_xml(
+            app_root,
+            node.props["menu_ref"],
+            name2text=name2text,
+            rev_idmap=rev_idmap,
+            menu_idmap=menu_idmap,
+        )
+        vis_idx = 0
+        for it in items:
+            if not it.get("visible", True):
+                continue
+            tprops = {
+                "menu_item_id": int(it.get("res_id") or 0),
+                "$nav_tab": True,
+                "role": "navitem",
+                "selected": (vis_idx == 0),
+                "enabled": bool(it.get("enabled", True)),
+            }
+            if it.get("icon_ref"):
+                tprops["compound_drawable_ref"] = it["icon_ref"]
+            if it.get("icon_name"):
+                tprops["img"] = it["icon_name"]
+            btn = ViewNode(
+                cls="Button",
+                vid=it.get("vid") or f"nav_tab_{vis_idx}",
+                text=it.get("title") or it.get("vid") or f"Tab {vis_idx + 1}",
+                clickable=True,
+                props=tprops,
+            )
+            node.add(btn)
+            vis_idx += 1
+    for c in list(node.children):
+        _expand_menus(app_root, c, name2text=name2text, rev_idmap=rev_idmap, menu_idmap=menu_idmap)
+
+
 def build_array_map(app_root, name2text=None):
     """(id2arr, name2arr): array res_id(int)->list[str] via public.xml(type=array) + arrays.xml."""
     rdir = _res_dir(app_root)
@@ -663,6 +847,85 @@ def build_array_map(app_root, name2text=None):
     return id2arr, name2arr
 
 
+def _public_type_map(app_root, res_type):
+    rdir = _res_dir(app_root)
+    id2name = {}
+    pub = os.path.join(rdir, "values", "public.xml")
+    if os.path.isfile(pub):
+        try:
+            for el in ET.parse(pub).getroot():
+                if el.get("type") == res_type and el.get("name") and el.get("id"):
+                    try:
+                        id2name[int(el.get("id"), 16)] = el.get("name")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    return rdir, id2name
+
+
+def build_bool_map(app_root):
+    """(id2bool, name2bool): bool res_id(int)->0/1 via public.xml(type=bool) + bools.xml."""
+    rdir, id2name = _public_type_map(app_root, "bool")
+    raw_map = {}
+    bx = os.path.join(rdir, "values", "bools.xml")
+    if os.path.isfile(bx):
+        try:
+            for el in ET.parse(bx).getroot():
+                if (el.tag == "bool" or (el.tag == "item" and el.get("type") == "bool")) and el.get("name"):
+                    raw_map[el.get("name")] = (el.text or "").strip().lower()
+        except Exception:
+            pass
+    name2bool = {}
+    for k, val in raw_map.items():
+        cur = val
+        for _ in range(5):
+            if cur.startswith("@bool/"):
+                nxt = raw_map.get(cur[len("@bool/"):])
+                if nxt is None or nxt == cur:
+                    break
+                cur = nxt
+            else:
+                break
+        if cur in ("true", "1", "yes"):
+            name2bool[k] = True
+        elif cur in ("false", "0", "no"):
+            name2bool[k] = False
+    id2bool = {rid: (1 if name2bool[nm] else 0) for rid, nm in id2name.items() if nm in name2bool}
+    return id2bool, name2bool
+
+
+def build_integer_map(app_root):
+    """(id2int, name2int): integer res_id(int)->int via public.xml(type=integer) + integers.xml."""
+    rdir, id2name = _public_type_map(app_root, "integer")
+    raw_map = {}
+    ix = os.path.join(rdir, "values", "integers.xml")
+    if os.path.isfile(ix):
+        try:
+            for el in ET.parse(ix).getroot():
+                if (el.tag == "integer" or (el.tag == "item" and el.get("type") == "integer")) and el.get("name"):
+                    raw_map[el.get("name")] = (el.text or "").strip()
+        except Exception:
+            pass
+    name2int = {}
+    for k, val in raw_map.items():
+        cur = val
+        for _ in range(5):
+            if cur.startswith("@integer/"):
+                nxt = raw_map.get(cur[len("@integer/"):])
+                if nxt is None or nxt == cur:
+                    break
+                cur = nxt
+            else:
+                break
+        try:
+            name2int[k] = int(cur, 0)
+        except Exception:
+            pass
+    id2int = {rid: name2int[nm] for rid, nm in id2name.items() if nm in name2int}
+    return id2int, name2int
+
+
 def _resolve_refs(node, name2text, resolver=None):
     v = getattr(node, "text", None)
     if isinstance(v, str) and v.startswith("@string/"):
@@ -678,6 +941,8 @@ def _resolve_refs(node, name2text, resolver=None):
             ("xml_pad_x_ref", "$pad_x"),
             ("xml_pad_y_ref", "$pad_y"),
             ("xml_pad_b_ref", "xml_pad_b"),
+            ("xml_margin_ref", "xml_margin"),
+            ("card_radius_ref", "card_radius"),
         ):
             _rv = node.props.get(_rk)
             if _rv and _pk not in node.props and hasattr(resolver, "resolve_dimen"):
@@ -708,6 +973,23 @@ def _resolve_refs(node, name2text, resolver=None):
             if sp is not None:
                 node.props["bg_drawable"] = sp
         _color_fn = getattr(resolver, "resolve_color_for_state", None)
+        card_bg_ref = node.props.get("card_bg_ref")
+        if card_bg_ref and "bg_drawable" not in node.props:
+            c_rgb, c_alpha = _color_fn(card_bg_ref, state=_st) if callable(_color_fn) else resolver.resolve_color(card_bg_ref)
+            if c_rgb is not None and c_alpha > 0.05:
+                c_rad = float(node.props.get("card_radius", 8) or 8)
+                c_spec = {
+                    "kind": "shape",
+                    "shape": "rectangle",
+                    "fill": c_rgb,
+                    "outline": c_rgb,
+                    "radius": c_rad,
+                }
+                if c_alpha < 0.999:
+                    c_spec["alpha"] = float(c_alpha)
+                node.props["bg_drawable"] = c_spec
+        elif card_bg_ref and "card_radius" in node.props and isinstance(node.props.get("bg_drawable"), dict):
+            node.props["bg_drawable"]["radius"] = float(node.props["card_radius"])
         col_ref = node.props.get("color_ref")
         if col_ref and "color" not in node.props:
             rgb, alpha = _color_fn(col_ref, state=_st) if callable(_color_fn) else resolver.resolve_color(col_ref)
@@ -785,6 +1067,20 @@ def inflate_res(app_root, res_id, idmap=None, _depth=0):
                 _, name2text = build_string_map(app_root)
             except Exception:
                 name2text = {}
+            try:
+                rev_idmap = {nm: rid for rid, nm in build_id_map(app_root).items()}
+            except Exception:
+                rev_idmap = {}
+            try:
+                menu_idmap = build_menu_map(app_root)
+            except Exception:
+                menu_idmap = {}
+            _expand_menus(
+                app_root, node,
+                name2text=name2text,
+                rev_idmap=rev_idmap,
+                menu_idmap=menu_idmap,
+            )
             resolver = None
             try:
                 from core.java.drawable_loader import get_drawable_resolver

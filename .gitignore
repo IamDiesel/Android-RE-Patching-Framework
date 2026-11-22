@@ -69,11 +69,12 @@ data/Kippy_RE_Log.md
 /librelinkup-ale-writeup
 
 # Backups (per-edit .bak + Archivordner)
+bak/
 *.bak
 *.bak_*
-_bak_archive/
 *.bak-*
-_baks
+_bak_archive/
+_baks/
 
 # Private, zielspezifische Native-Plugins (Decrypter etc.) + deren Daten
 native_plugins/

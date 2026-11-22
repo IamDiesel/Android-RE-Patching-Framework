@@ -23,7 +23,7 @@ class DebugSession:
         from core.java.bridge import JavaToNativeBridge
         self.vm = vm if vm is not None else DalvikVM()
         if self.vm.bridge is None:
-            self.vm.bridge = JavaToNativeBridge(eng, jni, emu)
+            self.vm.bridge = JavaToNativeBridge(eng, jni, emu, vm=self.vm)
         self.jdbg = JavaDebugger(self.vm)
         from services.native_trace_service import NativeTraceService
         self.ntr = NativeTraceService(publish=False)
@@ -69,8 +69,10 @@ class DebugSession:
 
     # ---- Native Seite -----------------------------------------------------
     def native_state(self):
+        if self.eng is None or getattr(self.eng, "cpu", None) is None:
+            return {"available": False, "pc": "0x0", "x0": "0x0", "sp": "0x0", "lr": "0x0"}
         c = self.eng.cpu
-        return {"pc": hex(int(c.pc) & _M64), "x0": hex(int(c.x[0]) & _M64),
+        return {"pc": hex(int(getattr(c, "pc", 0) or 0) & _M64), "x0": hex(int(c.x[0]) & _M64),
                 "sp": hex(int(c.sp) & _M64), "lr": hex(int(c.lr) & _M64)}
 
     def native_mem_read(self, addr, n=8):

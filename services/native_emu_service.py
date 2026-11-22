@@ -144,54 +144,100 @@ class NativeEmuService:
             max_wall_s: Optional[float] = None) -> dict:
         """Fuehrt ab `entry` aus und liefert {ok, ret, x[], sp, lr, pc, flags}.
         Publiziert PROGRESS(start) / DONE bzw. UNKNOWN_INSTR / ERROR."""
+        depth = int(getattr(eng, "_run_depth", 0) or 0)
+        saved = None
+        if depth > 0:
+            c = eng.cpu
+            saved = (
+                list(c.x),
+                int(c.sp),
+                int(c.lr),
+                int(getattr(c, "pc", 0) or 0),
+                int(c.n),
+                int(c.z),
+                int(c.c),
+                int(c.vf),
+                bool(getattr(c, "stopped", False)),
+                getattr(c, "stop_reason", None),
+            )
+        eng._run_depth = depth + 1
         try:
-            addr = self.resolve_entry(entry, image)
-        except Exception as e:
-            self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
-            return {"ok": False, "why": "entry", "error": repr(e)}
-        try:
-            self.apply_mem(eng, mem_overrides)
-            if sp is not None:
-                eng.cpu.sp = int(sp)
-        except Exception as e:
-            self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
-            return {"ok": False, "why": "setup", "error": repr(e)}
-
-        try:
-            int_args, outbufs = self.materialize_args(eng, args)
-        except Exception as e:
-            self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
-            return {"ok": False, "why": "args", "error": repr(e)}
-
-        self._emit(NATIVE_EMU_PROGRESS,
-                   {"stage": "start", "entry": f"0x{addr:x}", "args": [a & _M64 for a in int_args]})
-        try:
-            if max_wall_s is not None:
-                ret = eng.run_function(addr, tuple(int_args), maxins, max_wall_s=max_wall_s)
-            else:
-                ret = eng.run_function(addr, tuple(int_args), maxins)
-        except iface.UnknownInstructionError as e:
-            # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
-            d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
-                 "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
-            self._emit(NATIVE_UNKNOWN_INSTR, d)
-            return {"ok": False, "why": "unknown_instr", **d}
-        except Exception as e:
-            self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
-            return {"ok": False, **_classify_run_exc(e)}
-
-        snap = self.snapshot_regs(eng)
-        out = {}
-        for name, a, n in outbufs:
             try:
-                out[name] = self.read_mem(eng, a, n).hex()
-            except Exception:
-                pass
-        self._emit(NATIVE_EMU_DONE, {"ret": int(ret) & _M64})
-        res = {"ok": True, "ret": int(ret) & _M64, **snap}
-        if out:
-            res["out"] = out
-        return res
+                addr = self.resolve_entry(entry, image)
+            except Exception as e:
+                self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
+                return {"ok": False, "why": "entry", "error": repr(e)}
+            try:
+                self.apply_mem(eng, mem_overrides)
+                if sp is not None:
+                    eng.cpu.sp = int(sp)
+                elif depth > 0:
+                    cur_sp = int(eng.cpu.sp) if int(eng.cpu.sp) else 0x7F000000
+                    eng.cpu.sp = (cur_sp - 0x4000) & ~0xF
+                elif eng.cpu.sp == 0:
+                    eng.cpu.sp = 0x7F000000
+            except Exception as e:
+                self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
+                return {"ok": False, "why": "setup", "error": repr(e)}
+
+            try:
+                int_args, outbufs = self.materialize_args(eng, args)
+            except Exception as e:
+                self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
+                return {"ok": False, "why": "args", "error": repr(e)}
+
+            self._emit(NATIVE_EMU_PROGRESS,
+                       {"stage": "start", "entry": f"0x{addr:x}", "args": [a & _M64 for a in int_args]})
+            try:
+                if max_wall_s is not None:
+                    ret = eng.run_function(addr, tuple(int_args), maxins, max_wall_s=max_wall_s)
+                else:
+                    ret = eng.run_function(addr, tuple(int_args), maxins)
+            except iface.UnknownInstructionError as e:
+                # Einheitliche Felder fuer Coverage-Loop + GUI (pc/raw/mnem/encoding).
+                d = {"pc": getattr(e, "pc", None), "raw": getattr(e, "raw", None),
+                     "mnem": getattr(e, "mnemonic", None), "encoding": getattr(e, "encoding", "")}
+                self._emit(NATIVE_UNKNOWN_INSTR, d)
+                return {"ok": False, "why": "unknown_instr", **d}
+            except Exception as e:
+                self._emit(NATIVE_EMU_ERROR, {"error": repr(e)})
+                return {"ok": False, **_classify_run_exc(e)}
+
+            stopped = bool(getattr(eng.cpu, "stopped", False))
+            stop_reason = getattr(eng.cpu, "stop_reason", None)
+            if stopped and str(stop_reason or "") == "user_stop":
+                pc_now = int(getattr(eng.cpu, "pc", 0) or 0) & _M64
+                self._emit(NATIVE_EMU_ERROR, {"error": "user_stop", "pc": pc_now})
+                return {"ok": False, "why": "stopped", "pc": pc_now,
+                        "stopped": True, "stop_reason": "user_stop"}
+
+            snap = self.snapshot_regs(eng)
+            out = {}
+            for name, a, n in outbufs:
+                try:
+                    out[name] = self.read_mem(eng, a, n).hex()
+                except Exception:
+                    pass
+            self._emit(NATIVE_EMU_DONE, {"ret": int(ret) & _M64})
+            res = {"ok": True, "ret": int(ret) & _M64, **snap}
+            if stopped and not str(stop_reason or "").startswith("futex_stall"):
+                res["stopped"] = True
+                res["stop_reason"] = stop_reason or "stopped"
+            if out:
+                res["out"] = out
+            return res
+        finally:
+            if saved is not None:
+                c = eng.cpu
+                sx, ssp, slr, spc, sn, sz, sc, svf, sstopped, sreason = saved
+                c.x[:] = sx
+                c.sp = ssp
+                c.lr = slr
+                c.pc = spc
+                c.n, c.z, c.c, c.vf = sn, sz, sc, svf
+                c.stopped = sstopped
+                c.stop_reason = sreason
+            eng._run_depth = depth
 
     # ---- Ausfuehrung mit Breakpoints (A2, kontraktneutral) ----------------
     def run_with_breaks(self, eng: Arm64Engine, entry, args: Sequence[int] = (),
@@ -465,6 +511,8 @@ class NativeEmuService:
             c.lr = int(r["lr"]) & _M64
         try:
             c.cache = {}; c.tcache = {}; c.bb = {}
+            if hasattr(m, "_code_pages"):
+                m._code_pages = set()
         except Exception:
             pass
         return r

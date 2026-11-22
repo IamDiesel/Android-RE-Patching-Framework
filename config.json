@@ -1,7 +1,7 @@
 {
     "BASE_DIR": "C:\\Users\\Lenovo\\Documents\\GitHub\\Android RE Patching Framework",
-    "SPLIT_NAME": "com.alpicoolneutral.fridge.controller",
-    "APP_PACKAGE": "com.alpicoolneutral.fridge.controller",
+    "SPLIT_NAME": "digifit.virtuagym.client.android",
+    "APP_PACKAGE": "digifit.virtuagym.client.android",
     "SIGNER_JAR": "tools\\uber-apk-signer.jar",
     "APKEDITOR_JAR": "tools\\APKEditor.jar",
     "LSPATCH_JAR": "tools\\lspatch.jar",
@@ -189,6 +189,7 @@
             "log_args": true
         },
         "tools": {
+            "app.pull_apk": true,
             "lib.build": true,
             "lib.delete": true,
             "favorites.delete": true,
@@ -202,6 +203,9 @@
             "exec.deploy_run": true,
             "exec.pull_result": true,
             "exec.delete": true,
+            "app.start": true,
+            "app.stop": true,
+            "api.clear": true,
             "net.push_cert": true,
             "net.route": true,
             "frida.scripts_delete": true,
@@ -210,7 +214,9 @@
             "native.dbg_step": true,
             "native.dbg_resume": true,
             "native.os_config_set": true,
-            "native.session_set": true
+            "native.session_set": true,
+            "libcarve.session_set": true,
+            "libcarve.compile": true
         },
         "caps": {
             "build": true,
@@ -228,5 +234,6 @@
             "clear_on_app_start": true
         }
     },
-    "ADB_DEVICE_SERIAL": "45301FDAP009G0"
+    "ADB_DEVICE_SERIAL": "45301FDAP009G0",
+    "DEBUGGER_PERSIST_SESSION": true
 }

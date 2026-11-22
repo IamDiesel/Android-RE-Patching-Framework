@@ -35,18 +35,27 @@ def _summ(**kw) -> str:
 
 
 def build_server(ctx, host, port):
-    from mcp.server.fastmcp import FastMCP
+    try:
+        from mcp.server.mcpserver import MCPServer as _FastMCP
+        _is_v2 = True
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as _FastMCP
+        _is_v2 = False
     from mcp_server.guide import AGENT_GUIDE
     try:
-        mcp = FastMCP("re-framework", instructions=AGENT_GUIDE)
+        mcp = _FastMCP("re-framework", instructions=AGENT_GUIDE)
     except TypeError:
         # aeltere FastMCP-Versionen ohne instructions-Parameter
-        mcp = FastMCP("re-framework")
-    try:
-        mcp.settings.host = host
-        mcp.settings.port = int(port)
-    except Exception:
-        pass
+        mcp = _FastMCP("re-framework")
+    mcp._is_mcp_v2 = _is_v2
+    mcp._bind_host = host
+    mcp._bind_port = int(port)
+    if not _is_v2:
+        try:
+            mcp.settings.host = host
+            mcp.settings.port = int(port)
+        except Exception:
+            pass
 
     # ---------------- A: Workspace & Config ----------------
     @mcp.tool(name="workspace_status")
@@ -65,6 +74,30 @@ def build_server(ctx, host, port):
     def workspace_prepare_hint() -> str:
         """GUI-Anleitung fuer PREPARE_WORKSPACE (Bauen macht der Nutzer)."""
         return runtime.run(ctx, "workspace.prepare_hint", lambda: tools.workspace_prepare_hint(ctx))
+
+    @mcp.tool(name="workspace_renew_id")
+    def workspace_renew_id() -> str:
+        """Generiert eine neue Patch-Session-ID (PID-YYYYmmdd-HHMMSS) inkl. Archiv-Ordner."""
+        return runtime.run(ctx, "workspace.renew_id", lambda: tools.workspace_renew_id(ctx))
+
+    @mcp.tool(name="app_list_local")
+    def app_list_local() -> str:
+        """Listet lokal importierte Apps in source/ samt APKs, Unpacked-Ordnern & UI-Toolkit auf."""
+        return runtime.run(ctx, "app.list_local", lambda: tools.app_list_local(ctx))
+
+    @mcp.tool(name="app_import")
+    def app_import(path: str, package_name: str = "", switch_active: bool = True) -> str:
+        """Importiert einen lokalen APK-/Unpacked-Ordner oder eine .apk nach source/<pkg>/ inkl. Auto-Config."""
+        return runtime.run(ctx, "app.import",
+                           lambda: tools.app_import(ctx, path, package_name, bool(switch_active)),
+                           _summ(path=path, package_name=package_name, switch_active=switch_active))
+
+    @mcp.tool(name="app_pull_apk")
+    def app_pull_apk(package: str = "", switch_active: bool = True, confirm: bool = False) -> str:
+        """Zieht Base + Split-APKs der App vom ADB-Geraet nach source/<pkg>/. Gated: file_manager + confirm."""
+        return runtime.run(ctx, "app.pull_apk",
+                           lambda: tools.app_pull_apk(ctx, package, bool(switch_active)),
+                           _summ(package=package or "(active)", switch_active=switch_active), confirm=confirm)
 
     # ---------------- B: Analyse / Smali ----------------
     @mcp.tool(name="smali_index_status")
@@ -111,6 +144,20 @@ def build_server(ctx, host, port):
         return runtime.run(ctx, "smali.xref",
                            lambda: tools.smali_xref(ctx, symbol, max_results), _summ(symbol=symbol))
 
+    @mcp.tool(name="smali_callgraph")
+    def smali_callgraph(symbol: str, depth: int = 1, max_nodes: int = 200) -> str:
+        """Ausgehende Callees (depth=1..3) und eingehende Caller einer Smali-Methode ermitteln."""
+        return runtime.run(ctx, "smali.callgraph",
+                           lambda: tools.smali_callgraph(ctx, symbol, int(depth), int(max_nodes)),
+                           _summ(symbol=symbol, depth=depth))
+
+    @mcp.tool(name="app_manifest_info")
+    def app_manifest_info(app_root: Optional[str] = None) -> str:
+        """Liest AndroidManifest.xml (Activities, Launcher, Permissions, Exported, Deep-Links) & APK-Signatur-Certs."""
+        return runtime.run(ctx, "app.manifest_info",
+                           lambda: tools.app_manifest_info(ctx, app_root),
+                           _summ(app_root=app_root or "(auto)"))
+
     # ---------------- C: LibForge ----------------
     @mcp.tool(name="lib_list")
     def lib_list() -> str:
@@ -143,6 +190,22 @@ def build_server(ctx, host, port):
                                                     version=version, description=description,
                                                     source_file=source_file),
                            _summ(lib_id=lib_id, version=version))
+
+    @mcp.tool(name="lib_import_so")
+    def lib_import_so(name: str, so_path: str, version: str = "1.0",
+                      description: str = "", abi: str = "arm64-v8a") -> str:
+        """Importiert eine fertige .so ohne NDK-Build direkt in LibForge."""
+        return runtime.run(ctx, "lib.import_so",
+                           lambda: tools.lib_import_so(ctx, name, so_path, version=version,
+                                                       description=description, abi=abi),
+                           _summ(name=name, so_path=so_path, abi=abi))
+
+    @mcp.tool(name="lib_set_active")
+    def lib_set_active(ref: str, active: bool = True) -> str:
+        """Schaltet eine LibForge-Lib (Name oder ID) aktiv oder inaktiv."""
+        return runtime.run(ctx, "lib.set_active",
+                           lambda: tools.lib_set_active(ctx, ref, bool(active)),
+                           _summ(ref=ref, active=active))
     @mcp.tool(name="favorites_list")
     def favorites_list(tool_type: str = "") -> str:
         """Favoriten-Patch-Saetze auflisten (optional filterbar via tool_type='smali|libcarve|libforge|hex|lib_replace|kombi')."""
@@ -234,6 +297,16 @@ def build_server(ctx, host, port):
     def patch_clear_active() -> str:
         """Alle aktiven Session-Patches verwerfen (Favoriten bleiben unberuehrt)."""
         return runtime.run(ctx, "patch.clear_active", lambda: tools.patch_clear_active(ctx))
+
+    @mcp.tool(name="patch_fuzzy_match")
+    def patch_fuzzy_match(orig: str = "", file: str = "", favorite_ref: str = "",
+                          deep_search: bool = False, threshold: float = 0.80,
+                          max_results: int = 20) -> str:
+        """Findet verschobene Smali-Methoden/Patches nach App-Update per FuzzingEngine wieder."""
+        return runtime.run(ctx, "patch.fuzzy_match",
+                           lambda: tools.patch_fuzzy_match(ctx, orig, file, favorite_ref,
+                                                           bool(deep_search), float(threshold), int(max_results)),
+                           _summ(file=file, favorite_ref=favorite_ref, deep_search=deep_search))
 
     # ---------------- F: File Manager (nur info=O im MVP) ----------------
     # ---------------- L: Frida ----------------
@@ -738,26 +811,53 @@ def build_server(ctx, host, port):
                          max_steps: int = 400000, seam_profile: str = "self_cache",
                          java_cutoffs: str = None, jni_cutoffs: str = None,
                          net_condition: str = None, instance_id: str = None,
-                         native_fusion: bool = False) -> str:
-        """Glaeserner App-Lauf via GlassAppRunner (zone=original|live|destination; live=Zero-Build-Overlay aktiver Patches)."""
+                         native_fusion: bool = False, virtual_clock: Optional[str] = None,
+                         net_mode: str = "mock", record_timeline: bool = False,
+                         persist_session: Optional[bool] = None) -> str:
+        """Glaeserner App-Lauf via GlassAppRunner (zone=original|live|destination; inkl. virtual_clock, net_mode, record_timeline, persist_session Opt-In)."""
         return runtime.run(ctx, "native.glass_run",
                            lambda: tools.native_glass_run(
                                ctx, studio_root, zone, entry, action_points, net_replay,
                                int(max_steps), seam_profile, java_cutoffs, jni_cutoffs,
-                               net_condition, instance_id, bool(native_fusion)),
-                           _summ(entry=entry or "(Manifest)", seam=seam_profile))
+                               net_condition, instance_id, bool(native_fusion),
+                               virtual_clock=virtual_clock, net_mode=net_mode,
+                               record_timeline=bool(record_timeline),
+                               persist_session=persist_session),
+                           _summ(entry=entry or "(Manifest)", seam=seam_profile, net_mode=net_mode))
 
     @mcp.tool(name="native_glass_state")
     def native_glass_state() -> str:
         """Read-only: aktuellen Live-Zustand des Glass-Debuggers lesen."""
         return runtime.run(ctx, "native.glass_state", lambda: tools.native_glass_state(ctx), _summ())
 
+    @mcp.tool(name="native_glass_clock")
+    def native_glass_clock(op: str = "get", iso: Optional[str] = None, epoch_ms: Optional[int] = None,
+                           tz: Optional[str] = None, frozen: Optional[bool] = None,
+                           shift_days: float = 0.0, shift_hours: float = 0.0,
+                           shift_minutes: float = 0.0, shift_seconds: float = 0.0,
+                           step_ms: Optional[int] = None, forward_to_gui: bool = True) -> str:
+        """Virtuelle Uhrzeit & Datumsvorgabe (op=get|set|shift|reset; ISO/DE/Epoch/TZ/Freeze) lesen oder setzen."""
+        return runtime.run(ctx, "native.glass_clock",
+                           lambda: tools.native_glass_clock(
+                               ctx, op=op, iso=iso, epoch_ms=epoch_ms, tz=tz, frozen=frozen,
+                               shift_days=float(shift_days), shift_hours=float(shift_hours),
+                               shift_minutes=float(shift_minutes), shift_seconds=float(shift_seconds),
+                               step_ms=step_ms, forward_to_gui=bool(forward_to_gui)),
+                           _summ(op=op, iso=iso, tz=tz, frozen=frozen))
+
+    @mcp.tool(name="native_glass_inspect")
+    def native_glass_inspect(section: str = "all", query: str = "", limit: int = 100) -> str:
+        """Tiefen-Inspektion des Glass-Laufs (all|app_state|prefs|sqlite|missing|seams|timeline|heap|befund)."""
+        return runtime.run(ctx, "native.glass_inspect",
+                           lambda: tools.native_glass_inspect(ctx, section=section, query=query, limit=int(limit)),
+                           _summ(section=section, query=query))
+
     @mcp.tool(name="native_glass_control")
-    def native_glass_control(cmd: str, params_json: str = None) -> str:
-        """Steuerkommando an die GUI/Debugger-Queue senden (open_debugger/set_bp/set_net_condition/load_fork)."""
+    def native_glass_control(cmd: str, params_json: str = None, target: str = "gui") -> str:
+        """Steuerkommando an Live-GUI (`target='gui'`), Headless-Session (`'headless'`) oder beide (`'both'`) senden."""
         return runtime.run(ctx, "native.glass_control",
-                           lambda: tools.native_glass_control(ctx, cmd, params_json),
-                           _summ(cmd=cmd))
+                           lambda: tools.native_glass_control(ctx, cmd, params_json, target=target),
+                           _summ(cmd=cmd, target=target))
 
     @mcp.tool(name="native_glass_fork")
     def native_glass_fork(op: str = "list", package: str = None, fork_id: str = None,
@@ -772,10 +872,29 @@ def build_server(ctx, host, port):
         """Read-only: NetLog des letzten native.glass_run lesen."""
         return runtime.run(ctx, "native.net_log", lambda: tools.native_net_log(ctx), _summ())
 
+    @mcp.tool(name="native_webview_inspect")
+    def native_webview_inspect(url: str = "", app_root: Optional[str] = None,
+                               forward_to_gui: bool = False) -> str:
+        """In-Phone-Browser / WebView-DOM-Inspektor: App-URLs entdecken (url='') oder URL/HTML-Asset parsen."""
+        return runtime.run(ctx, "native.webview_inspect",
+                           lambda: tools.native_webview_inspect(ctx, url=url, app_root=app_root,
+                                                                forward_to_gui=bool(forward_to_gui)),
+                           _summ(url=url or "(discover)", forward_to_gui=forward_to_gui))
+
     @mcp.tool(name="native_ui_snapshot")
     def native_ui_snapshot() -> str:
-        """Read-only (gläsern): UI-Momentaufnahme des letzten native.glass_run (Paint/Texte/Knoten)."""
+        """Read-only (gläsern): UI-Momentaufnahme des letzten native.glass_run oder der laufenden Desktop-GUI (Paint/Texte/Knoten/Tap-Ziele)."""
         return runtime.run(ctx, "native.ui_snapshot", lambda: tools.native_ui_snapshot(ctx), _summ())
+
+    @mcp.tool(name="native_ui_view")
+    def native_ui_view(annotate: bool = False, scroll_y: Optional[int] = None, source: str = "auto") -> list:
+        """Gläsern/multimodal: zeigt der KI die aktuelle simulierte App-GUI als echtes PNG-Bild (ImageContent) plus sichtbare Texte & nummerierte Tap-Koordinaten."""
+        return runtime.run_multimodal(
+            ctx,
+            "native.ui_view",
+            lambda: tools.native_ui_view(ctx, annotate=annotate, scroll_y=scroll_y, source=source),
+            _summ(annotate=annotate, scroll_y=scroll_y, source=source),
+        )
 
     @mcp.tool(name="native_ui_detect")
     def native_ui_detect(studio_root: str = None) -> str:
@@ -790,16 +909,19 @@ def build_server(ctx, host, port):
                            lambda: tools.native_ui_render(ctx, path, title), _summ())
 
     @mcp.tool(name="native_ui_tap")
-    def native_ui_tap(x: float = 0, y: float = 0) -> str:
-        """Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen."""
+    def native_ui_tap(x: float = 0, y: float = 0, forward_to_gui: bool = False) -> str:
+        """Gläsern + manipulierbar: Tap (x,y) auf die zuletzt gläserne UI zurueckspielen (oder mit forward_to_gui=True in die Desktop-GUI senden)."""
         return runtime.run(ctx, "native.ui_tap",
-                           lambda: tools.native_ui_tap(ctx, x, y), _summ(x=x, y=y))
+                           lambda: tools.native_ui_tap(ctx, x, y, forward_to_gui=forward_to_gui),
+                           _summ(x=x, y=y, forward_to_gui=forward_to_gui))
 
     @mcp.tool(name="native_ui_key")
-    def native_ui_key(text: str = "") -> str:
-        """Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben."""
+    def native_ui_key(text: str = "", x: Optional[float] = None, y: Optional[float] = None,
+                      forward_to_gui: bool = False) -> str:
+        """Gläsern + manipulierbar: Tastentext an die fokussierte Surface geben (oder mit forward_to_gui=True in die Desktop-GUI senden)."""
         return runtime.run(ctx, "native.ui_key",
-                           lambda: tools.native_ui_key(ctx, text), _summ())
+                           lambda: tools.native_ui_key(ctx, text, x=x, y=y, forward_to_gui=forward_to_gui),
+                           _summ(forward_to_gui=forward_to_gui))
 
     @mcp.tool(name="native_workflow")
     def native_workflow(name: str = "devirt", params: str = None) -> str:
@@ -825,10 +947,33 @@ def build_server(ctx, host, port):
         """Aktuellen ghost.log-Inhalt (letzte N Zeilen) holen."""
         return runtime.run(ctx, "ghostlog.capture", lambda: tools.ghostlog_capture(ctx, lines), _summ(lines=lines))
 
+    @mcp.tool(name="logcat_capture")
+    def logcat_capture(lines: int = 300, filter_str: str = "", package_only: bool = True,
+                       seconds: float = 0.0) -> str:
+        """Liest gefilterten Logcat-Puffer vom verbundenen ADB-Geraet."""
+        return runtime.run(ctx, "logcat.capture",
+                           lambda: tools.logcat_capture(ctx, int(lines), filter_str, bool(package_only), float(seconds)),
+                           _summ(lines=lines, filter_str=filter_str, package_only=package_only))
+
     @mcp.tool(name="log_export")
     def log_export() -> str:
         """Audit + Kippy_RE_Log in den Log-Export-Ordner kopieren."""
         return runtime.run(ctx, "log.export", lambda: tools.log_export(ctx))
+
+    @mcp.tool(name="app_start")
+    def app_start(package: str = "", intent_cmd: str = "", stop_first: bool = False,
+                  confirm: bool = False) -> str:
+        """App/Intent auf dem verbundenen ADB-Geraet starten. Gated: app_start + confirm."""
+        return runtime.run(ctx, "app.start",
+                           lambda: tools.app_start(ctx, package, intent_cmd, bool(stop_first)),
+                           _summ(package=package or "(active)", stop_first=stop_first), confirm=confirm)
+
+    @mcp.tool(name="app_stop")
+    def app_stop(package: str = "", confirm: bool = False) -> str:
+        """App auf dem verbundenen ADB-Geraet per am force-stop beenden. Gated: app_start + confirm."""
+        return runtime.run(ctx, "app.stop",
+                           lambda: tools.app_stop(ctx, package),
+                           _summ(package=package or "(active)"), confirm=confirm)
 
     # ---------------- K: MCP-Selbstauskunft ----------------
     @mcp.tool(name="mcp_capabilities")
@@ -890,6 +1035,28 @@ def build_server(ctx, host, port):
         """Einen Traffic-Datensatz komplett (Bodies/Headers) per ID holen."""
         return runtime.run(ctx, "api.get", lambda: tools.api_get(ctx, req_id), _summ(req_id=req_id))
 
+    @mcp.tool(name="api_update")
+    def api_update(req_id: int, comment: Optional[str] = None, req_body: Optional[str] = None,
+                   res_body: Optional[str] = None) -> str:
+        """Kommentar, Request- oder Response-Body eines Eintrags in api_traffic.db aktualisieren."""
+        return runtime.run(ctx, "api.update",
+                           lambda: tools.api_update(ctx, int(req_id), comment, req_body, res_body),
+                           _summ(req_id=req_id))
+
+    @mcp.tool(name="api_replay")
+    def api_replay(req_id: int = 0, method: str = "", url: str = "", headers_json: str = "",
+                   body: str = "", record: bool = True, timeout_s: float = 12.0) -> str:
+        """Request aus api_traffic.db (req_id) oder frei per HTTP erneut senden."""
+        return runtime.run(ctx, "api.replay",
+                           lambda: tools.api_replay(ctx, int(req_id), method, url, headers_json, body,
+                                                    bool(record), float(timeout_s)),
+                           _summ(req_id=req_id, method=method, url=url))
+
+    @mcp.tool(name="api_clear")
+    def api_clear(confirm: bool = False) -> str:
+        """Alle Eintraege in api_traffic.db loeschen. Gated: delete_ops + confirm."""
+        return runtime.run(ctx, "api.clear", lambda: tools.api_clear(ctx), _summ(), confirm=confirm)
+
     @mcp.tool(name="api_rules_list")
     def api_rules_list() -> str:
         """Aktive HTTP Intercept-Regeln (intercept_rules.json) auflisten."""
@@ -908,6 +1075,13 @@ def build_server(ctx, host, port):
         return runtime.run(ctx, "api.extract_flutter_static",
                            lambda: tools.api_extract_flutter_static(ctx, app_root),
                            _summ(app_root=app_root or "(auto)"))
+
+    @mcp.tool(name="api_extract_engine_static")
+    def api_extract_engine_static(app_root: Optional[str] = None, engine: str = "auto") -> str:
+        """Statische API-/Web-Endpunkte fuer Hybrid-Web, React Native/Hermes, Flutter & Web-Assets extrahieren."""
+        return runtime.run(ctx, "api.extract_engine_static",
+                           lambda: tools.api_extract_engine_static(ctx, app_root, engine),
+                           _summ(app_root=app_root or "(auto)", engine=engine))
 
     @mcp.tool(name="api_import_templates")
     def api_import_templates(templates_json: str, app_root: Optional[str] = None) -> str:
@@ -1239,7 +1413,10 @@ def _main() -> None:
         mcp.run(transport="stdio")
     else:
         print(f"[MCP] Server startet ({transport}) auf {args.host}:{args.port}", flush=True)
-        mcp.run(transport=transport)
+        if getattr(mcp, "_is_mcp_v2", False):
+            mcp.run(transport=transport, host=args.host, port=int(args.port))
+        else:
+            mcp.run(transport=transport)
 
 
 if __name__ == "__main__":
